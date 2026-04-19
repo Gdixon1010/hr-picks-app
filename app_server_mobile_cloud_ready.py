@@ -39,7 +39,7 @@ def home():
         "endpoints": ["/app", "/refresh-data", "/latest", "/final-card", "/games", "/research"]
     }
 
-@app.post("/refresh-data")
+@app.api_route("/refresh-data", methods=["GET", "POST"])
 def refresh_data():
     today = dt.date.today().strftime("%Y-%m-%d")
     run_model_main(2026, today)
