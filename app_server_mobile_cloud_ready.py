@@ -113,7 +113,9 @@ th{position:sticky;top:0;background:#141c40;cursor:pointer}
 </div>
 
 <script>
-let D=null,S={},F={};
+let D=null;
+let S={};
+
 const e=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const n=v=>{let x=Number(v);return Number.isNaN(x)?String(v??'—'):x.toFixed(3).replace(/\.000$/,'')};
 
@@ -129,6 +131,7 @@ async function refreshData(){
   await fetch('/refresh-data');
   await loadData();
 }
+
 async function loadData(){
   D=await (await fetch('/latest')).json();
   meta.textContent=`Date: ${D.date||'—'} • ${D._meta?.filename||'No data yet'}`;
@@ -168,7 +171,12 @@ function renderGames(){
       </div>`).join('');
 }
 
-function cols(rows){let s=new Set();rows.slice(0,50).forEach(r=>Object.keys(r).forEach(k=>s.add(k)));return [...s]}
+function cols(rows){
+  let s=new Set();
+  rows.slice(0,50).forEach(r=>Object.keys(r).forEach(k=>s.add(k)));
+  return [...s];
+}
+
 function sortRows(rows,k,d){
   let c=[...rows];
   c.sort((a,b)=>{
@@ -178,59 +186,104 @@ function sortRows(rows,k,d){
   });
   return c;
 }
-function uniq(rows,k){return [...new Set((rows||[]).map(r=>String(r[k]??'')).filter(v=>v.trim()!==''))].sort((a,b)=>a.localeCompare(b))}
-function init(name){if(!F[name])F[name]={q:'',teams:[],status:[],parks:[],opps:[],over:false,min:''}}
-function checkBox(name,key,title,vals){
-  let s=(F[name]||{})[key]||[];
-  return `<div class="box"><div class="m">${title}</div><div class="list">${
-    vals.map(v=>`<label class="item"><input type="checkbox" ${s.includes(v)?'checked':''} onchange="setChk('${name}','${key}',${JSON.stringify(v)},this.checked)"><span>${e(v)}</span></label>`).join('') || 'None'
-  }</div></div>`;
+
+function uniq(rows,k){
+  return [...new Set((rows||[]).map(r=>String(r[k]??'')).filter(v=>v.trim()!==''))].sort((a,b)=>a.localeCompare(b));
 }
-function setChk(name,key,v,on){
-  init(name);
-  let a=F[name][key],i=a.indexOf(v);
-  if(on&&i===-1)a.push(v);
-  if(!on&&i!==-1)a.splice(i,1);
+
+function getCheckedValues(name, group){
+  return Array.from(
+    document.querySelectorAll(`input[data-filter="${name}-${group}"]:checked`)
+  ).map(x => x.value);
 }
-function apply(name,rows){
-  init(name);
-  let f=F[name],q=(f.q||'').toLowerCase().trim(),d=[...rows];
-  if(q)d=d.filter(r=>JSON.stringify(r).toLowerCase().includes(q));
+
+function applyFilters(name, rows){
+  let d=[...(rows||[])];
+
+  const q = (document.getElementById(`${name}-search`)?.value || '').toLowerCase().trim();
+  if(q){
+    d = d.filter(r => JSON.stringify(r).toLowerCase().includes(q));
+  }
+
   if(['hr_drought','hit_drought'].includes(name)){
-    if(f.teams.length)d=d.filter(r=>f.teams.includes(String(r.teamName||'')));
-    if(f.status.length)d=d.filter(r=>f.status.includes(String(r.status||'')));
-    if(f.parks.length)d=d.filter(r=>f.parks.includes(String(r.park_favorability||'')));
-    if(f.opps.length)d=d.filter(r=>f.opps.includes(String(r.opponent_pitcher_pick_type||'')));
-    if(f.over)d=d.filter(r=>String(r.status||'').toLowerCase().includes('overdue'));
-    if(f.min!==''){
-      let t=Number(f.min),c=name==='hr_drought'?'current_games_without_hr':'current_games_without_hit';
-      if(!Number.isNaN(t))d=d.filter(r=>Number(r[c]||0)>=t);
+    const teams = getCheckedValues(name, 'teams');
+    const statuses = getCheckedValues(name, 'status');
+    const parks = getCheckedValues(name, 'parks');
+    const opps = getCheckedValues(name, 'opps');
+    const over = !!document.getElementById(`${name}-overdue`)?.checked;
+    const minRaw = document.getElementById(`${name}-mindrought`)?.value || '';
+    const minVal = Number(minRaw);
+
+    if(teams.length){
+      d = d.filter(r => teams.includes(String(r.teamName || '')));
+    }
+    if(statuses.length){
+      d = d.filter(r => statuses.includes(String(r.status || '')));
+    }
+    if(parks.length){
+      d = d.filter(r => parks.includes(String(r.park_favorability || '')));
+    }
+    if(opps.length){
+      d = d.filter(r => opps.includes(String(r.opponent_pitcher_pick_type || '')));
+    }
+    if(over){
+      d = d.filter(r => String(r.status || '').toLowerCase().includes('overdue'));
+    }
+    if(minRaw !== '' && !Number.isNaN(minVal)){
+      const col = name === 'hr_drought' ? 'current_games_without_hr' : 'current_games_without_hit';
+      d = d.filter(r => Number(r[col] || 0) >= minVal);
     }
   }
+
   return d;
 }
-function one(name,rows){
-  init(name);
-  let d=apply(name,Array.isArray(rows)?rows:[]), sk=S[name]?.k, sd=S[name]?.d||'desc';
-  if(sk)d=sortRows(d,sk,sd);
-  let c=cols(d.length?d:rows), tgt=document.getElementById('tbl_'+name);
-  if(!tgt)return;
-  if(!d.length){tgt.innerHTML='<div class="card">No rows to show.</div>'; return;}
+
+function clearFilters(name){
+  if(document.getElementById(`${name}-search`)) document.getElementById(`${name}-search`).value = '';
+  if(document.getElementById(`${name}-overdue`)) document.getElementById(`${name}-overdue`).checked = false;
+  if(document.getElementById(`${name}-mindrought`)) document.getElementById(`${name}-mindrought`).value = '';
+
+  document.querySelectorAll(`input[data-filter="${name}-teams"]`).forEach(x => x.checked = false);
+  document.querySelectorAll(`input[data-filter="${name}-status"]`).forEach(x => x.checked = false);
+  document.querySelectorAll(`input[data-filter="${name}-parks"]`).forEach(x => x.checked = false);
+  document.querySelectorAll(`input[data-filter="${name}-opps"]`).forEach(x => x.checked = false);
+
+  renderOne(name, D.research?.[name] || []);
+}
+
+function toggleSort(name,k){
+  if(!S[name]||S[name].k!==k) S[name]={k,d:'desc'};
+  else S[name].d=S[name].d==='desc'?'asc':'desc';
+  renderOne(name, D.research?.[name] || []);
+}
+
+function renderCheckboxGroup(name,key,title,vals){
+  return `<div class="box"><div class="m">${title}</div><div class="list">${
+    vals.map(v=>`<label class="item"><input type="checkbox" data-filter="${name}-${key}" value="${e(v)}"><span>${e(v)}</span></label>`).join('') || '<div class="empty">None</div>'
+  }</div></div>`;
+}
+
+function renderOne(name,rows){
+  let d=applyFilters(name, Array.isArray(rows)?rows:[]);
+  let sk=S[name]?.k, sd=S[name]?.d||'desc';
+  if(sk) d=sortRows(d,sk,sd);
+
+  let c=cols(d.length?d:rows);
+  let tgt=document.getElementById('tbl_'+name);
+  if(!tgt) return;
+
+  if(!d.length){
+    tgt.innerHTML='<div class="card">No rows to show.</div>';
+    return;
+  }
+
   tgt.innerHTML=`<div class="tbl"><table><thead><tr>${
-    c.map(k=>`<th onclick="tog('${name}','${k}')">${e(k)}${sk===k?(sd==='asc'?' ▲':' ▼'):''}</th>`).join('')
+    c.map(k=>`<th onclick="toggleSort('${name}','${k}')">${e(k)}${sk===k?(sd==='asc'?' ▲':' ▼'):''}</th>`).join('')
   }</tr></thead><tbody>${
     d.map(r=>`<tr>${c.map(k=>`<td>${e(r[k]??'—')}</td>`).join('')}</tr>`).join('')
   }</tbody></table></div>`;
 }
-function tog(name,k){
-  if(!S[name]||S[name].k!==k)S[name]={k,d:'desc'};
-  else S[name].d=S[name].d==='desc'?'asc':'desc';
-  one(name,D.research?.[name]||[]);
-}
-function clearF(name){
-  F[name]={q:'',teams:[],status:[],parks:[],opps:[],over:false,min:''};
-  renderResearch();
-}
+
 function renderResearch(){
   let s=D.research||{},
       order=['game_rankings','pitcher_line_value','pitcher_metrics','top_picks','refined_picks','hr_drought','hit_drought'],
@@ -238,32 +291,36 @@ function renderResearch(){
 
   research.innerHTML=order.map(name=>{
     let rows=s[name]||[], adv=['hr_drought','hit_drought'].includes(name);
-    init(name);
+
     return `<div class="panel">
       <div><b>${labels[name]}</b></div>
       ${adv
         ? `<div class="tools">
-             <input type="text" placeholder="Search this table" value="${e(F[name].q)}" oninput="F['${name}'].q=this.value;one('${name}',D.research?.['${name}']||[])">
-             <label class="item"><input type="checkbox" ${F[name].over?'checked':''} onchange="F['${name}'].over=this.checked"><span>Overdue only</span></label>
-             <input type="number" placeholder="Min drought" value="${e(F[name].min)}" oninput="F['${name}'].min=this.value">
+             <input id="${name}-search" type="text" placeholder="Search this table">
+             <label class="item"><input id="${name}-overdue" type="checkbox"><span>Overdue only</span></label>
+             <input id="${name}-mindrought" type="number" placeholder="Min drought">
            </div>
            <div class="grid">
-             ${checkBox(name,'teams','Teams',uniq(rows,'teamName'))}
-             ${checkBox(name,'status','Status',uniq(rows,'status'))}
-             ${checkBox(name,'parks','Park',uniq(rows,'park_favorability'))}
-             ${checkBox(name,'opps','Opponent Pitcher Type',uniq(rows,'opponent_pitcher_pick_type'))}
+             ${renderCheckboxGroup(name,'teams','Teams',uniq(rows,'teamName'))}
+             ${renderCheckboxGroup(name,'status','Status',uniq(rows,'status'))}
+             ${renderCheckboxGroup(name,'parks','Park',uniq(rows,'park_favorability'))}
+             ${renderCheckboxGroup(name,'opps','Opponent Pitcher Type',uniq(rows,'opponent_pitcher_pick_type'))}
            </div>
            <div class="tools">
-             <button class="btn" onclick="one('${name}',D.research?.['${name}']||[])">Apply Filters</button>
-             <button class="btn" onclick="clearF('${name}')">Clear Filters</button>
+             <button class="btn" onclick="renderOne('${name}',D.research?.['${name}']||[])">Apply Filters</button>
+             <button class="btn" onclick="clearFilters('${name}')">Clear Filters</button>
            </div>`
-        : `<div class="tools"><input type="text" placeholder="Search this table" oninput="F['${name}']={q:this.value,teams:[],status:[],parks:[],opps:[],over:false,min:''};one('${name}',D.research?.['${name}']||[])"></div>`
+        : `<div class="tools">
+             <input id="${name}-search" type="text" placeholder="Search this table">
+             <button class="btn" onclick="renderOne('${name}',D.research?.['${name}']||[])">Apply Filters</button>
+             <button class="btn" onclick="clearFilters('${name}')">Clear Filters</button>
+           </div>`
       }
       <div id="tbl_${name}"></div>
     </div>`;
   }).join('');
 
-  order.forEach(name=>one(name,s[name]||[]));
+  order.forEach(name=>renderOne(name,s[name]||[]));
 }
 
 loadData();
