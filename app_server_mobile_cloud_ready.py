@@ -2,7 +2,8 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, HTMLResponse
 from pathlib import Path
 import json
-import datetime as dt
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from hr_v41_cloud_ready import main as run_model_main
 
@@ -10,6 +11,12 @@ app = FastAPI()
 
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+EASTERN_TZ = ZoneInfo("America/New_York")
+
+
+def get_eastern_today():
+    return datetime.now(EASTERN_TZ).strftime("%Y-%m-%d")
 
 
 def get_latest_json_file():
@@ -37,6 +44,7 @@ def load_latest_data():
     data["_meta"] = {
         "filename": latest_file.name,
         "path": str(latest_file),
+        "eastern_now": datetime.now(EASTERN_TZ).strftime("%Y-%m-%d %I:%M %p ET"),
     }
     return data
 
@@ -46,14 +54,20 @@ def home():
     return {
         "message": "HR Picks cloud app v41",
         "endpoints": ["/app", "/latest", "/refresh-data"],
+        "timezone": "America/New_York",
     }
 
 
 @app.api_route("/refresh-data", methods=["GET", "POST"])
 def refresh_data():
-    today = dt.date.today().strftime("%Y-%m-%d")
+    today = get_eastern_today()
     run_model_main(2026, today)
-    return {"status": "ok", "message": "Data refreshed", "date": today}
+    return {
+        "status": "ok",
+        "message": "Data refreshed",
+        "date": today,
+        "timezone": "America/New_York",
+    }
 
 
 @app.get("/latest")
@@ -134,7 +148,7 @@ async function refreshData(){
 
 async function loadData(){
   D=await (await fetch('/latest')).json();
-  meta.textContent=`Date: ${D.date||'—'} • ${D._meta?.filename||'No data yet'}`;
+  meta.textContent=`Date: ${D.date||'—'} • ${D._meta?.filename||'No data yet'} • ${D._meta?.eastern_now||''}`;
   renderFinal();
   renderGames();
   renderResearch();
