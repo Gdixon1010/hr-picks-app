@@ -1,328 +1,379 @@
-from __future__ import annotations
-
-import json
-import os
-import subprocess
-import datetime as dt
-from pathlib import Path
-from typing import Any
-
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
+from pathlib import Path
+import json
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
-app = FastAPI(title="HR Picks App")
+from hr_v41_cloud_ready import main as run_model_main
+
+app = FastAPI()
 
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-EASTERN = ZoneInfo("America/New_York")
+EASTERN_TZ = ZoneInfo("America/New_York")
 
 
-def eastern_now_str() -> str:
-    return dt.datetime.now(EASTERN).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ")
+def get_eastern_today():
+    return datetime.now(EASTERN_TZ).strftime("%Y-%m-%d")
 
 
-def _safe_read_json(path: Path) -> dict[str, Any] | None:
+def get_matching_json_files(pattern: str):
+    files = list(OUTPUT_DIR.glob(pattern))
+    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def get_latest_json_file():
+    files = get_matching_json_files("HR_Hit_Drought_v41_appdata-*.json") + get_matching_json_files("HR_Hit_Drought_v40_appdata-*.json")
+    files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0] if files else None
+
+
+def load_json_file(path: Path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def merge_game_times_from_v40(data: dict):
+    if data.get("games") and any(g.get("game_time_et") for g in data.get("games", [])):
+        return data
+    v40_files = get_matching_json_files("HR_Hit_Drought_v40_appdata-*.json")
+    if not v40_files:
+        return data
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        v40_data = load_json_file(v40_files[0])
+        time_map = {g.get("game"): {"game_time_et": g.get("game_time_et"), "venue": g.get("venue")} for g in v40_data.get("games", [])}
+        for g in data.get("games", []):
+            extra = time_map.get(g.get("game"), {})
+            if extra.get("game_time_et") and not g.get("game_time_et"):
+                g["game_time_et"] = extra.get("game_time_et")
+            if extra.get("venue") and not g.get("venue"):
+                g["venue"] = extra.get("venue")
     except Exception:
-        return None
+        pass
+    return data
 
 
-def _find_latest_json() -> tuple[dict[str, Any], Path | None]:
-    files = sorted(OUTPUT_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for p in files:
-        payload = _safe_read_json(p)
-        if isinstance(payload, dict):
-            payload.setdefault("_meta", {})
-            payload["_meta"]["filename"] = p.name
-            payload["_meta"]["path"] = str(p)
-            try:
-                updated_et = dt.datetime.fromtimestamp(p.stat().st_mtime, EASTERN)
-                payload["_meta"]["last_updated_et"] = updated_et.strftime("%b %d, %Y %I:%M %p ET").replace(" 0", " ")
-            except Exception:
-                payload["_meta"]["last_updated_et"] = eastern_now_str()
-            payload["_meta"]["eastern_now"] = eastern_now_str()
-            return payload, p
+def load_latest_data():
+    latest_file = get_latest_json_file()
+    if not latest_file:
+        return {
+            "date": None,
+            "final_card": {"generated_section": "final_card", "plays": []},
+            "games": [],
+            "research": {},
+            "_meta": {"filename": None, "last_updated": None},
+        }
+
+    data = load_json_file(latest_file)
+    data = merge_game_times_from_v40(data)
+
+    mtime = datetime.fromtimestamp(latest_file.stat().st_mtime, EASTERN_TZ)
+    data["_meta"] = {
+        "filename": latest_file.name,
+        "path": str(latest_file),
+        "last_updated": mtime.isoformat(),
+        "last_updated_display": mtime.strftime("%b %d, %Y %I:%M %p ET"),
+    }
+    return data
+
+
+@app.get("/")
+def home():
     return {
-        "date": None,
-        "final_card": {"generated_section": "final_card", "plays": []},
-        "games": [],
-        "research": {},
-        "_meta": {"filename": None, "path": None, "last_updated_et": None, "eastern_now": eastern_now_str()},
-    }, None
+        "message": "HR Picks cloud app v43",
+        "endpoints": ["/app", "/latest", "/refresh-data"],
+        "timezone": "America/New_York",
+    }
 
 
-@app.get("/", response_class=HTMLResponse)
-def root() -> HTMLResponse:
-    return HTMLResponse('<meta http-equiv="refresh" content="0; url=/app">')
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "time": eastern_now_str()}
-
-@app.get("/latest")
-def latest():
-    payload, _ = _find_latest_json()
-    return JSONResponse(payload)
-
-@app.get("/refresh-data")
+@app.api_route("/refresh-data", methods=["GET", "POST"])
 def refresh_data():
-    # Runs the backend refresh and returns the newest JSON metadata if successful
-    today = dt.datetime.now(EASTERN).date().isoformat()
-    cmd = [
-        "python",
-        "-c",
-        (
-            "from hr_v41_cloud_ready import main; "
-            f"main(2026, '{today}')"
-        ),
-    ]
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=str(Path.cwd()),
-            capture_output=True,
-            text=True,
-            timeout=1800,
-            check=False,
-        )
-    except Exception as e:
-        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
-
-    if result.returncode != 0:
-        return JSONResponse(
-            {
-                "status": "error",
-                "message": "Refresh failed",
-                "stdout": result.stdout[-4000:],
-                "stderr": result.stderr[-4000:],
-            },
-            status_code=500,
-        )
-
-    payload, path = _find_latest_json()
+    today = get_eastern_today()
+    run_model_main(2026, today)
     return {
         "status": "ok",
         "message": "Data refreshed",
-        "date": payload.get("date"),
-        "filename": payload.get("_meta", {}).get("filename"),
-        "last_updated_et": payload.get("_meta", {}).get("last_updated_et"),
-        "path": str(path) if path else None,
+        "date": today,
+        "timezone": "America/New_York",
     }
 
+
+@app.get("/latest")
+def latest():
+    return JSONResponse(content=load_latest_data())
+
+
 HTML = r"""
-<!DOCTYPE html>
+<!doctype html>
 <html>
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>HR Picks App</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background:#0f1115; color:#f4f4f4; }
-    .wrap { max-width: 1100px; margin: 0 auto; padding: 16px; }
-    .top { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:12px; margin-bottom:16px; }
-    .title { font-size: 28px; font-weight: 700; }
-    .meta { color:#b9c0cb; font-size:14px; }
-    .btn { background:#1f6feb; color:white; border:none; border-radius:10px; padding:10px 14px; font-size:14px; font-weight:600; cursor:pointer; }
-    .btn:disabled { opacity:.65; cursor:default; }
-    .tabs { display:flex; flex-wrap:wrap; gap:8px; margin:14px 0 18px; }
-    .tab { background:#1b1f27; color:#dce3ed; border:1px solid #2b3240; border-radius:999px; padding:8px 12px; cursor:pointer; }
-    .tab.active { background:#2a3444; border-color:#4a5a73; }
-    .panel { display:none; }
-    .panel.active { display:block; }
-    .card { background:#171b22; border:1px solid #29303c; border-radius:16px; padding:14px; margin:0 0 12px; }
-    .card h3 { margin:0 0 8px; font-size:18px; }
-    .small { color:#b9c0cb; font-size:13px; }
-    .grid { display:grid; gap:12px; }
-    .grid.two { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
-    .pill { display:inline-block; padding:4px 8px; border-radius:999px; background:#263043; font-size:12px; color:#dfe8f5; margin-right:6px; margin-bottom:6px; }
-    table { width:100%; border-collapse:collapse; }
-    th, td { text-align:left; padding:10px 8px; border-bottom:1px solid #2a3039; font-size:14px; vertical-align:top; }
-    th { color:#c7d0dd; }
-    .muted { color:#9aa6b2; }
-    pre { white-space:pre-wrap; word-break:break-word; background:#11151b; border:1px solid #2a3039; border-radius:12px; padding:12px; overflow:auto; }
-  </style>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>HR Picks v43</title>
+<style>
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:#070b24;color:#f2f4ff}
+.wrap{max-width:960px;margin:auto;padding:16px}
+.meta{color:#adb4da;margin:10px 0 16px 0;line-height:1.5}
+.tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:14px 0}
+.tab{padding:12px;border:1px solid #334181;border-radius:14px;background:#121938;color:#fff;font-weight:800;cursor:pointer}
+.tab.active{outline:2px solid #8ea2ff}
+.sec{display:none}.sec.on{display:block}
+.card,.panel{background:#121938;border:1px solid #2e3b7d;border-radius:18px;padding:14px;margin:12px 0}
+.m{color:#adb4da}.pill{float:right;background:#27326f;border-radius:999px;padding:10px 14px;font-weight:800}
+.tools{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+.tools input{background:#0f1532;color:#fff;border:1px solid #344281;border-radius:10px;padding:10px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.box{background:#0f1532;border:1px solid #344281;border-radius:12px;padding:10px}
+.list{max-height:150px;overflow:auto}
+.item{display:flex;gap:8px;align-items:center;margin:6px 0}
+.tbl{overflow:auto;max-height:60vh}
+table{width:100%;border-collapse:collapse}
+th,td{padding:8px 10px;border-bottom:1px solid #28366e;text-align:left}
+th{position:sticky;top:0;background:#141c40;cursor:pointer}
+.empty{color:#adb4da;padding:12px}
+.small{font-size:13px}
+@media(max-width:700px){.grid{grid-template-columns:1fr}}
+</style>
 </head>
 <body>
 <div class="wrap">
-  <div class="top">
-    <div>
-      <div class="title">HR Picks App</div>
-      <div class="meta" id="metaLine">Loading…</div>
-    </div>
-    <div>
-      <button class="btn" id="reloadBtn" onclick="reloadApp()">Reload App</button>
-    </div>
-  </div>
-
+  <h1>HR Picks</h1>
+  <div id="meta" class="meta">Loading…</div>
+  <div class="tools"><button class="tab" onclick="loadData()">Reload App</button></div>
   <div class="tabs">
-    <button class="tab active" onclick="showTab('final')">Final Card</button>
-    <button class="tab" onclick="showTab('games')">Games</button>
-    <button class="tab" onclick="showTab('research')">Research</button>
-    <button class="tab" onclick="showTab('raw')">Raw Data</button>
+    <button class="tab active" data-x="final">Final Card</button>
+    <button class="tab" data-x="games">Games</button>
+    <button class="tab" data-x="research">Research</button>
   </div>
-
-  <div id="final" class="panel active"></div>
-  <div id="games" class="panel"></div>
-  <div id="research" class="panel"></div>
-  <div id="raw" class="panel"></div>
+  <div id="final" class="sec on"></div>
+  <div id="games" class="sec"></div>
+  <div id="research" class="sec"></div>
 </div>
 
 <script>
-let APP_DATA = null;
+let D=null;
+let S={};
 
-function esc(v) {
-  if (v === null || v === undefined) return "—";
-  return String(v)
-    .replaceAll("&","&amp;")
-    .replaceAll("<","&lt;")
-    .replaceAll(">","&gt;");
+const e=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const n=v=>{let x=Number(v);return Number.isNaN(x)?String(v??'—'):x.toFixed(3).replace(/\.000$/,'')};
+
+function formatLastUpdated(meta){
+  if(!meta?.last_updated_display) return 'Last Updated: No data yet';
+  return `Last Updated: ${meta.last_updated_display}`;
 }
 
-function showTab(id) {
-  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  document.getElementById(id).classList.add('active');
-  const btn = [...document.querySelectorAll('.tab')].find(b => b.textContent.replace(/\s+/g,'').toLowerCase().startsWith(id));
-  if (btn) btn.classList.add('active');
-}
-
-function renderMeta(data) {
-  const meta = data._meta || {};
-  const line = `Date: ${esc(data.date || "—")} • Last Updated: ${esc(meta.last_updated_et || "—")}`;
-  document.getElementById('metaLine').innerHTML = line;
-}
-
-function renderFinal(data) {
-  const panel = document.getElementById('final');
-  const plays = (data.final_card && data.final_card.plays) || (data.research && data.research.final_card) || [];
-  if (!plays.length) {
-    panel.innerHTML = `<div class="card">No final card plays available.</div>`;
-    return;
-  }
-  let html = '<div class="grid">';
-  plays.forEach((p, idx) => {
-    html += `
-      <div class="card">
-        <h3>${esc(p.slot || 'Play ' + (idx+1))} — ${esc(p.bet_type || 'Play')}</h3>
-        <div><strong>${esc(p.pick || '')}</strong></div>
-        <div class="small">${esc(p.team || '')}${p.opponent ? ' vs ' + esc(p.opponent) : ''}</div>
-        <div style="margin-top:8px;"><span class="pill">${esc(p.confidence || '—')}</span><span class="pill">${esc(p.source_tab || '—')}</span></div>
-        <div style="margin-top:8px;">${esc(p.why_it_made_the_card || '')}</div>
-      </div>`;
-  });
-  html += '</div>';
-  panel.innerHTML = html;
-}
-
-function renderGames(data) {
-  const panel = document.getElementById('games');
-  const games = data.games || [];
-  if (!games.length) {
-    panel.innerHTML = `<div class="card">No games available.</div>`;
-    return;
-  }
-  let html = '<div class="grid">';
-  games.forEach(g => {
-    const ml = g.ml_lean || {};
-    const hitPicks = g.top_hit_picks || [];
-    const hrPicks = g.top_hr_picks || [];
-    const k = g.top_k_pick || null;
-    html += `<div class="card">
-      <h3>${esc(g.game)}</h3>
-      <div class="small">Start Time: ${esc(g.game_time_et || 'not available yet')}${g.venue ? ' • ' + esc(g.venue) : ''}</div>
-      <div style="margin-top:10px;"><strong>ML Lean:</strong> ${esc(ml.team || '—')} ${ml.edge_vs_opponent !== undefined && ml.edge_vs_opponent !== null ? `(edge ${esc(ml.edge_vs_opponent)})` : ''}</div>
-      <div class="small">${esc(ml.recommended_play || '')}</div>
-      <div style="margin-top:10px;"><strong>Top Hit Picks</strong></div>
-      <div class="small">${hitPicks.length ? hitPicks.map(p => `${esc(p.playerName)} (${esc(p.teamName)})`).join(' • ') : '—'}</div>
-      <div style="margin-top:10px;"><strong>Top HR Picks</strong></div>
-      <div class="small">${hrPicks.length ? hrPicks.map(p => `${esc(p.playerName)} (${esc(p.teamName)})`).join(' • ') : '—'}</div>
-      <div style="margin-top:10px;"><strong>Top K Pick</strong></div>
-      <div class="small">${k ? `${esc(k.pitcherName)} (${esc(k.teamName)}) — ${esc(k.recommended_k_action || '')}` : '—'}</div>
-    </div>`;
-  });
-  html += '</div>';
-  panel.innerHTML = html;
-}
-
-function renderResearch(data) {
-  const panel = document.getElementById('research');
-  const research = data.research || {};
-  const sections = [
-    ['Game Rankings', (research.game_rankings || []).length],
-    ['Pitcher Metrics', (research.pitcher_metrics || []).length],
-    ['Pitcher Line Value', (research.pitcher_line_value || []).length],
-    ['HR Drought', (research.hr_drought || []).length],
-    ['Hit Drought', (research.hit_drought || []).length],
-    ['Top Picks', (research.top_picks || []).length],
-    ['Refined Picks', (research.refined_picks || []).length]
-  ];
-  let html = '<div class="grid two">';
-  sections.forEach(([name, count]) => {
-    html += `<div class="card"><h3>${esc(name)}</h3><div class="small">${count} rows</div></div>`;
-  });
-  html += '</div>';
-  panel.innerHTML = html;
-}
-
-function renderRaw(data) {
-  document.getElementById('raw').innerHTML = `<pre>${esc(JSON.stringify(data, null, 2))}</pre>`;
-}
-
-function renderAll(data) {
-  APP_DATA = data;
-  renderMeta(data);
-  renderFinal(data);
-  renderGames(data);
-  renderResearch(data);
-  renderRaw(data);
-}
-
-async function loadLatest(forceFresh=true) {
-  const url = forceFresh ? `/latest?t=${Date.now()}` : `/latest`;
-  const res = await fetch(url, { cache: 'no-store' });
-  if (!res.ok) throw new Error(`Load failed (${res.status})`);
-  return await res.json();
-}
-
-async function reloadApp() {
-  const btn = document.getElementById('reloadBtn');
-  const original = btn.textContent;
-  btn.disabled = true;
-  btn.textContent = 'Reloading...';
-  try {
-    const data = await loadLatest(true);
-    renderAll(data);
-    btn.textContent = 'Reloaded';
-    setTimeout(() => {
-      btn.textContent = original;
-      btn.disabled = false;
-    }, 900);
-  } catch (err) {
-    btn.textContent = 'Reload failed';
-    setTimeout(() => {
-      btn.textContent = original;
-      btn.disabled = false;
-    }, 1500);
-  }
-}
-
-window.addEventListener('load', async () => {
-  try {
-    const data = await loadLatest(true);
-    renderAll(data);
-  } catch (err) {
-    document.getElementById('final').innerHTML = `<div class="card">Could not load app data.</div>`;
-    document.getElementById('metaLine').textContent = 'Load failed';
-  }
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.sec').forEach(x=>x.classList.remove('on'));
+  b.classList.add('active');
+  document.getElementById(b.dataset.x).classList.add('on');
 });
+
+async function loadData(){
+  D=await (await fetch('/latest')).json();
+  meta.innerHTML=`<div>Date: ${D.date||'—'}</div><div>${formatLastUpdated(D._meta)}</div>`;
+  renderFinal();
+  renderGames();
+  renderResearch();
+}
+
+function renderFinal(){
+  let p=D.final_card?.plays||[];
+  final.innerHTML=!p.length
+    ? '<div class="card">No final card plays yet.</div>'
+    : p.map(r=>`<div class="card">
+        <span class="pill">${e(r.confidence||'')}</span>
+        <div class="m">${e(r.slot)} · ${e(r.bet_type)}</div>
+        <div><b>${e(r.pick)}</b></div>
+        <div class="m">${e(r.team)} vs ${e(r.opponent)}</div>
+        <div class="m">${e(r.why_it_made_the_card)}</div>
+      </div>`).join('');
+}
+
+function renderGames(){
+  let g=D.games||[];
+  games.innerHTML=!g.length
+    ? '<div class="card">No games yet.</div>'
+    : g.map(x=>`<div class="card">
+        <div><b>${e(x.game)}</b></div>
+        <div class="m">Start Time: ${e(x.game_time_et || x.start_time_et || 'Not available yet')}</div>
+        <div class="m">Model Lean: ${e(x.ml_lean?.team||'No side')} vs ${e(x.ml_lean?.opponent||'—')} · Edge ${n(x.ml_lean?.edge_vs_opponent)}</div>
+        <hr style="border-color:#2a376f">
+        <div><b>Top Hit Picks</b>
+          ${(x.top_hit_picks||[]).map(p=>`<div class="m">${e(p.playerName)} · ${e(p.teamName)} · ${n(p.Hit_score)}</div>`).join('') || '<div class="m">None</div>'}
+        </div>
+        <hr style="border-color:#2a376f">
+        <div><b>Top HR Picks</b>
+          ${(x.top_hr_picks||[]).map(p=>`<div class="m">${e(p.playerName)} · ${e(p.teamName)} · ${n(p.HR_score)}</div>`).join('') || '<div class="m">None</div>'}
+        </div>
+        <hr style="border-color:#2a376f">
+        <div><b>Top K Pick</b>
+          ${x.top_k_pick ? `<div class="m">${e(x.top_k_pick.pitcherName)} · ${e(x.top_k_pick.teamName)} · ${e(x.top_k_pick.recommended_k_action || 'No action')}</div>` : '<div class="m">None</div>'}
+        </div>
+      </div>`).join('');
+}
+
+function cols(rows){
+  let s=new Set();
+  rows.slice(0,50).forEach(r=>Object.keys(r).forEach(k=>s.add(k)));
+  return [...s];
+}
+
+function sortRows(rows,k,d){
+  let c=[...rows];
+  c.sort((a,b)=>{
+    let av=a[k],bv=b[k],an=Number(av),bn=Number(bv);
+    let cmp=!Number.isNaN(an)&&!Number.isNaN(bn) ? an-bn : String(av??'').localeCompare(String(bv??''));
+    return d==='asc'?cmp:-cmp;
+  });
+  return c;
+}
+
+function uniq(rows,k){
+  return [...new Set((rows||[]).map(r=>String(r[k]??'')).filter(v=>v.trim()!==''))].sort((a,b)=>a.localeCompare(b));
+}
+
+function getCheckedValues(name, group){
+  return Array.from(
+    document.querySelectorAll(`input[data-filter="${name}-${group}"]:checked`)
+  ).map(x => x.value);
+}
+
+function applyFilters(name, rows){
+  let d=[...(rows||[])];
+
+  const q = (document.getElementById(`${name}-search`)?.value || '').toLowerCase().trim();
+  if(q){
+    d = d.filter(r => JSON.stringify(r).toLowerCase().includes(q));
+  }
+
+  if(['hr_drought','hit_drought'].includes(name)){
+    const teams = getCheckedValues(name, 'teams');
+    const statuses = getCheckedValues(name, 'status');
+    const parks = getCheckedValues(name, 'parks');
+    const opps = getCheckedValues(name, 'opps');
+    const over = !!document.getElementById(`${name}-overdue`)?.checked;
+    const minRaw = document.getElementById(`${name}-mindrought`)?.value || '';
+    const minVal = Number(minRaw);
+
+    if(teams.length){
+      d = d.filter(r => teams.includes(String(r.teamName || '')));
+    }
+    if(statuses.length){
+      d = d.filter(r => statuses.includes(String(r.status || '')));
+    }
+    if(parks.length){
+      d = d.filter(r => parks.includes(String(r.park_favorability || '')));
+    }
+    if(opps.length){
+      d = d.filter(r => opps.includes(String(r.opponent_pitcher_pick_type || '')));
+    }
+    if(over){
+      d = d.filter(r => String(r.status || '').toLowerCase().includes('overdue'));
+    }
+    if(minRaw !== '' && !Number.isNaN(minVal)){
+      const col = name === 'hr_drought' ? 'current_games_without_hr' : 'current_games_without_hit';
+      d = d.filter(r => Number(r[col] || 0) >= minVal);
+    }
+  }
+
+  return d;
+}
+
+function clearFilters(name){
+  if(document.getElementById(`${name}-search`)) document.getElementById(`${name}-search`).value = '';
+  if(document.getElementById(`${name}-overdue`)) document.getElementById(`${name}-overdue`).checked = false;
+  if(document.getElementById(`${name}-mindrought`)) document.getElementById(`${name}-mindrought`).value = '';
+
+  document.querySelectorAll(`input[data-filter="${name}-teams"]`).forEach(x => x.checked = false);
+  document.querySelectorAll(`input[data-filter="${name}-status"]`).forEach(x => x.checked = false);
+  document.querySelectorAll(`input[data-filter="${name}-parks"]`).forEach(x => x.checked = false);
+  document.querySelectorAll(`input[data-filter="${name}-opps"]`).forEach(x => x.checked = false);
+
+  renderOne(name, D.research?.[name] || []);
+}
+
+function toggleSort(name,k){
+  if(!S[name]||S[name].k!==k) S[name]={k,d:'desc'};
+  else S[name].d=S[name].d==='desc'?'asc':'desc';
+  renderOne(name, D.research?.[name] || []);
+}
+
+function renderCheckboxGroup(name,key,title,vals){
+  return `<div class="box"><div class="m">${title}</div><div class="list">${
+    vals.map(v=>`<label class="item"><input type="checkbox" data-filter="${name}-${key}" value="${e(v)}"><span>${e(v)}</span></label>`).join('') || '<div class="empty">None</div>'
+  }</div></div>`;
+}
+
+function renderOne(name,rows){
+  let d=applyFilters(name, Array.isArray(rows)?rows:[]);
+  let sk=S[name]?.k, sd=S[name]?.d||'desc';
+  if(sk) d=sortRows(d,sk,sd);
+
+  let c=cols(d.length?d:rows);
+  let tgt=document.getElementById('tbl_'+name);
+  if(!tgt) return;
+
+  if(!d.length){
+    tgt.innerHTML='<div class="card">No rows to show.</div>';
+    return;
+  }
+
+  tgt.innerHTML=`<div class="tbl"><table><thead><tr>${
+    c.map(k=>`<th onclick="toggleSort('${name}','${k}')">${e(k)}${sk===k?(sd==='asc'?' ▲':' ▼'):''}</th>`).join('')
+  }</tr></thead><tbody>${
+    d.map(r=>`<tr>${c.map(k=>`<td>${e(r[k]??'—')}</td>`).join('')}</tr>`).join('')
+  }</tbody></table></div>`;
+}
+
+function renderResearch(){
+  let s=D.research||{},
+      order=['game_rankings','pitcher_line_value','pitcher_metrics','top_picks','refined_picks','hr_drought','hit_drought'],
+      labels={game_rankings:'Game Rankings',pitcher_line_value:'Pitcher Line Value',pitcher_metrics:'Pitcher Metrics',top_picks:'Top Picks',refined_picks:'Refined Picks',hr_drought:'HR Drought',hit_drought:'Hit Drought'};
+
+  research.innerHTML=order.map(name=>{
+    let rows=s[name]||[], adv=['hr_drought','hit_drought'].includes(name);
+
+    return `<div class="panel">
+      <div><b>${labels[name]}</b></div>
+      ${adv
+        ? `<div class="tools">
+             <input id="${name}-search" type="text" placeholder="Search this table">
+             <label class="item"><input id="${name}-overdue" type="checkbox"><span>Overdue only</span></label>
+             <input id="${name}-mindrought" type="number" placeholder="Min drought">
+           </div>
+           <div class="grid">
+             ${renderCheckboxGroup(name,'teams','Teams',uniq(rows,'teamName'))}
+             ${renderCheckboxGroup(name,'status','Status',uniq(rows,'status'))}
+             ${renderCheckboxGroup(name,'parks','Park',uniq(rows,'park_favorability'))}
+             ${renderCheckboxGroup(name,'opps','Opponent Pitcher Type',uniq(rows,'opponent_pitcher_pick_type'))}
+           </div>
+           <div class="tools">
+             <button class="btn" onclick="renderOne('${name}',D.research?.['${name}']||[])">Apply Filters</button>
+             <button class="btn" onclick="clearFilters('${name}')">Clear Filters</button>
+           </div>`
+        : `<div class="tools">
+             <input id="${name}-search" type="text" placeholder="Search this table">
+             <button class="btn" onclick="renderOne('${name}',D.research?.['${name}']||[])">Apply Filters</button>
+             <button class="btn" onclick="clearFilters('${name}')">Clear Filters</button>
+           </div>`
+      }
+      <div id="tbl_${name}"></div>
+    </div>`;
+  }).join('');
+
+  order.forEach(name=>renderOne(name,s[name]||[]));
+}
+
+loadData();
 </script>
 </body>
 </html>
 """
 
-@app.get("/app", response_class=HTMLResponse)
-def app_page() -> HTMLResponse:
+
+@app.get("/app")
+def app_page():
     return HTMLResponse(HTML)
