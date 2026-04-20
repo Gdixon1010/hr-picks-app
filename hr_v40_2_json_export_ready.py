@@ -223,7 +223,7 @@ def save_app_json(payload, output_path):
 
 
 DEFAULT_SEASON = 2026
-OUTPUT_DIR = Path("output")
+OUTPUT_DIR = Path(r"C:\Users\gdixo\OneDrive\Desktop\HR Search\output")
 SLEEP_BETWEEN_CALLS = 0.02
 
 GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
@@ -331,19 +331,6 @@ def innings_to_float(ip):
             return None
     return whole_i + {0: 0.0, 1: 1 / 3, 2: 2 / 3}.get(frac_i, 0.0)
 
-
-
-
-def safe_int(val):
-    try:
-        if val is None:
-            return None
-        s = str(val).strip().lower()
-        if s in ("", "nan", "none"):
-            return None
-        return int(float(val))
-    except Exception:
-        return None
 
 def safe_div(n, d, fallback=0.0):
     try:
@@ -841,6 +828,14 @@ def determine_status(current_gap, avg_gap):
         return f"Slightly Overdue (+{current_gap - int(avg_gap)})"
     return f"Overdue (+{current_gap - int(avg_gap)})"
 
+
+def average_games_per_event(games_played, event_count):
+    gp = nz(games_played, None)
+    ec = nz(event_count, None)
+    if gp is None or ec is None or ec <= 0:
+        return None
+    return round(float(gp) / float(ec), 2)
+
 def get_pitcher_season_stats(pid: int, season: int) -> dict:
     if not pid:
         return {}
@@ -895,8 +890,7 @@ def build_pitcher_metrics(schedule_rows: pd.DataFrame, season: int) -> pd.DataFr
                 continue
             print_step(f"🎯 Pitcher {counter}/{total}: {pitcher_name} ({team})")
             stat = get_pitcher_season_stats(pitcher_id, season)
-            pid = safe_int(pitcher_id)
-            logs = get_pitcher_game_logs(pid, season) if pid is not None else pd.DataFrame()
+            logs = get_pitcher_game_logs(int(float(pitcher_id)), season) if pitcher_id else pd.DataFrame()
             recent = summarize_recent_pitcher_form(logs)
             ip = stat.get("inningsPitched")
             so = stat.get("strikeOuts")
@@ -990,8 +984,10 @@ def build_hit_hr_rows(pool_df: pd.DataFrame, season: int, sched_ctx: dict) -> pd
         logs = get_player_game_logs(int(row["playerId"]), season)
         hr_d = compute_drought_metrics(logs, "homeRuns")
         hit_d = compute_drought_metrics(logs, "hits")
-        hr_status = determine_status(hr_d["current_gap"], hr_d["avg_games_between"])
-        hit_status = determine_status(hit_d["current_gap"], hit_d["avg_games_between"])
+        avg_games_between_hrs = average_games_per_event(row.get("gamesPlayed"), row.get("homeRuns"))
+        avg_games_between_hits = average_games_per_event(row.get("gamesPlayed"), row.get("hits"))
+        hr_status = determine_status(hr_d["current_gap"], avg_games_between_hrs)
+        hit_status = determine_status(hit_d["current_gap"], avg_games_between_hits)
         last10 = logs.tail(10)
         hit_pct_last_10 = round((len(last10[last10["hits"] > 0]) / 10) * 100, 1) if len(last10) == 10 else None
         ctx = sched_ctx.get(row["teamName"], {})
@@ -1011,9 +1007,9 @@ def build_hit_hr_rows(pool_df: pd.DataFrame, season: int, sched_ctx: dict) -> pd
         rows.append({
             "season": season, "teamName": row["teamName"], "playerName": row["playerName"], "playerId": row["playerId"],
             "homeRuns": row["homeRuns"], "gamesPlayed": row["gamesPlayed"], "totalHits": row["hits"],
-            "avg_games_between_hrs": hr_d["avg_games_between"], "current_games_without_hr": hr_d["current_gap"],
+            "avg_games_between_hrs": avg_games_between_hrs, "current_games_without_hr": hr_d["current_gap"],
             "longest_games_without_hr": hr_d["longest_drought"], "last_hr_date": hr_d["last_event_date"],
-            "hr_status": hr_status, "avg_games_between_hits": hit_d["avg_games_between"],
+            "hr_status": hr_status, "avg_games_between_hits": avg_games_between_hits,
             "current_games_without_hit": hit_d["current_gap"], "longestHitDrought": hit_d["longest_drought"],
             "hit_status": hit_status, "hit_pct_last_10": hit_pct_last_10, "season_hit_pct": season_hit_pct,
             "auto_pitcher_name": ctx.get("opp_pitcher_name"), "auto_pitcher_hand": ctx.get("opp_pitcher_hand"),
