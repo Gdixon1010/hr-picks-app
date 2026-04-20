@@ -36,31 +36,46 @@ def read_json_file(path: Path, default):
         pass
     return default
 
+
 def load_latest_data():
+    history_dir = OUTPUT_DIR / "history"
     latest = get_latest_json_file()
-    if not latest:
-        return {
+
+    if latest and latest.exists():
+        with open(latest, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        filename = latest.name
+        path_str = str(latest)
+        try:
+            eastern_now = dt.datetime.fromtimestamp(latest.stat().st_mtime, ZoneInfo("America/New_York"))
+            display = eastern_now.strftime("%b %d, %Y %I:%M %p ET").replace(" 0", " ")
+        except Exception:
+            eastern_now = None
+            display = None
+    else:
+        snapshot = read_json_file(history_dir / "latest_app_data.json", {})
+        data = snapshot.get("app_payload") or {
             "date": None,
             "final_card": {"generated_section": "final_card", "plays": []},
             "games": [],
             "research": {},
-            "results": {"overall": {}, "by_bet_type": [], "by_confidence": [], "recent_results": []},
-            "info": {},
-            "_meta": {"filename": None, "last_updated_display": None},
         }
+        filename = snapshot.get("json_filename")
+        path_str = str(history_dir / "latest_app_data.json") if snapshot else None
+        eastern_now = None
+        saved_label = snapshot.get("saved_at_et")
+        display = saved_label
 
-    with open(latest, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    frozen_latest = read_json_file(history_dir / "final_card_by_date_latest.json", {})
+    frozen_rows = frozen_latest.get("rows") or []
+    frozen_date = frozen_latest.get("target_date")
 
-    display = None
-    eastern_now = None
-    try:
-        eastern_now = dt.datetime.fromtimestamp(latest.stat().st_mtime, ZoneInfo("America/New_York"))
-        display = eastern_now.strftime("%b %d, %Y %I:%M %p ET").replace(" 0", " ")
-    except Exception:
-        pass
+    data_date = str(data.get("date")) if data.get("date") else None
+    if frozen_rows and frozen_date and (data_date is None or frozen_date == data_date):
+        data["final_card"] = {"generated_section": "final_card", "plays": frozen_rows}
+        if not data.get("date"):
+            data["date"] = frozen_date
 
-    history_dir = OUTPUT_DIR / "history"
     data["results"] = read_json_file(history_dir / "performance_summary_latest.json", {"overall": {}, "by_bet_type": [], "by_confidence": [], "recent_results": []})
     data["results_latest"] = read_json_file(history_dir / "results_history_latest.json", {"graded_rows": 0, "rows": []})
     data["info"] = {
@@ -86,8 +101,8 @@ def load_latest_data():
         ]
     }
     data["_meta"] = {
-        "filename": latest.name,
-        "path": str(latest),
+        "filename": filename,
+        "path": path_str,
         "last_updated_display": display,
         "eastern_now": eastern_now.strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ") if eastern_now else None,
     }
