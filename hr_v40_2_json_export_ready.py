@@ -985,48 +985,93 @@ def build_locked_player_pool(all_players: pd.DataFrame, lineup_map: dict, slot_m
 def build_hit_hr_rows(pool_df: pd.DataFrame, season: int, sched_ctx: dict) -> pd.DataFrame:
     rows = []
     total = max(len(pool_df), 1)
+
     for i, (_, row) in enumerate(pool_df.iterrows(), 1):
         print_step(f"👤 Player {i}/{total}: {row['playerName']} ({row['teamName']})")
+
         logs = get_player_game_logs(int(row["playerId"]), season)
         hr_d = compute_drought_metrics(logs, "homeRuns")
         hit_d = compute_drought_metrics(logs, "hits")
-        hr_status = determine_status(hr_d["current_gap"], hr_d["avg_games_between"])
-        hit_status = determine_status(hit_d["current_gap"], hit_d["avg_games_between"])
+
+        avg_hr = average_games_per_event(row.get("gamesPlayed"), row.get("homeRuns"))
+        avg_hit = average_games_per_event(row.get("gamesPlayed"), row.get("hits"))
+
+        hr_status = determine_status(hr_d["current_gap"], avg_hr)
+        hit_status = determine_status(hit_d["current_gap"], avg_hit)
+
         last10 = logs.tail(10)
         hit_pct_last_10 = round((len(last10[last10["hits"] > 0]) / 10) * 100, 1) if len(last10) == 10 else None
+
         ctx = sched_ctx.get(row["teamName"], {})
         season_hit_pct = pct(row["hits"], row.get("atBats", 0))
+
         slot_raw = row.get("batting_order_slot")
         slot = 9 if pd.isna(slot_raw) else int(slot_raw)
         lineup_bonus = max(0, 10 - slot) * 0.12
+
         team_volatility = get_team_volatility(row["teamName"])
         public_bias = get_public_bias(row["teamName"])
         hit_vol_penalty = get_volatility_penalty(row["teamName"], "hit")
         hr_vol_penalty = get_volatility_penalty(row["teamName"], "hr")
         hr_public_penalty = get_public_bias_penalty(row["teamName"], "hr")
-        hr_score_raw = (row["homeRuns"] / max(row["gamesPlayed"], 1) * 10 * 0.40) + (overdue_value(hr_status) * 0.25) + (park_value(ctx.get("park_favorability")) * 0.20) + lineup_bonus
-        hit_score_raw = (nz(season_hit_pct) / 10.0 * 0.40) + (nz(hit_pct_last_10) / 10.0 * 0.20) + (park_value(ctx.get("park_favorability")) * 0.05) + lineup_bonus
+
+        hr_score_raw = (
+            (row["homeRuns"] / max(row["gamesPlayed"], 1) * 10 * 0.40)
+            + (overdue_value(hr_status) * 0.25)
+            + (park_value(ctx.get("park_favorability")) * 0.20)
+            + lineup_bonus
+        )
+
+        hit_score_raw = (
+            (nz(season_hit_pct) / 10.0 * 0.40)
+            + (nz(hit_pct_last_10) / 10.0 * 0.20)
+            + (park_value(ctx.get("park_favorability")) * 0.05)
+            + lineup_bonus
+        )
+
         hr_score = round(hr_score_raw - hr_vol_penalty - hr_public_penalty, 3)
         hit_score = round(hit_score_raw - hit_vol_penalty, 3)
+
         rows.append({
-            "season": season, "teamName": row["teamName"], "playerName": row["playerName"], "playerId": row["playerId"],
-            "homeRuns": row["homeRuns"], "gamesPlayed": row["gamesPlayed"], "totalHits": row["hits"],
-            "avg_games_between_hrs": hr_d["avg_games_between"], "current_games_without_hr": hr_d["current_gap"],
-            "longest_games_without_hr": hr_d["longest_drought"], "last_hr_date": hr_d["last_event_date"],
-            "hr_status": hr_status, "avg_games_between_hits": hit_d["avg_games_between"],
-            "current_games_without_hit": hit_d["current_gap"], "longestHitDrought": hit_d["longest_drought"],
-            "hit_status": hit_status, "hit_pct_last_10": hit_pct_last_10, "season_hit_pct": season_hit_pct,
-            "auto_pitcher_name": ctx.get("opp_pitcher_name"), "auto_pitcher_hand": ctx.get("opp_pitcher_hand"),
-            "park_favorability": ctx.get("park_favorability"), "game_park_team": ctx.get("game_park_team"),
+            "season": season,
+            "teamName": row["teamName"],
+            "playerName": row["playerName"],
+            "playerId": row["playerId"],
+            "homeRuns": row["homeRuns"],
+            "gamesPlayed": row["gamesPlayed"],
+            "totalHits": row["hits"],
+            "avg_games_between_hrs": avg_hr,
+            "current_games_without_hr": hr_d["current_gap"],
+            "longest_games_without_hr": hr_d["longest_drought"],
+            "last_hr_date": hr_d["last_event_date"],
+            "hr_status": hr_status,
+            "avg_games_between_hits": avg_hit,
+            "current_games_without_hit": hit_d["current_gap"],
+            "longestHitDrought": hit_d["longest_drought"],
+            "hit_status": hit_status,
+            "hit_pct_last_10": hit_pct_last_10,
+            "season_hit_pct": season_hit_pct,
+            "auto_pitcher_name": ctx.get("opp_pitcher_name"),
+            "auto_pitcher_hand": ctx.get("opp_pitcher_hand"),
+            "park_favorability": ctx.get("park_favorability"),
+            "game_park_team": ctx.get("game_park_team"),
             "game_park_name": ctx.get("game_park_name"),
-            "HR_score_raw": round(hr_score_raw, 3), "Hit_score_raw": round(hit_score_raw, 3),
-            "HR_score": hr_score, "Hit_score": hit_score,
-            "team_volatility": team_volatility, "public_bias": public_bias,
-            "volatility_penalty_hit": hit_vol_penalty, "volatility_penalty_hr": hr_vol_penalty, "public_bias_penalty_hr": hr_public_penalty,
-            "lineup_status": row.get("lineup_status"), "batting_order_slot": row.get("batting_order_slot"),
+            "HR_score_raw": round(hr_score_raw, 3),
+            "Hit_score_raw": round(hit_score_raw, 3),
+            "HR_score": hr_score,
+            "Hit_score": hit_score,
+            "team_volatility": team_volatility,
+            "public_bias": public_bias,
+            "volatility_penalty_hit": hit_vol_penalty,
+            "volatility_penalty_hr": hr_vol_penalty,
+            "public_bias_penalty_hr": hr_public_penalty,
+            "lineup_status": row.get("lineup_status"),
+            "batting_order_slot": row.get("batting_order_slot"),
             "starter_only_flag": row.get("starter_only_flag"),
         })
+
         time.sleep(SLEEP_BETWEEN_CALLS)
+
     return pd.DataFrame(rows)
 
 def build_game_rankings(schedule_rows, hr_rows, hit_rows, pitcher_metrics):
