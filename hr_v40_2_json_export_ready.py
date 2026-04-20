@@ -234,6 +234,164 @@ def save_app_json(payload, output_path):
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
+def append_jsonl_rows(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def upsert_history_csv(path: Path, rows: list[dict]) -> None:
+    if not rows:
+        return
+    new_df = pd.DataFrame(rows)
+    if path.exists():
+        try:
+            old_df = pd.read_csv(path)
+            combined = pd.concat([old_df, new_df], ignore_index=True)
+        except Exception:
+            combined = new_df.copy()
+    else:
+        combined = new_df.copy()
+
+    dedupe_cols = [c for c in ["run_id", "history_type", "game", "pick", "team", "slot"] if c in combined.columns]
+    if dedupe_cols:
+        combined = combined.drop_duplicates(subset=dedupe_cols, keep="last")
+    combined.to_csv(path, index=False)
+
+
+def build_pick_history_rows(target_date: str, run_ts_et: dt.datetime, json_filename: str, final_card_df: pd.DataFrame, top_picks_df: pd.DataFrame, game_rankings_df: pd.DataFrame, pitcher_line_value_df: pd.DataFrame) -> list[dict]:
+    run_id = f"{target_date}_{run_ts_et.strftime('%Y%m%d_%H%M%S')}"
+    run_ts_label = run_ts_et.strftime("%Y-%m-%d %I:%M:%S %p ET")
+    rows: list[dict] = []
+
+    if final_card_df is not None and not final_card_df.empty:
+        for _, r in final_card_df.iterrows():
+            rows.append({
+                "run_id": run_id,
+                "history_type": "final_card",
+                "target_date": target_date,
+                "generated_at_et": run_ts_label,
+                "json_filename": json_filename,
+                "slot": _clean_value(r.get("slot")),
+                "bet_type": _clean_value(r.get("bet_type")),
+                "pick": _clean_value(r.get("pick")),
+                "team": _clean_value(r.get("team")),
+                "opponent": _clean_value(r.get("opponent")),
+                "game": None,
+                "confidence": _clean_value(r.get("confidence")),
+                "score": None,
+                "why_it_made_the_card": _clean_value(r.get("why_it_made_the_card")),
+                "source_tab": _clean_value(r.get("source_tab")),
+                "result_status": "pending",
+                "result_detail": None,
+            })
+
+    if top_picks_df is not None and not top_picks_df.empty:
+        for _, r in top_picks_df.iterrows():
+            score = r.get("HR_score") if pd.notna(r.get("HR_score")) else r.get("Hit_score")
+            rows.append({
+                "run_id": run_id,
+                "history_type": "top_pick",
+                "target_date": target_date,
+                "generated_at_et": run_ts_label,
+                "json_filename": json_filename,
+                "slot": _clean_value(r.get("type")),
+                "bet_type": "HR" if _clean_value(r.get("type")) == "HR" else "1+ Hit",
+                "pick": _clean_value(r.get("playerName")),
+                "team": _clean_value(r.get("teamName")),
+                "opponent": None,
+                "game": None,
+                "confidence": None,
+                "score": _clean_value(score),
+                "why_it_made_the_card": None,
+                "source_tab": "Top_Picks",
+                "result_status": "pending",
+                "result_detail": None,
+            })
+
+    if game_rankings_df is not None and not game_rankings_df.empty:
+        best_ml = game_rankings_df.sort_values(["game", "edge_vs_opponent"], ascending=[True, False]).groupby("game", as_index=False).head(1)
+        for _, r in best_ml.iterrows():
+            rows.append({
+                "run_id": run_id,
+                "history_type": "ml_lean",
+                "target_date": target_date,
+                "generated_at_et": run_ts_label,
+                "json_filename": json_filename,
+                "slot": None,
+                "bet_type": "Moneyline",
+                "pick": f"{_clean_value(r.get('teamName'))} ML",
+                "team": _clean_value(r.get("teamName")),
+                "opponent": _clean_value(r.get("opponentTeam")),
+                "game": _clean_value(r.get("game")),
+                "confidence": _clean_value(r.get("win_rating")),
+                "score": _clean_value(r.get("edge_vs_opponent")),
+                "why_it_made_the_card": _clean_value(r.get("recommended_play")),
+                "source_tab": "Game_Rankings",
+                "result_status": "pending",
+                "result_detail": None,
+            })
+
+    if pitcher_line_value_df is not None and not pitcher_line_value_df.empty:
+        for _, r in pitcher_line_value_df.iterrows():
+            if str(r.get("recommended_k_action") or "").startswith("Pass"):
+                continue
+            rows.append({
+                "run_id": run_id,
+                "history_type": "k_prop",
+                "target_date": target_date,
+                "generated_at_et": run_ts_label,
+                "json_filename": json_filename,
+                "slot": None,
+                "bet_type": "K Prop",
+                "pick": _clean_value(r.get("pitcherName")),
+                "team": _clean_value(r.get("teamName")),
+                "opponent": _clean_value(r.get("opponentTeam")),
+                "game": None,
+                "confidence": _clean_value(r.get("k_value_tier")),
+                "score": _clean_value(r.get("projected_k_mid")),
+                "why_it_made_the_card": _clean_value(r.get("recommended_k_action")),
+                "source_tab": "Pitcher_Line_Value",
+                "result_status": "pending",
+                "result_detail": None,
+            })
+
+    return rows
+
+
+def save_pick_history(target_date: str, json_filename: str, final_card_df: pd.DataFrame, top_picks_df: pd.DataFrame, game_rankings_df: pd.DataFrame, pitcher_line_value_df: pd.DataFrame) -> dict:
+    history_dir = OUTPUT_DIR / "history"
+    run_ts_et = dt.datetime.now(ZoneInfo("America/New_York"))
+    rows = build_pick_history_rows(target_date, run_ts_et, json_filename, final_card_df, top_picks_df, game_rankings_df, pitcher_line_value_df)
+
+    jsonl_path = history_dir / "pick_history.jsonl"
+    csv_path = history_dir / "pick_history.csv"
+    latest_path = history_dir / "pick_history_latest.json"
+
+    append_jsonl_rows(jsonl_path, rows)
+    upsert_history_csv(csv_path, rows)
+
+    latest_payload = {
+        "target_date": target_date,
+        "generated_at_et": run_ts_et.strftime("%Y-%m-%d %I:%M:%S %p ET"),
+        "json_filename": json_filename,
+        "records_saved": len(rows),
+        "history_jsonl": str(jsonl_path),
+        "history_csv": str(csv_path),
+        "rows": rows,
+    }
+    with open(latest_path, "w", encoding="utf-8") as f:
+        json.dump(latest_payload, f, indent=2, ensure_ascii=False)
+
+    return {
+        "rows_saved": len(rows),
+        "history_jsonl": jsonl_path,
+        "history_csv": csv_path,
+        "latest_json": latest_path,
+    }
+
+
 DEFAULT_SEASON = 2026
 SLEEP_BETWEEN_CALLS = 0.02
 
@@ -1540,6 +1698,17 @@ def main(season: int, target_date: str):
 
     save_app_json(app_payload, json_output_path)
     print_step(f"🧾 JSON created: {json_output_path}")
+
+    history_info = save_pick_history(
+        target_date=target_date,
+        json_filename=json_filename,
+        final_card_df=final_card,
+        top_picks_df=top_picks,
+        game_rankings_df=game_rankings,
+        pitcher_line_value_df=pitcher_line_value,
+    )
+    print_step(f"🗂️ Pick history saved: {history_info['rows_saved']} rows")
+    print_step(f"🗂️ History CSV: {history_info['history_csv']}")
 
     print_step("✅ DONE!")
     print_step(f"Created: {outfile}")
