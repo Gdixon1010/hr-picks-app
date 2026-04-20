@@ -5,6 +5,7 @@ import argparse
 import datetime as dt
 import re
 import time
+import os
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -13,8 +14,26 @@ import requests
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 
-OUTPUT_DIR = Path("output")
-OUTPUT_DIR.mkdir(exist_ok=True)
+
+
+def resolve_storage_dir() -> Path:
+    configured = os.getenv("HR_APP_DATA_DIR")
+    if configured:
+        p = Path(configured)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    render_default = Path("/var/data/hr-picks/output")
+    if render_default.parent.exists():
+        render_default.mkdir(parents=True, exist_ok=True)
+        return render_default
+
+    local_default = Path("output")
+    local_default.mkdir(parents=True, exist_ok=True)
+    return local_default
+
+
+OUTPUT_DIR = resolve_storage_dir()
 def _clean_value(v):
     """Convert pandas/numpy values into JSON-safe Python values."""
     try:
