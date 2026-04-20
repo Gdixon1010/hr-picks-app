@@ -44,7 +44,7 @@ def save_v41_data(data):
 def build_v41():
     v40_data = load_v40_data()
 
-    # 🔥 You can enhance this later — for now we pass through
+    # pass-through for now
     v41_data = v40_data
 
     output_file = save_v41_data(v41_data)
@@ -56,8 +56,13 @@ def build_v41():
     }
 
 # =========================
-# ENTRY POINT
+# 🔥 THIS IS THE FIX
+# =========================
+def main():
+    return build_v41()
+
+# =========================
+# CLI RUN
 # =========================
 if __name__ == "__main__":
-    result = build_v41()
-    print(result)
+    print(main())
