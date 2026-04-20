@@ -19,12 +19,40 @@ def get_eastern_today():
     return datetime.now(EASTERN_TZ).strftime("%Y-%m-%d")
 
 
+def get_matching_json_files(pattern: str):
+    files = list(OUTPUT_DIR.glob(pattern))
+    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
 def get_latest_json_file():
-    files = []
-    for pat in ("HR_Hit_Drought_v41_appdata-*.json", "HR_Hit_Drought_v40_appdata-*.json"):
-        files.extend(OUTPUT_DIR.glob(pat))
+    files = get_matching_json_files("HR_Hit_Drought_v41_appdata-*.json") + get_matching_json_files("HR_Hit_Drought_v40_appdata-*.json")
     files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
     return files[0] if files else None
+
+
+def load_json_file(path: Path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def merge_game_times_from_v40(data: dict):
+    if data.get("games") and any(g.get("game_time_et") for g in data.get("games", [])):
+        return data
+    v40_files = get_matching_json_files("HR_Hit_Drought_v40_appdata-*.json")
+    if not v40_files:
+        return data
+    try:
+        v40_data = load_json_file(v40_files[0])
+        time_map = {g.get("game"): {"game_time_et": g.get("game_time_et"), "venue": g.get("venue")} for g in v40_data.get("games", [])}
+        for g in data.get("games", []):
+            extra = time_map.get(g.get("game"), {})
+            if extra.get("game_time_et") and not g.get("game_time_et"):
+                g["game_time_et"] = extra.get("game_time_et")
+            if extra.get("venue") and not g.get("venue"):
+                g["venue"] = extra.get("venue")
+    except Exception:
+        pass
+    return data
 
 
 def load_latest_data():
@@ -38,8 +66,8 @@ def load_latest_data():
             "_meta": {"filename": None, "last_updated": None},
         }
 
-    with open(latest_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    data = load_json_file(latest_file)
+    data = merge_game_times_from_v40(data)
 
     mtime = datetime.fromtimestamp(latest_file.stat().st_mtime, EASTERN_TZ)
     data["_meta"] = {
@@ -54,7 +82,7 @@ def load_latest_data():
 @app.get("/")
 def home():
     return {
-        "message": "HR Picks cloud app v42",
+        "message": "HR Picks cloud app v43",
         "endpoints": ["/app", "/latest", "/refresh-data"],
         "timezone": "America/New_York",
     }
@@ -83,7 +111,7 @@ HTML = r"""
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>HR Picks v42</title>
+<title>HR Picks v43</title>
 <style>
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:#070b24;color:#f2f4ff}
 .wrap{max-width:960px;margin:auto;padding:16px}
@@ -113,6 +141,7 @@ th{position:sticky;top:0;background:#141c40;cursor:pointer}
 <div class="wrap">
   <h1>HR Picks</h1>
   <div id="meta" class="meta">Loading…</div>
+  <div class="tools"><button class="tab" onclick="loadData()">Reload App</button></div>
   <div class="tabs">
     <button class="tab active" data-x="final">Final Card</button>
     <button class="tab" data-x="games">Games</button>
@@ -144,7 +173,7 @@ document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
 
 async function loadData(){
   D=await (await fetch('/latest')).json();
-  meta.innerHTML=`<div>Date: ${D.date||'—'}</div><div>${formatLastUpdated(D._meta)}</div><div class="small">Open the private refresh link separately to update the data.</div>`;
+  meta.innerHTML=`<div>Date: ${D.date||'—'}</div><div>${formatLastUpdated(D._meta)}</div>`;
   renderFinal();
   renderGames();
   renderResearch();
