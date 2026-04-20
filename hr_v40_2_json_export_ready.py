@@ -395,6 +395,66 @@ def save_pick_history(target_date: str, json_filename: str, final_card_df: pd.Da
 
 
 
+def save_latest_app_snapshot(target_date: str, app_payload: dict, json_filename: str) -> Path:
+    history_dir = OUTPUT_DIR / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    latest_path = history_dir / "latest_app_data.json"
+    payload = {
+        "target_date": target_date,
+        "saved_at_et": dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M:%S %p ET"),
+        "json_filename": json_filename,
+        "app_payload": app_payload,
+    }
+    with open(latest_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    return latest_path
+
+
+def save_frozen_daily_final_card(target_date: str, final_card_df: pd.DataFrame) -> pd.DataFrame:
+    history_dir = OUTPUT_DIR / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    store_path = history_dir / "final_card_by_date.json"
+    latest_path = history_dir / "final_card_by_date_latest.json"
+
+    try:
+        store = json.loads(store_path.read_text(encoding="utf-8")) if store_path.exists() else {}
+    except Exception:
+        store = {}
+
+    incoming_rows = df_to_records(final_card_df) if final_card_df is not None and not final_card_df.empty else []
+    existing_rows = store.get(str(target_date), []) or []
+
+    combined = existing_rows + incoming_rows
+    frozen_rows = []
+    seen = set()
+    for row in combined:
+        key = (
+            str(row.get("bet_type") or ""),
+            str(row.get("pick") or row.get("playerName") or ""),
+            str(row.get("team") or row.get("teamName") or ""),
+            str(row.get("opponent") or row.get("opponentTeam") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        frozen_rows.append(row)
+
+    store[str(target_date)] = frozen_rows
+
+    with open(store_path, "w", encoding="utf-8") as f:
+        json.dump(store, f, indent=2, ensure_ascii=False)
+
+    latest_payload = {
+        "target_date": str(target_date),
+        "saved_at_et": dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M:%S %p ET"),
+        "rows": frozen_rows,
+    }
+    with open(latest_path, "w", encoding="utf-8") as f:
+        json.dump(latest_payload, f, indent=2, ensure_ascii=False)
+
+    return pd.DataFrame(frozen_rows)
+
+
 def get_schedule_results_for_date(target_date: str) -> pd.DataFrame:
     try:
         data = get_json(
@@ -507,7 +567,7 @@ def grade_pending_history_rows(current_target_date: str, season: int) -> dict:
     if "graded_at_et" not in hist.columns:
         hist["graded_at_et"] = None
 
-    to_grade = hist[(hist["target_date"].astype(str) < str(current_target_date)) & (hist["result_status"].fillna("pending") == "pending")].copy()
+    to_grade = hist[(hist["target_date"].astype(str) <= str(current_target_date)) & (hist["result_status"].fillna("pending") == "pending")].copy()
     graded_rows = []
     if not to_grade.empty:
         schedule_cache = {}
@@ -1860,6 +1920,7 @@ def main(season: int, target_date: str):
 
     daily_card = build_daily_card(game_rankings, refined_picks, pitcher_line_value, hr_drought)
     final_card = build_final_card(player_rows, game_rankings, pitcher_line_value)
+    frozen_final_card = save_frozen_daily_final_card(target_date, final_card)
 
     ts = dt.datetime.now().strftime("%Y-%m-%d_%H%M")
     outfile = OUTPUT_DIR / f"HR_Hit_Drought_v40_stats-{season}_{ts}.xlsx"
@@ -1882,7 +1943,7 @@ def main(season: int, target_date: str):
         game_rankings.to_excel(writer, sheet_name="Game_Rankings", index=False)
         refined_picks.to_excel(writer, sheet_name="Refined_Picks", index=False)
         daily_card.to_excel(writer, sheet_name="Daily_Card", index=False)
-        final_card.to_excel(writer, sheet_name="Final_Card", index=False)
+        frozen_final_card.to_excel(writer, sheet_name="Final_Card", index=False)
 
         top_hr = pd.DataFrame()
         top_hit = pd.DataFrame()
@@ -1908,7 +1969,7 @@ def main(season: int, target_date: str):
 
     app_payload = build_app_payload(
         target_date=target_date,
-        final_card_df=final_card,
+        final_card_df=frozen_final_card,
         player_rows=player_rows,
         game_rankings=game_rankings,
         pitcher_metrics=pitcher_metrics,
@@ -1920,12 +1981,14 @@ def main(season: int, target_date: str):
     )
 
     save_app_json(app_payload, json_output_path)
+    latest_snapshot = save_latest_app_snapshot(target_date, app_payload, json_filename)
     print_step(f"🧾 JSON created: {json_output_path}")
+    print_step(f"🧾 Latest app snapshot: {latest_snapshot}")
 
     history_info = save_pick_history(
         target_date=target_date,
         json_filename=json_filename,
-        final_card_df=final_card,
+        final_card_df=frozen_final_card,
         top_picks_df=top_picks,
         game_rankings_df=game_rankings,
         pitcher_line_value_df=pitcher_line_value,
