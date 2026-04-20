@@ -235,6 +235,8 @@ let APP_DATA = null;
 let currentView = "final";
 let CURRENT_RESEARCH_KEY = null;
 let CURRENT_RESEARCH_ROWS = [];
+let CURRENT_SORT_COLUMN = "";
+let CURRENT_SORT_DIR = "asc";
 
 function esc(v) {
   if (v === null || v === undefined) return "";
@@ -480,7 +482,7 @@ function openResearchTable(key) {
       ${facets.length ? `<div class="facet-grid">${facets.join("")}</div>` : ""}
       <div class="table-wrap">
         <table id="researchTable">
-          <thead><tr>${columns.map(c => `<th class="${String(c).length > 18 ? 'wrap' : ''}">${esc(c)}</th>`).join("")}</tr></thead>
+          <thead><tr>${columns.map(c => `<th data-col="${esc(c)}" class="sortable ${String(c).length > 18 ? 'wrap' : ''}">${esc(c)}</th>`).join("")}</tr></thead>
           <tbody>
             ${rows.map(r => `<tr>${columns.map(c => `<td class="${String(c).length > 18 ? 'wrap' : ''}">${esc(fmt(r[c]))}</td>`).join("")}</tr>`).join("")}
           </tbody>
@@ -494,6 +496,19 @@ function openResearchTable(key) {
   clearBtn.addEventListener("click", clearResearchFilters);
   mount.querySelectorAll(".facet-check").forEach(el => {
     el.addEventListener("change", filterResearchTable);
+  });
+  mount.querySelectorAll("thead th.sortable").forEach(th => {
+    th.style.cursor = "pointer";
+    th.addEventListener("click", () => {
+      const col = th.dataset.col || "";
+      if (CURRENT_SORT_COLUMN === col) {
+        CURRENT_SORT_DIR = CURRENT_SORT_DIR === "asc" ? "desc" : "asc";
+      } else {
+        CURRENT_SORT_COLUMN = col;
+        CURRENT_SORT_DIR = "asc";
+      }
+      filterResearchTable();
+    });
   });
 
   filterResearchTable();
@@ -514,6 +529,8 @@ function clearResearchFilters() {
   if (minAvg) minAvg.value = "";
   if (minCurrent) minCurrent.value = "";
   document.querySelectorAll(".facet-check").forEach(c => c.checked = false);
+  CURRENT_SORT_COLUMN = "";
+  CURRENT_SORT_DIR = "asc";
   filterResearchTable();
 }
 
@@ -539,68 +556,90 @@ function filterResearchTable() {
   const table = document.getElementById("researchTable");
   if (!table) return;
 
-  const headers = Array.from(table.querySelectorAll("thead th")).map(th => th.textContent);
-  const colIndex = column ? headers.indexOf(column) : -1;
+  const headers = Array.from(table.querySelectorAll("thead th")).map(th => th.dataset.col || th.textContent || "");
   const tbody = table.querySelector("tbody");
-  let rows = Array.from(table.querySelectorAll("tbody tr"));
+  if (!tbody) return;
 
-  if (sortValue) {
-    const nameIdx = headers.includes("playerName") ? headers.indexOf("playerName") : 0;
-    rows.sort((a, b) => {
-      const aText = ((a.querySelectorAll("td")[nameIdx]?.textContent) || "").toLowerCase();
-      const bText = ((b.querySelectorAll("td")[nameIdx]?.textContent) || "").toLowerCase();
-      return sortValue === "asc" ? aText.localeCompare(bText) : bText.localeCompare(aText);
-    });
-    rows.forEach(tr => tbody.appendChild(tr));
-  }
+  let rows = Array.isArray(CURRENT_RESEARCH_ROWS) ? [...CURRENT_RESEARCH_ROWS] : [];
 
-  rows.forEach(tr => {
-    const cellValues = Array.from(tr.querySelectorAll("td")).map(td => td.textContent || "");
-    const lowerCells = cellValues.map(v => v.toLowerCase());
-
-    let show = true;
+  rows = rows.filter(r => {
+    const getVal = (key) => String(r?.[key] ?? "");
+    const headerVals = headers.map(h => getVal(h));
+    const lowerHeaderVals = headerVals.map(v => v.toLowerCase());
 
     if (search) {
-      const hay = colIndex >= 0 ? (lowerCells[colIndex] || "") : lowerCells.join(" | ");
-      if (!hay.includes(search)) show = false;
-    }
-
-    if (show && overdueOnly) {
-      const statusIdx = headers.indexOf("status");
-      const statusVal = statusIdx >= 0 ? (cellValues[statusIdx] || "") : "";
-      if (!String(statusVal).toLowerCase().includes("overdue")) show = false;
-    }
-
-    if (show && !Number.isNaN(minAvg)) {
-      const idx = headers.indexOf("avg_games_between_hrs");
-      if (idx >= 0) {
-        const num = parseFloat(cellValues[idx]);
-        if (Number.isNaN(num) || num < minAvg) show = false;
+      if (column) {
+        const hay = getVal(column).toLowerCase();
+        if (!hay.includes(search)) return false;
+      } else {
+        if (!lowerHeaderVals.join(" | ").includes(search)) return false;
       }
     }
 
-    if (show && !Number.isNaN(minCurrent)) {
-      const idx = headers.indexOf("current_games_without_hr");
-      if (idx >= 0) {
-        const num = parseFloat(cellValues[idx]);
-        if (Number.isNaN(num) || num < minCurrent) show = false;
+    if (overdueOnly) {
+      const statusVal = getVal("status").toLowerCase();
+      if (!statusVal.includes("overdue")) return false;
+    }
+
+    if (!Number.isNaN(minAvg)) {
+      const avgKey = headers.includes("avg_games_between_hrs") ? "avg_games_between_hrs" : (headers.includes("avg_games_between_hits") ? "avg_games_between_hits" : "");
+      if (avgKey) {
+        const num = parseFloat(getVal(avgKey));
+        if (Number.isNaN(num) || num < minAvg) return false;
       }
     }
 
-    if (show) {
-      for (const [key, valSet] of Object.entries(facetMap)) {
-        const idx = headers.indexOf(key);
-        if (idx >= 0) {
-          const val = cellValues[idx] || "";
-          if (!valSet.has(String(val))) {
-            show = false;
-            break;
-          }
-        }
+    if (!Number.isNaN(minCurrent)) {
+      const curKey = headers.includes("current_games_without_hr") ? "current_games_without_hr" : (headers.includes("current_games_without_hit") ? "current_games_without_hit" : "");
+      if (curKey) {
+        const num = parseFloat(getVal(curKey));
+        if (Number.isNaN(num) || num < minCurrent) return false;
       }
     }
 
-    tr.style.display = show ? "" : "none";
+    for (const [key, valSet] of Object.entries(facetMap)) {
+      const val = getVal(key);
+      if (!valSet.has(String(val))) return false;
+    }
+
+    return true;
+  });
+
+  if (CURRENT_SORT_COLUMN) {
+    rows.sort((a, b) => {
+      const av = String(a?.[CURRENT_SORT_COLUMN] ?? "");
+      const bv = String(b?.[CURRENT_SORT_COLUMN] ?? "");
+      const an = parseFloat(av);
+      const bn = parseFloat(bv);
+      const bothNumeric = !Number.isNaN(an) && !Number.isNaN(bn) && av.trim() !== "" && bv.trim() !== "";
+      if (bothNumeric) {
+        return CURRENT_SORT_DIR === "asc" ? an - bn : bn - an;
+      }
+      return CURRENT_SORT_DIR === "asc"
+        ? av.localeCompare(bv, undefined, {numeric:true, sensitivity:"base"})
+        : bv.localeCompare(av, undefined, {numeric:true, sensitivity:"base"});
+    });
+  } else if (sortValue) {
+    const sortKey = headers.includes("playerName") ? "playerName" : headers[0];
+    rows.sort((a, b) => {
+      const av = String(a?.[sortKey] ?? "");
+      const bv = String(b?.[sortKey] ?? "");
+      return sortValue === "asc"
+        ? av.localeCompare(bv, undefined, {numeric:true, sensitivity:"base"})
+        : bv.localeCompare(av, undefined, {numeric:true, sensitivity:"base"});
+    });
+  }
+
+  tbody.innerHTML = rows.map(r => `<tr>${headers.map(c => `<td class="${String(c).length > 18 ? 'wrap' : ''}">${esc(fmt(r[c]))}</td>`).join("")}</tr>`).join("");
+
+  document.querySelectorAll("thead th.sortable").forEach(th => {
+    const col = th.dataset.col || "";
+    const base = col;
+    if (CURRENT_SORT_COLUMN === col) {
+      th.textContent = `${base} ${CURRENT_SORT_DIR === 'asc' ? '↑' : '↓'}`;
+    } else {
+      th.textContent = base;
+    }
   });
 }
 
