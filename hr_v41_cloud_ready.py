@@ -1,68 +1,58 @@
 import os
-from pathlib import Path
 import json
+from pathlib import Path
 from datetime import datetime
 
-# =========================
-# ✅ USE PERSISTENT DISK
-# =========================
-BASE_DIR = Path(os.getenv("HR_APP_DATA_DIR", "output"))
-BASE_DIR.mkdir(parents=True, exist_ok=True)
+from hr_v40_2_json_export_ready import main as run_v40_main
 
-# =========================
-# FIND LATEST V40 FILE
-# =========================
-def get_latest_v40_file():
-    files = list(BASE_DIR.glob("HR_Hit_Drought_v40_appdata-*.json"))
+
+OUTPUT_DIR = Path(os.getenv("HR_APP_DATA_DIR", "output"))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _latest_v40_json() -> Path:
+    files = sorted(
+        OUTPUT_DIR.glob("HR_Hit_Drought_v40_appdata-*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
     if not files:
         raise FileNotFoundError("No v40 appdata JSON was created.")
-    return max(files, key=lambda x: x.stat().st_mtime)
+    return files[0]
 
-# =========================
-# LOAD V40 DATA
-# =========================
-def load_v40_data():
-    latest_file = get_latest_v40_file()
-    with open(latest_file, "r") as f:
-        return json.load(f)
 
-# =========================
-# SAVE V41 OUTPUT
-# =========================
-def save_v41_data(data):
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_path = BASE_DIR / f"HR_Hit_Drought_v41_appdata-{timestamp}.json"
+def _write_v41_json(data: dict, season: int, target_date: str) -> Path:
+    now_stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    out = OUTPUT_DIR / (
+        f"HR_Hit_Drought_v41_appdata-{season}_{target_date}_{target_date}_{now_stamp}.json"
+    )
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    return out
 
-    with open(file_path, "w") as f:
-        json.dump(data, f, indent=2)
 
-    return file_path
+def main(season: int, target_date: str):
+    # Run the v40 builder first. This creates the latest app snapshot on disk.
+    run_v40_main(season, target_date)
 
-# =========================
-# MAIN PROCESS
-# =========================
-def build_v41():
-    v40_data = load_v40_data()
+    latest_v40 = _latest_v40_json()
 
-    # pass-through for now
-    v41_data = v40_data
+    with open(latest_v40, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-    output_file = save_v41_data(v41_data)
+    # For now, v41 is a pass-through wrapper around the latest v40 appdata.
+    v41_path = _write_v41_json(data, season, target_date)
+
+    print(f"✅ v41 JSON created: {v41_path}")
 
     return {
         "status": "success",
         "message": "v41 built successfully",
-        "output_file": str(output_file)
+        "v40_source": str(latest_v40),
+        "v41_output": str(v41_path),
     }
 
-# =========================
-# 🔥 THIS IS THE FIX
-# =========================
-def main():
-    return build_v41()
 
-# =========================
-# CLI RUN
-# =========================
 if __name__ == "__main__":
-    print(main())
+    today = datetime.now().strftime("%Y-%m-%d")
+    print(main(2026, today))
