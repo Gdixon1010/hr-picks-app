@@ -1,5 +1,3 @@
-OUTPUT_DIR = Path("output")
-OUTPUT_DIR.mkdir(exist_ok=True)
 from __future__ import annotations
 
 import json
@@ -15,8 +13,8 @@ import requests
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 
-
-
+OUTPUT_DIR = Path("output")
+OUTPUT_DIR.mkdir(exist_ok=True)
 def _clean_value(v):
     """Convert pandas/numpy values into JSON-safe Python values."""
     try:
@@ -237,7 +235,6 @@ def save_app_json(payload, output_path):
 
 
 DEFAULT_SEASON = 2026
-OUTPUT_DIR = Path(r"C:\Users\gdixo\OneDrive\Desktop\HR Search\output")
 SLEEP_BETWEEN_CALLS = 0.02
 
 GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
@@ -363,7 +360,16 @@ def innings_to_float(ip):
     return whole_i + {0: 0.0, 1: 1 / 3, 2: 2 / 3}.get(frac_i, 0.0)
 
 
+def safe_int(v):
+    try:
+        if v is None or pd.isna(v):
+            return None
+        return int(float(v))
+    except Exception:
+        return None
+
 def safe_div(n, d, fallback=0.0):
+
     try:
         n = float(n)
         d = float(d)
