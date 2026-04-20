@@ -3,14 +3,34 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from pathlib import Path
 import json
 import datetime as dt
+import os
 from zoneinfo import ZoneInfo
 
 from hr_v41_cloud_ready import main as run_model_main
 
 app = FastAPI()
 
-OUTPUT_DIR = Path("output")
-OUTPUT_DIR.mkdir(exist_ok=True)
+
+
+def resolve_storage_dir() -> Path:
+    configured = os.getenv("HR_APP_DATA_DIR")
+    if configured:
+        p = Path(configured)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    # Helpful default for Render Disk users if they mount to /var/data
+    render_default = Path("/var/data/hr-picks/output")
+    if render_default.parent.exists():
+        render_default.mkdir(parents=True, exist_ok=True)
+        return render_default
+
+    local_default = Path("output")
+    local_default.mkdir(parents=True, exist_ok=True)
+    return local_default
+
+
+OUTPUT_DIR = resolve_storage_dir()
 
 
 def get_latest_json_file():
