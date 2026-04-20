@@ -25,6 +25,17 @@ def get_latest_json_file():
     return files[0] if files else None
 
 
+
+
+def read_json_file(path: Path, default):
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default
+
 def load_latest_data():
     latest = get_latest_json_file()
     if not latest:
@@ -33,6 +44,8 @@ def load_latest_data():
             "final_card": {"generated_section": "final_card", "plays": []},
             "games": [],
             "research": {},
+            "results": {"overall": {}, "by_bet_type": [], "by_confidence": [], "recent_results": []},
+            "info": {},
             "_meta": {"filename": None, "last_updated_display": None},
         }
 
@@ -47,6 +60,31 @@ def load_latest_data():
     except Exception:
         pass
 
+    history_dir = OUTPUT_DIR / "history"
+    data["results"] = read_json_file(history_dir / "performance_summary_latest.json", {"overall": {}, "by_bet_type": [], "by_confidence": [], "recent_results": []})
+    data["results_latest"] = read_json_file(history_dir / "results_history_latest.json", {"graded_rows": 0, "rows": []})
+    data["info"] = {
+        "purpose": "This app finds MLB betting edges by combining player trends, drought logic, matchup strength, pitcher quality, lineup context, and park factors.",
+        "how_to_use": [
+            "Start on Final Card for the strongest condensed plays.",
+            "Use Games to see matchup context, start time, and top game-level picks.",
+            "Use Research to drill into HR drought, hit drought, pitcher metrics, and game rankings.",
+            "Filter for overdue players, favorable parks, and weaker pitcher types to isolate stronger spots.",
+            "Treat Strong SP as a warning for hitter props and Short Leash Risk or Attack With Hitters as friendlier hitting environments."
+        ],
+        "terms": [
+            {"term": "Attack With Hitters", "meaning": "Pitcher or pitching environment is vulnerable enough to target hitters."},
+            {"term": "Strong SP", "meaning": "Strong starting pitcher. Usually a downgrade for hitter props."},
+            {"term": "Short Leash Risk", "meaning": "Pitcher may not work deep into the game, which can help hitters later against the bullpen."},
+            {"term": "K Upside", "meaning": "Pitcher has a favorable strikeout profile for K props."},
+            {"term": "On Pace", "meaning": "Current drought is normal relative to the player’s average pattern."},
+            {"term": "Slightly Overdue", "meaning": "Player is running a bit longer than usual without the event."},
+            {"term": "Overdue", "meaning": "Player is well beyond normal drought range and may be due for regression."},
+            {"term": "Hit Score", "meaning": "Composite score for hit probability using matchup, context, and trend inputs. Higher is better."},
+            {"term": "HR Score", "meaning": "Composite score for home run appeal using power, park, matchup, and drought context. Higher is better."},
+            {"term": "Moneyline Lean", "meaning": "The model sees an edge on that team, but size depends on edge strength and matchup quality."}
+        ]
+    }
     data["_meta"] = {
         "filename": latest.name,
         "path": str(latest),
@@ -223,11 +261,15 @@ def app_view():
       <button class="tab active" data-view="final">Final Card</button>
       <button class="tab" data-view="games">Games</button>
       <button class="tab" data-view="research">Research</button>
+      <button class="tab" data-view="info">Info</button>
+      <button class="tab" data-view="results">Results</button>
     </div>
 
     <section id="view-final"></section>
     <section id="view-games" class="hidden"></section>
     <section id="view-research" class="hidden"></section>
+    <section id="view-info" class="hidden"></section>
+    <section id="view-results" class="hidden"></section>
   </div>
 
 <script>
@@ -643,11 +685,85 @@ function filterResearchTable() {
   });
 }
 
+
+
+function renderInfo() {
+  const mount = document.getElementById("view-info");
+  const info = APP_DATA?.info || {};
+  const terms = Array.isArray(info.terms) ? info.terms : [];
+  const how = Array.isArray(info.how_to_use) ? info.how_to_use : [];
+  mount.innerHTML = `
+    <div class="cards">
+      <div class="card">
+        <h2>What This App Does</h2>
+        <div class="line">${esc(fmt(info.purpose || "This app ranks MLB betting edges across hits, HRs, Ks, and moneyline spots."))}</div>
+      </div>
+      <div class="card">
+        <h2>What To Look For</h2>
+        <ul class="list">${how.map(x => `<li>${esc(x)}</li>`).join("")}</ul>
+      </div>
+    </div>
+    <div class="table-shell" style="margin-top:18px;">
+      <h2 style="margin-top:0;">Key Terms</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Term</th><th class="wrap">Meaning</th></tr></thead>
+          <tbody>${terms.map(t => `<tr><td>${esc(fmt(t.term))}</td><td class="wrap">${esc(fmt(t.meaning))}</td></tr>`).join("")}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function renderResults() {
+  const mount = document.getElementById("view-results");
+  const results = APP_DATA?.results || {};
+  const overall = results.overall || {};
+  const byType = Array.isArray(results.by_bet_type) ? results.by_bet_type : [];
+  const byConf = Array.isArray(results.by_confidence) ? results.by_confidence : [];
+  const recent = Array.isArray(results.recent_results) ? results.recent_results : [];
+  mount.innerHTML = `
+    <div class="cards">
+      <div class="card"><h2>Overall Performance</h2>
+        <div class="line"><span class="label">Graded Picks:</span> ${esc(fmt(overall.graded_picks))}</div>
+        <div class="line"><span class="label">Wins:</span> ${esc(fmt(overall.wins))}</div>
+        <div class="line"><span class="label">Losses:</span> ${esc(fmt(overall.losses))}</div>
+        <div class="line"><span class="label">Win Rate:</span> ${overall.win_rate !== undefined && overall.win_rate !== null ? esc((overall.win_rate * 100).toFixed(1) + '%') : '—'}</div>
+      </div>
+      <div class="card"><h2>What This Is For</h2>
+        <div class="line">This tab tracks how saved picks perform over time so you can see what the model does well and where it needs tightening.</div>
+      </div>
+    </div>
+    <div class="cards" style="margin-top:18px;">
+      <div class="table-shell">
+        <h2 style="margin-top:0;">By Bet Type</h2>
+        <div class="table-wrap"><table><thead><tr><th>Bet Type</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
+        ${byType.map(r => `<tr><td>${esc(fmt(r.bet_type))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${r.win_rate !== undefined && r.win_rate !== null ? esc((Number(r.win_rate) * 100).toFixed(1) + '%') : '—'}</td></tr>`).join("") || '<tr><td colspan="5">No graded results yet.</td></tr>'}
+        </tbody></table></div>
+      </div>
+      <div class="table-shell">
+        <h2 style="margin-top:0;">By Confidence</h2>
+        <div class="table-wrap"><table><thead><tr><th>Confidence</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
+        ${byConf.map(r => `<tr><td>${esc(fmt(r.confidence))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${r.win_rate !== undefined && r.win_rate !== null ? esc((Number(r.win_rate) * 100).toFixed(1) + '%') : '—'}</td></tr>`).join("") || '<tr><td colspan="5">No confidence-level results yet.</td></tr>'}
+        </tbody></table></div>
+      </div>
+    </div>
+    <div class="table-shell" style="margin-top:18px;">
+      <h2 style="margin-top:0;">Recent Graded Picks</h2>
+      <div class="table-wrap"><table><thead><tr><th>Date</th><th>Bet Type</th><th>Pick</th><th>Team</th><th>Opponent</th><th>Confidence</th><th>Result</th><th class="wrap">Detail</th></tr></thead><tbody>
+      ${recent.map(r => `<tr><td>${esc(fmt(r.target_date))}</td><td>${esc(fmt(r.bet_type))}</td><td>${esc(fmt(r.pick))}</td><td>${esc(fmt(r.team))}</td><td>${esc(fmt(r.opponent))}</td><td>${esc(fmt(r.confidence))}</td><td>${esc(fmt(r.result_status))}</td><td class="wrap">${esc(fmt(r.result_detail))}</td></tr>`).join("") || '<tr><td colspan="8">No graded picks yet.</td></tr>'}
+      </tbody></table></div>
+    </div>
+  `;
+}
+
 function renderAll() {
   setMeta();
   renderFinal();
   renderGames();
   renderResearchHome();
+  renderInfo();
+  renderResults();
   switchView(currentView);
 }
 
@@ -656,6 +772,8 @@ function switchView(view) {
   document.getElementById("view-final").classList.toggle("hidden", view !== "final");
   document.getElementById("view-games").classList.toggle("hidden", view !== "games");
   document.getElementById("view-research").classList.toggle("hidden", view !== "research");
+  document.getElementById("view-info").classList.toggle("hidden", view !== "info");
+  document.getElementById("view-results").classList.toggle("hidden", view !== "results");
   document.querySelectorAll(".tab").forEach(btn => btn.classList.toggle("active", btn.dataset.view === view));
 }
 
