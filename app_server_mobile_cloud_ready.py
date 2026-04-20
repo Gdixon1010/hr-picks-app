@@ -35,16 +35,18 @@ def load_latest_data():
             "final_card": {"generated_section": "final_card", "plays": []},
             "games": [],
             "research": {},
-            "_meta": {"filename": None},
+            "_meta": {"filename": None, "last_updated": None},
         }
 
     with open(latest_file, "r", encoding="utf-8") as f:
         data = json.load(f)
 
+    mtime = datetime.fromtimestamp(latest_file.stat().st_mtime, EASTERN_TZ)
     data["_meta"] = {
         "filename": latest_file.name,
         "path": str(latest_file),
-        "eastern_now": datetime.now(EASTERN_TZ).strftime("%Y-%m-%d %I:%M %p ET"),
+        "last_updated": mtime.isoformat(),
+        "last_updated_display": mtime.strftime("%b %d, %Y %I:%M %p ET"),
     }
     return data
 
@@ -52,7 +54,7 @@ def load_latest_data():
 @app.get("/")
 def home():
     return {
-        "message": "HR Picks cloud app v41",
+        "message": "HR Picks cloud app v42",
         "endpoints": ["/app", "/latest", "/refresh-data"],
         "timezone": "America/New_York",
     }
@@ -81,13 +83,11 @@ HTML = r"""
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>HR Picks v41</title>
+<title>HR Picks v42</title>
 <style>
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:#070b24;color:#f2f4ff}
 .wrap{max-width:960px;margin:auto;padding:16px}
-.meta{color:#adb4da;margin:12px 0}
-.row{display:flex;gap:8px;flex-wrap:wrap}
-.btn{padding:12px 14px;border:none;border-radius:14px;background:#1a2248;color:#fff;font-weight:700;cursor:pointer}
+.meta{color:#adb4da;margin:10px 0 16px 0;line-height:1.5}
 .tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:14px 0}
 .tab{padding:12px;border:1px solid #334181;border-radius:14px;background:#121938;color:#fff;font-weight:800;cursor:pointer}
 .tab.active{outline:2px solid #8ea2ff}
@@ -105,6 +105,7 @@ table{width:100%;border-collapse:collapse}
 th,td{padding:8px 10px;border-bottom:1px solid #28366e;text-align:left}
 th{position:sticky;top:0;background:#141c40;cursor:pointer}
 .empty{color:#adb4da;padding:12px}
+.small{font-size:13px}
 @media(max-width:700px){.grid{grid-template-columns:1fr}}
 </style>
 </head>
@@ -112,10 +113,6 @@ th{position:sticky;top:0;background:#141c40;cursor:pointer}
 <div class="wrap">
   <h1>HR Picks</h1>
   <div id="meta" class="meta">Loading…</div>
-  <div class="row">
-    <button class="btn" onclick="refreshData()">Refresh Data</button>
-    <button class="btn" onclick="loadData()">Reload App</button>
-  </div>
   <div class="tabs">
     <button class="tab active" data-x="final">Final Card</button>
     <button class="tab" data-x="games">Games</button>
@@ -133,6 +130,11 @@ let S={};
 const e=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const n=v=>{let x=Number(v);return Number.isNaN(x)?String(v??'—'):x.toFixed(3).replace(/\.000$/,'')};
 
+function formatLastUpdated(meta){
+  if(!meta?.last_updated_display) return 'Last Updated: No data yet';
+  return `Last Updated: ${meta.last_updated_display}`;
+}
+
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
   document.querySelectorAll('.sec').forEach(x=>x.classList.remove('on'));
@@ -140,15 +142,9 @@ document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
   document.getElementById(b.dataset.x).classList.add('on');
 });
 
-async function refreshData(){
-  meta.textContent='Refreshing...';
-  await fetch('/refresh-data');
-  await loadData();
-}
-
 async function loadData(){
   D=await (await fetch('/latest')).json();
-  meta.textContent=`Date: ${D.date||'—'} • ${D._meta?.filename||'No data yet'} • ${D._meta?.eastern_now||''}`;
+  meta.innerHTML=`<div>Date: ${D.date||'—'}</div><div>${formatLastUpdated(D._meta)}</div><div class="small">Open the private refresh link separately to update the data.</div>`;
   renderFinal();
   renderGames();
   renderResearch();
@@ -173,6 +169,7 @@ function renderGames(){
     ? '<div class="card">No games yet.</div>'
     : g.map(x=>`<div class="card">
         <div><b>${e(x.game)}</b></div>
+        <div class="m">Start Time: ${e(x.game_time_et || x.start_time_et || 'Not available yet')}</div>
         <div class="m">Model Lean: ${e(x.ml_lean?.team||'No side')} vs ${e(x.ml_lean?.opponent||'—')} · Edge ${n(x.ml_lean?.edge_vs_opponent)}</div>
         <hr style="border-color:#2a376f">
         <div><b>Top Hit Picks</b>
@@ -181,6 +178,10 @@ function renderGames(){
         <hr style="border-color:#2a376f">
         <div><b>Top HR Picks</b>
           ${(x.top_hr_picks||[]).map(p=>`<div class="m">${e(p.playerName)} · ${e(p.teamName)} · ${n(p.HR_score)}</div>`).join('') || '<div class="m">None</div>'}
+        </div>
+        <hr style="border-color:#2a376f">
+        <div><b>Top K Pick</b>
+          ${x.top_k_pick ? `<div class="m">${e(x.top_k_pick.pitcherName)} · ${e(x.top_k_pick.teamName)} · ${e(x.top_k_pick.recommended_k_action || 'No action')}</div>` : '<div class="m">None</div>'}
         </div>
       </div>`).join('');
 }
@@ -342,6 +343,7 @@ loadData();
 </body>
 </html>
 """
+
 
 @app.get("/app")
 def app_page():
