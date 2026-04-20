@@ -1,13 +1,11 @@
-
-from __future__ import annotations
-
-import datetime as dt
-import json
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse, HTMLResponse
 from pathlib import Path
+import json
+import datetime as dt
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
+from hr_v41_cloud_ready import main as run_model_main
 
 app = FastAPI()
 
@@ -15,104 +13,47 @@ OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 
-def get_latest_json_file() -> Path | None:
+def get_latest_json_file():
     patterns = [
         "HR_Hit_Drought_v41_appdata-*.json",
         "HR_Hit_Drought_v40_appdata-*.json",
-        "HR_Hit_Drought_v41_appdata-*.JSON",
-        "HR_Hit_Drought_v40_appdata-*.JSON",
     ]
-    files: list[Path] = []
+    files = []
     for pat in patterns:
         files.extend(OUTPUT_DIR.glob(pat))
     files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
     return files[0] if files else None
 
 
-def load_latest_data() -> dict:
-    latest_file = get_latest_json_file()
-    if not latest_file:
+def load_latest_data():
+    latest = get_latest_json_file()
+    if not latest:
         return {
             "date": None,
             "final_card": {"generated_section": "final_card", "plays": []},
             "games": [],
             "research": {},
-            "_meta": {"filename": None, "path": None, "eastern_now": None},
+            "_meta": {"filename": None, "last_updated_display": None},
         }
 
-    with open(latest_file, "r", encoding="utf-8") as f:
+    with open(latest, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    meta = data.get("_meta", {})
-    eastern_now = meta.get("eastern_now")
-    if not eastern_now:
-        try:
-            modified = dt.datetime.fromtimestamp(latest_file.stat().st_mtime, tz=ZoneInfo("America/New_York"))
-            eastern_now = modified.strftime("%b %d, %Y %I:%M %p ET").replace(" 0", " ")
-        except Exception:
-            eastern_now = None
+    display = None
+    eastern_now = None
+    try:
+        eastern_now = dt.datetime.fromtimestamp(latest.stat().st_mtime, ZoneInfo("America/New_York"))
+        display = eastern_now.strftime("%b %d, %Y %I:%M %p ET").replace(" 0", " ")
+    except Exception:
+        pass
 
     data["_meta"] = {
-        "filename": latest_file.name,
-        "path": str(latest_file),
-        "eastern_now": eastern_now,
+        "filename": latest.name,
+        "path": str(latest),
+        "last_updated_display": display,
+        "eastern_now": eastern_now.strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ") if eastern_now else None,
     }
     return data
-
-
-def format_game_time_value(v: str | None) -> str | None:
-    if not v:
-        return None
-    s = str(v).strip()
-    if not s:
-        return None
-    return s
-
-
-def games_with_time_fallback(data: dict) -> list[dict]:
-    games = list(data.get("games") or [])
-    rankings = data.get("research", {}).get("game_rankings", []) or []
-
-    rank_lookup: dict[str, dict] = {}
-    for row in rankings:
-        game = row.get("game")
-        if game and game not in rank_lookup:
-            rank_lookup[game] = row
-
-    out = []
-    for g in games:
-        g2 = dict(g)
-        fallback = rank_lookup.get(g.get("game"), {})
-        game_time = (
-            g.get("game_time_et")
-            or g.get("start_time_et")
-            or g.get("start_time")
-            or fallback.get("game_time_et")
-            or fallback.get("start_time_et")
-            or fallback.get("start_time")
-        )
-        venue = g.get("venue") or fallback.get("venue")
-        g2["game_time_et"] = format_game_time_value(game_time)
-        g2["venue"] = venue
-        out.append(g2)
-
-    def sort_key(g: dict):
-        raw = g.get("game_time_et") or ""
-        if not raw:
-            return (99, 99)
-        try:
-            txt = raw.replace(" ET", "").strip()
-            t = dt.datetime.strptime(txt, "%I:%M %p")
-            return (t.hour, t.minute)
-        except Exception:
-            return (99, 99)
-
-    out.sort(key=sort_key)
-    return out
-
-
-def esc_js_text(v) -> str:
-    return json.dumps("" if v is None else str(v), ensure_ascii=False)
 
 
 @app.get("/latest")
@@ -122,129 +63,148 @@ def latest():
 
 @app.get("/refresh-data")
 def refresh_data():
-    import hr_v41_cloud_ready  # local import so app can still start if backend changes
-
-    eastern = ZoneInfo("America/New_York")
-    today = dt.datetime.now(eastern).date().isoformat()
-    hr_v41_cloud_ready.main(2026, today)
-    return JSONResponse({
-        "status": "ok",
-        "message": "Data refreshed",
-        "date": today,
-        "timezone": "America/New_York",
-    })
+    today = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    run_model_main(2026, today)
+    return JSONResponse({"status": "ok", "message": "Data refreshed", "date": today, "timezone": "America/New_York"})
 
 
+@app.get("/")
 @app.get("/app")
-def app_page():
-    data = load_latest_data()
-    data["games"] = games_with_time_fallback(data)
-
-    initial_data_json = json.dumps(data, ensure_ascii=False)
-
-    html = f"""<!doctype html>
+def app_view():
+    html = """
+<!doctype html>
 <html>
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HR Picks App</title>
   <style>
-    :root {{
-      --bg: #020617;
-      --card: #111827;
-      --card2: #0f172a;
-      --text: #f8fafc;
-      --muted: #cbd5e1;
-      --line: #24324d;
-      --pill: #22314f;
-      --accent: #5b8cff;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
+    :root {
+      --bg: #050914;
+      --card: #121925;
+      --card2: #0e1522;
+      --border: #26324a;
+      --text: #eef2f8;
+      --muted: #b8c1d1;
+      --accent: #4c83ff;
+      --accent2: #2f5ec7;
+      --chip: #172132;
+      --soft: #0c1320;
+    }
+    * { box-sizing: border-box; }
+    body {
       margin: 0;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       background: var(--bg);
       color: var(--text);
-    }}
-    .wrap {{ max-width: 1720px; margin: 0 auto; padding: 20px 24px 40px; }}
-    .topbar {{
-      display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom: 18px;
-    }}
-    h1 {{
-      margin:0 0 8px 0; font-size: 3.8rem; line-height: 1; font-weight: 900; letter-spacing: -.04em;
-    }}
-    .sub {{
-      color: var(--muted); font-size: 1rem;
-    }}
-    .reload-btn, .tab-btn, .back-btn, .card-btn, select, input {{
-      border-radius: 18px; border:1px solid #334155; color: white; background:#182235;
-      font-size: 1rem;
-    }}
-    .reload-btn {{
-      background: #638bf5; border-color:#638bf5; padding: 14px 24px; font-weight: 800; cursor:pointer;
-      color: white; min-width: 160px;
-    }}
-    .reload-btn:disabled {{ opacity:.7; cursor: wait; }}
-    .tabs {{ display:flex; gap:16px; margin: 20px 0 24px; flex-wrap: wrap; }}
-    .tab-btn {{
-      padding: 12px 22px; cursor:pointer; background:#162033;
-    }}
-    .tab-btn.active {{ background:#263754; }}
-    .panel {{ display:none; }}
-    .panel.active {{ display:block; }}
-    .grid {{
-      display:grid; grid-template-columns: repeat(4, minmax(260px, 1fr)); gap:18px;
-    }}
-    .card {{
-      background: linear-gradient(180deg, rgba(17,24,39,.96), rgba(15,23,42,.98));
-      border:1px solid var(--line); border-radius: 28px; padding: 22px 24px; box-shadow: 0 0 0 1px rgba(255,255,255,0.02) inset;
-    }}
-    .card h3 {{ margin:0 0 10px 0; font-size: 1.1rem; }}
-    .muted {{ color: var(--muted); }}
-    .small {{ font-size: .95rem; }}
-    .game-grid {{ display:grid; grid-template-columns: repeat(3, minmax(300px,1fr)); gap:18px; }}
-    .game-card h2 {{ margin:0 0 16px 0; font-size: 1.15rem; line-height: 1.2; }}
-    .section-label {{ font-weight: 800; font-size: 1rem; margin-top: 16px; }}
-    .bullet-list {{ margin: 8px 0 0 18px; padding:0; }}
-    .bullet-list li {{ margin: 6px 0; }}
-    .hero-grid {{ display:grid; grid-template-columns: repeat(3, minmax(260px,1fr)); gap:22px; }}
-    .play-card .slot {{
-      display:inline-block; padding:6px 12px; background:var(--pill); border-radius:999px; color:#dbeafe; font-size:.9rem; margin-bottom: 10px;
-    }}
-    .play-card h2 {{ margin:0 0 14px 0; font-size: 1.15rem; line-height: 1.15; }}
-    .kv {{ margin: 6px 0; font-size: 1rem; }}
-    .research-grid {{ display:grid; grid-template-columns: repeat(4, minmax(260px, 1fr)); gap:18px; }}
-    .research-card {{ cursor:pointer; }}
-    .research-card h3 {{ font-size: 1.2rem; margin:0 0 14px 0; }}
-    .toolbar {{
-      display:flex; gap:12px; flex-wrap: wrap; margin-bottom: 16px; align-items:center;
-    }}
-    .toolbar input, .toolbar select {{
-      padding: 12px 14px; background:#091223; min-width: 220px;
-    }}
-    .back-btn {{
-      padding: 12px 18px; background:#091223; cursor:pointer; margin: 4px 0 18px;
-    }}
-    table {{ width:100%; border-collapse: collapse; }}
-    th, td {{
-      text-align:left; padding: 12px 10px; border-bottom:1px solid #24324d; vertical-align: top;
-      font-size: .98rem;
-    }}
-    th {{ font-weight: 800; }}
-    .table-wrap {{ overflow:auto; background: transparent; }}
-    .status {{
-      display:inline-block; padding: 4px 10px; border-radius:999px; background:#1f2b45; font-size:.9rem;
-    }}
-    @media (max-width: 1400px) {{
-      .research-grid {{ grid-template-columns: repeat(3, minmax(260px, 1fr)); }}
-      .game-grid {{ grid-template-columns: repeat(2, minmax(300px,1fr)); }}
-    }}
-    @media (max-width: 980px) {{
-      h1 {{ font-size: 3rem; }}
-      .hero-grid, .game-grid, .grid, .research-grid {{ grid-template-columns: 1fr; }}
-      .topbar {{ flex-direction:column; }}
-      .reload-btn {{ align-self:flex-start; }}
-    }}
+    }
+    .wrap { max-width: 1520px; margin: 0 auto; padding: 18px 22px 48px; }
+    h1 { margin: 0 0 6px; font-size: 68px; line-height: 0.95; font-weight: 900; letter-spacing: -1px; }
+    .meta { color: var(--muted); font-size: 18px; margin-bottom: 18px; }
+    .topbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+    .btn {
+      background: var(--accent);
+      color: white;
+      border: 0;
+      border-radius: 16px;
+      padding: 14px 22px;
+      font-weight: 800;
+      font-size: 16px;
+      cursor: pointer;
+      box-shadow: 0 8px 24px rgba(76,131,255,.2);
+    }
+    .btn:hover { background: var(--accent2); }
+    .btn:disabled { opacity: .7; cursor: wait; }
+    .btn.secondary {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+      box-shadow: none;
+    }
+    .tabs { display: flex; gap: 12px; flex-wrap: wrap; margin: 18px 0 22px; }
+    .tab {
+      background: var(--chip);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 999px;
+      padding: 12px 16px;
+      cursor: pointer;
+      font-size: 16px;
+    }
+    .tab.active { background: #24324d; }
+    .hidden { display: none !important; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 18px; }
+    .card {
+      background: linear-gradient(180deg, var(--card), var(--card2));
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      padding: 22px 22px 18px;
+      box-shadow: 0 14px 40px rgba(0,0,0,.25);
+    }
+    .card h2 { margin: 0 0 14px; font-size: 24px; line-height: 1.15; }
+    .kicker { color: var(--muted); margin: 8px 0 18px; font-size: 15px; }
+    .line { margin: 8px 0; font-size: 17px; color: var(--text); }
+    .label { font-weight: 800; }
+    .muted { color: var(--muted); }
+    .pill {
+      display: inline-block; padding: 4px 10px; border-radius: 999px; background: #1d2740; border: 1px solid var(--border);
+      font-size: 13px; color: var(--muted);
+    }
+    .list { margin: 8px 0 0; padding-left: 18px; }
+    .list li { margin: 6px 0; }
+    .research-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+    .research-card { cursor: pointer; }
+    .research-card:hover { border-color: #4a5f8b; }
+    .research-title { font-size: 22px; font-weight: 900; margin-bottom: 10px; }
+    .table-shell {
+      background: linear-gradient(180deg, var(--card), var(--card2));
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      padding: 18px;
+      overflow: hidden;
+    }
+    .toolbar { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+    .input, select {
+      background: var(--soft);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 12px 14px;
+      font-size: 15px;
+      min-width: 180px;
+    }
+    .facet-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin: 6px 0 16px; }
+    .facet-box {
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 12px;
+      background: rgba(23,33,50,.35);
+      min-height: 100px;
+    }
+    .facet-title { font-weight: 800; margin-bottom: 10px; }
+    .facet-scroll { max-height: 180px; overflow: auto; padding-right: 4px; }
+    .facet-item { display: flex; align-items: center; gap: 10px; margin: 8px 0; color: var(--muted); }
+    .facet-item input { transform: scale(1.05); }
+    .checkbox-inline { display: flex; align-items: center; gap: 10px; color: var(--text); }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td {
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid #1f2940;
+      vertical-align: top;
+      white-space: nowrap;
+    }
+    td.wrap, th.wrap { white-space: normal; }
+    th { color: var(--text); position: sticky; top: 0; background: #0f1726; z-index: 1; }
+    td { color: var(--muted); }
+    .table-wrap { overflow: auto; max-height: 70vh; border-radius: 16px; }
+    .backrow { margin-bottom: 14px; }
+    .subhead { font-size: 13px; color: var(--muted); margin-top: -4px; margin-bottom: 8px; }
+    @media (max-width: 700px) {
+      h1 { font-size: 54px; }
+      .wrap { padding: 18px 16px 38px; }
+      .cards { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
@@ -252,290 +212,434 @@ def app_page():
     <div class="topbar">
       <div>
         <h1>HR Picks App</h1>
-        <div class="sub" id="headerSub"></div>
+        <div id="meta" class="meta">Loading...</div>
       </div>
-      <button class="reload-btn" id="reloadBtn" onclick="reloadApp()">Reload App</button>
+      <div>
+        <button class="btn" id="reloadBtn">Reload App</button>
+      </div>
     </div>
 
     <div class="tabs">
-      <button class="tab-btn active" onclick="showPanel('finalCardPanel', this)">Final Card</button>
-      <button class="tab-btn" onclick="showPanel('gamesPanel', this)">Games</button>
-      <button class="tab-btn" onclick="showPanel('researchPanel', this)">Research</button>
+      <button class="tab active" data-view="final">Final Card</button>
+      <button class="tab" data-view="games">Games</button>
+      <button class="tab" data-view="research">Research</button>
     </div>
 
-    <div id="finalCardPanel" class="panel active"></div>
-    <div id="gamesPanel" class="panel"></div>
-    <div id="researchPanel" class="panel"></div>
+    <section id="view-final"></section>
+    <section id="view-games" class="hidden"></section>
+    <section id="view-research" class="hidden"></section>
   </div>
 
 <script>
-const initialData = {initial_data_json};
-let appData = initialData;
-let researchState = {{
-  openKey: null,
-  search: '',
-  column: '__all__',
-  sort: ''
-}};
+let APP_DATA = null;
+let currentView = "final";
+let CURRENT_RESEARCH_KEY = null;
+let CURRENT_RESEARCH_ROWS = [];
 
-function esc(v) {{
-  if (v === null || v === undefined) return '';
+function esc(v) {
+  if (v === null || v === undefined) return "";
   return String(v)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
-}}
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
 
-function showPanel(id, btn) {{
-  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-  document.getElementById(id).classList.add('active');
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-}}
+function fmt(v) {
+  if (v === null || v === undefined || v === "") return "—";
+  return typeof v === "number" ? String(v) : String(v);
+}
 
-function fmtHeader() {{
-  const d = appData.date || '—';
-  const u = appData._meta?.eastern_now || '—';
-  document.getElementById('headerSub').innerHTML = `Date: ${esc(d)} • Last Updated: ${esc(u)}`;
-}}
+function titleize(key) {
+  return String(key || "").replaceAll("_", " ").replace(/\b\w/g, m => m.toUpperCase());
+}
 
-function timeToSortValue(t) {{
+function parseEtTimeToMinutes(t) {
   if (!t) return 99999;
-  const m = String(t).match(/(\\d{{1,2}}):(\\d{{2}})\\s*(AM|PM)/i);
+  const s = String(t).toUpperCase().replace("ET", "").trim();
+  const m = s.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/);
   if (!m) return 99999;
   let hh = parseInt(m[1], 10);
   const mm = parseInt(m[2], 10);
-  const ap = m[3].toUpperCase();
-  if (ap === 'PM' && hh !== 12) hh += 12;
-  if (ap === 'AM' && hh === 12) hh = 0;
+  const ap = m[3];
+  if (ap === "PM" && hh !== 12) hh += 12;
+  if (ap === "AM" && hh === 12) hh = 0;
   return hh * 60 + mm;
-}}
+}
 
-function getGamesSorted() {{
-  const games = Array.isArray(appData.games) ? [...appData.games] : [];
-  const rankings = appData.research?.game_rankings || [];
-  const fallbackMap = new Map();
-  rankings.forEach(r => {{
-    if (r.game && !fallbackMap.has(r.game)) fallbackMap.set(r.game, r);
-  }});
-  games.forEach(g => {{
-    const fb = fallbackMap.get(g.game) || {{}};
-    g.game_time_et = g.game_time_et || g.start_time_et || g.start_time || fb.game_time_et || fb.start_time_et || fb.start_time || null;
-    g.venue = g.venue || fb.venue || null;
-  }});
-  games.sort((a,b) => timeToSortValue(a.game_time_et) - timeToSortValue(b.game_time_et));
-  return games;
-}}
+function buildGameTimeLookup() {
+  const map = {};
+  const games = APP_DATA?.games || [];
+  games.forEach(g => {
+    const gameName = g?.game;
+    if (gameName) {
+      map[gameName] = g.game_time_et || g.start_time_et || g.startTimeEt || g.game_datetime_utc || null;
+    }
+  });
+  const rankings = APP_DATA?.research?.game_rankings || [];
+  rankings.forEach(r => {
+    const gameName = r?.game;
+    if (gameName && !map[gameName]) {
+      map[gameName] = r.game_time_et || r.start_time_et || r.startTimeEt || r.game_datetime_utc || null;
+    }
+  });
+  return map;
+}
 
-function renderFinalCard() {{
-  const panel = document.getElementById('finalCardPanel');
-  const plays = appData.final_card?.plays || [];
-  if (!plays.length) {{
-    panel.innerHTML = `<div class="card">No final card plays available.</div>`;
+function setMeta() {
+  const date = APP_DATA?.date || "—";
+  const lu = APP_DATA?._meta?.last_updated_display || "—";
+  document.getElementById("meta").textContent = "Date: " + date + " • Last Updated: " + lu;
+}
+
+async function loadData() {
+  const res = await fetch("/latest?t=" + Date.now(), { cache: "no-store" });
+  APP_DATA = await res.json();
+  renderAll();
+}
+
+function finalCardRows() {
+  const plays = APP_DATA?.final_card?.plays;
+  if (Array.isArray(plays) && plays.length) return plays;
+  const fallback = APP_DATA?.research?.final_card;
+  return Array.isArray(fallback) ? fallback : [];
+}
+
+function renderFinal() {
+  const mount = document.getElementById("view-final");
+  const plays = finalCardRows();
+  if (!plays.length) {
+    mount.innerHTML = '<div class="card"><h2>No final card available.</h2></div>';
     return;
-  }}
-  panel.innerHTML = `<div class="hero-grid">${plays.map(p => `
-    <div class="card play-card">
-      <div class="slot">${esc(p.slot || '')}</div>
-      <h2>${esc(p.pick || '—')}</h2>
-      <div class="kv"><strong>Bet Type:</strong> ${esc(p.bet_type || '—')}</div>
-      <div class="kv"><strong>Team:</strong> ${esc(p.team || '—')}</div>
-      <div class="kv"><strong>Opponent:</strong> ${esc(p.opponent || '—')}</div>
-      <div class="kv"><strong>Confidence:</strong> ${esc(p.confidence || '—')}</div>
-      <div class="kv muted">${esc(p.why_it_made_the_card || '')}</div>
-      <div class="kv muted">Source: ${esc(p.source_tab || '—')}</div>
-    </div>
-  `).join('')}</div>`;
-}}
-
-function renderGames() {{
-  const panel = document.getElementById('gamesPanel');
-  const games = getGamesSorted();
-  if (!games.length) {{
-    panel.innerHTML = `<div class="card">No games available.</div>`;
-    return;
-  }}
-  panel.innerHTML = `<div class="game-grid">${games.map(g => `
-    <div class="card game-card">
-      <h2>${esc(g.game || '—')}</h2>
-      <div class="kv"><strong>Start Time:</strong> ${esc(g.game_time_et || 'not available yet')}</div>
-      ${g.venue ? `<div class="kv"><strong>Venue:</strong> ${esc(g.venue)}</div>` : ``}
-      <div class="kv"><strong>ML Lean:</strong> ${esc(g.ml_lean?.team || '—')} ${g.ml_lean?.edge_vs_opponent !== undefined && g.ml_lean?.edge_vs_opponent !== null ? `(edge ${esc(g.ml_lean.edge_vs_opponent)})` : ''}</div>
-      <div class="kv muted">${esc(g.ml_lean?.recommended_play || '')}</div>
-
-      <div class="section-label">Top Hit Picks</div>
-      ${g.top_hit_picks?.length ? `<ul class="bullet-list">${g.top_hit_picks.map(x => `<li>${esc(x.playerName)} (${esc(x.teamName)})</li>`).join('')}</ul>` : `<ul class="bullet-list"><li>—</li></ul>`}
-
-      <div class="section-label">Top HR Picks</div>
-      ${g.top_hr_picks?.length ? `<ul class="bullet-list">${g.top_hr_picks.map(x => `<li>${esc(x.playerName)} (${esc(x.teamName)})</li>`).join('')}</ul>` : `<ul class="bullet-list"><li>—</li></ul>`}
-
-      <div class="section-label">Top K Pick</div>
-      <div class="kv">${g.top_k_pick ? `${esc(g.top_k_pick.pitcherName)} (${esc(g.top_k_pick.teamName)}) — ${esc(g.top_k_pick.recommended_k_action)}` : '—'}</div>
-    </div>
-  `).join('')}</div>`;
-}}
-
-function labelForKey(key) {{
-  const map = {{
-    game_rankings: 'Game Rankings',
-    pitcher_metrics: 'Pitcher Metrics',
-    pitcher_line_value: 'Pitcher Line Value',
-    hr_drought: 'HR Drought',
-    hit_drought: 'Hit Drought',
-    top_picks: 'Top Picks',
-    refined_picks: 'Refined Picks'
-  }};
-  return map[key] || key;
-}}
-
-function renderResearchHome() {{
-  const panel = document.getElementById('researchPanel');
-  const research = appData.research || {{}};
-  const keys = ['game_rankings','pitcher_metrics','pitcher_line_value','hr_drought','hit_drought','top_picks','refined_picks'];
-  panel.innerHTML = `<div class="research-grid">${keys.map(key => `
-    <div class="card research-card" onclick="openResearch('${key}')">
-      <h3>${esc(labelForKey(key))}</h3>
-      <div class="muted">${Array.isArray(research[key]) ? research[key].length : 0} rows</div>
-    </div>
-  `).join('')}</div>`;
-}}
-
-function openResearch(key) {{
-  researchState.openKey = key;
-  researchState.search = '';
-  researchState.column = '__all__';
-  researchState.sort = '';
-  renderResearchDetail();
-}}
-
-function backToResearch() {{
-  researchState.openKey = null;
-  renderResearchHome();
-}}
-
-function setResearchSearch(v) {{
-  researchState.search = v || '';
-  renderResearchDetail();
-}}
-
-function setResearchColumn(v) {{
-  researchState.column = v || '__all__';
-  renderResearchDetail();
-}}
-
-function setResearchSort(v) {{
-  researchState.sort = v || '';
-  renderResearchDetail();
-}}
-
-function applyResearchFilters(rows, columns) {{
-  let out = [...rows];
-  const q = researchState.search.trim().toLowerCase();
-  if (q) {{
-    out = out.filter(r => {{
-      if (researchState.column && researchState.column !== '__all__') {{
-        return String(r[researchState.column] ?? '').toLowerCase().includes(q);
-      }}
-      return columns.some(c => String(r[c] ?? '').toLowerCase().includes(q));
-    }});
-  }}
-  if (researchState.sort === 'asc' || researchState.sort === 'desc') {{
-    const primaryCol =
-      columns.find(c => /playerName/i.test(c)) ||
-      columns.find(c => /teamName/i.test(c)) ||
-      columns[0];
-    out.sort((a,b) => {{
-      const av = String(a[primaryCol] ?? '').toLowerCase();
-      const bv = String(b[primaryCol] ?? '').toLowerCase();
-      return researchState.sort === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
-    }});
-  }}
-  return out;
-}}
-
-function renderResearchDetail() {{
-  const panel = document.getElementById('researchPanel');
-  const key = researchState.openKey;
-  const rows = appData.research?.[key] || [];
-  const columns = rows.length ? Object.keys(rows[0]) : [];
-
-  const filtered = applyResearchFilters(rows, columns);
-
-  panel.innerHTML = `
-    <button class="back-btn" onclick="backToResearch()">← Back</button>
+  }
+  mount.innerHTML = '<div class="cards">' + plays.map(p => `
     <div class="card">
-      <h3 style="margin-top:0; font-size:1.8rem;">${esc(labelForKey(key))}</h3>
-      <div class="toolbar">
-        <input type="text" placeholder="Search this table" value="${esc(researchState.search)}" oninput="setResearchSearch(this.value)" />
-        <select onchange="setResearchColumn(this.value)">
-          <option value="__all__"${researchState.column === '__all__' ? ' selected' : ''}>All columns</option>
-          ${columns.map(c => `<option value="${esc(c)}"${researchState.column === c ? ' selected' : ''}>${esc(c)}</option>`).join('')}
-        </select>
-        <select onchange="setResearchSort(this.value)">
-          <option value=""${!researchState.sort ? ' selected' : ''}>Sort</option>
-          <option value="asc"${researchState.sort === 'asc' ? ' selected' : ''}>A → Z</option>
-          <option value="desc"${researchState.sort === 'desc' ? ' selected' : ''}>Z → A</option>
-        </select>
+      <div class="pill">${esc(fmt(p.slot || p.play_type || p.section || "Play"))}</div>
+      <h2>${esc(fmt(p.pick || p.playerName || "Play"))}</h2>
+      <div class="line"><span class="label">Bet Type:</span> ${esc(fmt(p.bet_type))}</div>
+      <div class="line"><span class="label">Team:</span> ${esc(fmt(p.team || p.teamName))}</div>
+      <div class="line"><span class="label">Opponent:</span> ${esc(fmt(p.opponent || p.opponentTeam))}</div>
+      <div class="line"><span class="label">Confidence:</span> ${esc(fmt(p.confidence))}</div>
+      <div class="kicker">${esc(fmt(p.why_it_made_the_card || p.reason))}</div>
+      <div class="muted">Source: ${esc(fmt(p.source_tab))}</div>
+    </div>
+  `).join("") + "</div>";
+}
+
+function normalizedGames() {
+  const rawGames = Array.isArray(APP_DATA?.games) ? APP_DATA.games.slice() : [];
+  const timeMap = buildGameTimeLookup();
+  return rawGames.map(g => {
+    const time = g.game_time_et || g.start_time_et || g.startTimeEt || timeMap[g.game] || null;
+    return { ...g, _sortTime: parseEtTimeToMinutes(time), _displayTime: time || "not available yet" };
+  }).sort((a, b) => a._sortTime - b._sortTime || String(a.game || "").localeCompare(String(b.game || "")));
+}
+
+function renderGames() {
+  const mount = document.getElementById("view-games");
+  const games = normalizedGames();
+  if (!games.length) {
+    mount.innerHTML = '<div class="card"><h2>No game cards available.</h2></div>';
+    return;
+  }
+
+  mount.innerHTML = '<div class="cards">' + games.map(g => {
+    const venueHtml = g.venue ? `<p class="line"><span class="label">Venue:</span> ${esc(g.venue)}</p>` : "";
+    const hits = (g.top_hit_picks || []).map(x => `<li>${esc(x.playerName)} (${esc(x.teamName)})</li>`).join("") || "<li>—</li>";
+    const hrs = (g.top_hr_picks || []).map(x => `<li>${esc(x.playerName)} (${esc(x.teamName)})</li>`).join("") || "<li>—</li>";
+    const kp = g.top_k_pick
+      ? `${esc(fmt(g.top_k_pick.pitcherName))} (${esc(fmt(g.top_k_pick.teamName))}) — ${esc(fmt(g.top_k_pick.recommended_k_action))}`
+      : "—";
+    const ml = g.ml_lean || {};
+    const mlPlay = `${esc(fmt(ml.team))} (edge ${esc(fmt(ml.edge_vs_opponent))})`;
+    return `
+      <div class="card">
+        <h2>${esc(fmt(g.game))}</h2>
+        <p class="line"><span class="label">Start Time:</span> ${esc(g._displayTime)}</p>
+        ${venueHtml}
+        <p class="line"><span class="label">ML Lean:</span> ${mlPlay}</p>
+        <p class="muted">${esc(fmt(ml.recommended_play))}</p>
+        <h2 style="font-size:20px;margin-top:18px;">Top Hit Picks</h2>
+        <ul class="list">${hits}</ul>
+        <h2 style="font-size:20px;margin-top:18px;">Top HR Picks</h2>
+        <ul class="list">${hrs}</ul>
+        <h2 style="font-size:20px;margin-top:18px;">Top K Pick</h2>
+        <p class="line">${kp}</p>
       </div>
+    `;
+  }).join("") + '</div>';
+}
+
+function visibleResearchEntries() {
+  const research = APP_DATA?.research || {};
+  const hide = new Set(["final_card"]);
+  return Object.entries(research).filter(([k, v]) => Array.isArray(v) && !hide.has(k));
+}
+
+function renderResearchHome() {
+  const mount = document.getElementById("view-research");
+  const entries = visibleResearchEntries();
+  if (!entries.length) {
+    mount.innerHTML = '<div class="card"><h2>No research tables available.</h2></div>';
+    return;
+  }
+  mount.innerHTML = '<div class="research-grid">' + entries.map(([k, rows]) => `
+    <div class="card research-card" data-key="${esc(k)}">
+      <div class="research-title">${esc(titleize(k))}</div>
+      <div class="muted">${rows.length} rows</div>
+    </div>
+  `).join("") + '</div>';
+
+  mount.querySelectorAll(".research-card").forEach(el => {
+    el.addEventListener("click", () => openResearchTable(el.dataset.key));
+  });
+}
+
+function uniqueValues(rows, key) {
+  const set = new Set();
+  rows.forEach(r => {
+    const v = r[key];
+    if (v !== null && v !== undefined && String(v).trim() !== "") set.add(String(v));
+  });
+  return Array.from(set).sort((a, b) => a.localeCompare(b));
+}
+
+function buildFacetBox(label, key, values) {
+  if (!values.length) return "";
+  const checks = values.map(v => `
+    <label class="facet-item">
+      <input type="checkbox" class="facet-check" data-key="${esc(key)}" value="${esc(v)}">
+      <span>${esc(v)}</span>
+    </label>
+  `).join("");
+  return `
+    <div class="facet-box">
+      <div class="facet-title">${esc(label)}</div>
+      <div class="facet-scroll">${checks}</div>
+    </div>
+  `;
+}
+
+function openResearchTable(key) {
+  CURRENT_RESEARCH_KEY = key;
+  CURRENT_RESEARCH_ROWS = APP_DATA?.research?.[key] || [];
+
+  const rows = CURRENT_RESEARCH_ROWS;
+  const mount = document.getElementById("view-research");
+  const columns = rows.length ? Object.keys(rows[0]) : [];
+  const options = columns.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+
+  const facets = [];
+  const facetColumns = [
+    ["Teams", "teamName"],
+    ["Status", "status"],
+    ["Park", "park_favorability"],
+    ["Opponent Pitcher Type", "opponent_pitcher_pick_type"],
+    ["Lineup Status", "lineup_status"]
+  ];
+  facetColumns.forEach(([label, keyName]) => {
+    if (columns.includes(keyName)) {
+      facets.push(buildFacetBox(label, keyName, uniqueValues(rows, keyName)));
+    }
+  });
+
+  const numericFilters = [];
+  if (columns.includes("avg_games_between_hrs")) {
+    numericFilters.push('<input id="minAvgInput" class="input" placeholder="Min avg drought" oninput="filterResearchTable()">');
+  }
+  if (columns.includes("current_games_without_hr")) {
+    numericFilters.push('<input id="minCurrentInput" class="input" placeholder="Min games since HR" oninput="filterResearchTable()">');
+  }
+
+  mount.innerHTML = `
+    <div class="backrow">
+      <button class="btn secondary" id="backBtn">← Back</button>
+    </div>
+    <div class="table-shell">
+      <h2 style="margin-top:0;">${esc(titleize(key))}</h2>
+      <div class="subhead">Search + filters are active for this table.</div>
+      <div class="toolbar">
+        <input id="searchBox" class="input" placeholder="Search this table" oninput="filterResearchTable()">
+        <select id="columnSelect" onchange="filterResearchTable()">
+          <option value="">All columns</option>
+          ${options}
+        </select>
+        <select id="sortSelect" onchange="filterResearchTable()">
+          <option value="">Default order</option>
+          <option value="asc">A → Z</option>
+          <option value="desc">Z → A</option>
+        </select>
+        <label class="checkbox-inline">
+          <input type="checkbox" id="overdueOnly" onchange="filterResearchTable()">
+          <span>Overdue only</span>
+        </label>
+        ${numericFilters.join("")}
+        <button class="btn secondary" id="clearFiltersBtn">Clear Filters</button>
+      </div>
+      ${facets.length ? `<div class="facet-grid">${facets.join("")}</div>` : ""}
       <div class="table-wrap">
-        <table>
-          <thead><tr>${columns.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead>
+        <table id="researchTable">
+          <thead><tr>${columns.map(c => `<th class="${String(c).length > 18 ? 'wrap' : ''}">${esc(c)}</th>`).join("")}</tr></thead>
           <tbody>
-            ${filtered.map(r => `<tr>${columns.map(c => `<td>${esc(r[c] ?? '')}</td>`).join('')}</tr>`).join('')}
+            ${rows.map(r => `<tr>${columns.map(c => `<td class="${String(c).length > 18 ? 'wrap' : ''}">${esc(fmt(r[c]))}</td>`).join("")}</tr>`).join("")}
           </tbody>
         </table>
       </div>
     </div>
   `;
-}}
 
-async function reloadApp() {{
-  const btn = document.getElementById('reloadBtn');
-  const oldText = btn.textContent;
+  document.getElementById("backBtn").addEventListener("click", renderResearchHome);
+  const clearBtn = document.getElementById("clearFiltersBtn");
+  clearBtn.addEventListener("click", clearResearchFilters);
+  mount.querySelectorAll(".facet-check").forEach(el => {
+    el.addEventListener("change", filterResearchTable);
+  });
+
+  filterResearchTable();
+}
+
+function clearResearchFilters() {
+  const search = document.getElementById("searchBox");
+  const col = document.getElementById("columnSelect");
+  const overdue = document.getElementById("overdueOnly");
+  const sortSel = document.getElementById("sortSelect");
+  const minAvg = document.getElementById("minAvgInput");
+  const minCurrent = document.getElementById("minCurrentInput");
+
+  if (search) search.value = "";
+  if (col) col.value = "";
+  if (overdue) overdue.checked = false;
+  if (sortSel) sortSel.value = "";
+  if (minAvg) minAvg.value = "";
+  if (minCurrent) minCurrent.value = "";
+  document.querySelectorAll(".facet-check").forEach(c => c.checked = false);
+  filterResearchTable();
+}
+
+function selectedFacetMap() {
+  const map = {};
+  document.querySelectorAll(".facet-check:checked").forEach(el => {
+    const key = el.dataset.key;
+    map[key] = map[key] || new Set();
+    map[key].add(String(el.value));
+  });
+  return map;
+}
+
+function filterResearchTable() {
+  const search = (document.getElementById("searchBox")?.value || "").toLowerCase();
+  const column = document.getElementById("columnSelect")?.value || "";
+  const overdueOnly = !!document.getElementById("overdueOnly")?.checked;
+  const minAvg = parseFloat(document.getElementById("minAvgInput")?.value || "");
+  const minCurrent = parseFloat(document.getElementById("minCurrentInput")?.value || "");
+  const facetMap = selectedFacetMap();
+  const sortValue = document.getElementById("sortSelect")?.value || "";
+
+  const table = document.getElementById("researchTable");
+  if (!table) return;
+
+  const headers = Array.from(table.querySelectorAll("thead th")).map(th => th.textContent);
+  const colIndex = column ? headers.indexOf(column) : -1;
+  const tbody = table.querySelector("tbody");
+  let rows = Array.from(table.querySelectorAll("tbody tr"));
+
+  if (sortValue) {
+    const nameIdx = headers.includes("playerName") ? headers.indexOf("playerName") : 0;
+    rows.sort((a, b) => {
+      const aText = ((a.querySelectorAll("td")[nameIdx]?.textContent) || "").toLowerCase();
+      const bText = ((b.querySelectorAll("td")[nameIdx]?.textContent) || "").toLowerCase();
+      return sortValue === "asc" ? aText.localeCompare(bText) : bText.localeCompare(aText);
+    });
+    rows.forEach(tr => tbody.appendChild(tr));
+  }
+
+  rows.forEach(tr => {
+    const cellValues = Array.from(tr.querySelectorAll("td")).map(td => td.textContent || "");
+    const lowerCells = cellValues.map(v => v.toLowerCase());
+
+    let show = true;
+
+    if (search) {
+      const hay = colIndex >= 0 ? (lowerCells[colIndex] || "") : lowerCells.join(" | ");
+      if (!hay.includes(search)) show = false;
+    }
+
+    if (show && overdueOnly) {
+      const statusIdx = headers.indexOf("status");
+      const statusVal = statusIdx >= 0 ? (cellValues[statusIdx] || "") : "";
+      if (!String(statusVal).toLowerCase().includes("overdue")) show = false;
+    }
+
+    if (show && !Number.isNaN(minAvg)) {
+      const idx = headers.indexOf("avg_games_between_hrs");
+      if (idx >= 0) {
+        const num = parseFloat(cellValues[idx]);
+        if (Number.isNaN(num) || num < minAvg) show = false;
+      }
+    }
+
+    if (show && !Number.isNaN(minCurrent)) {
+      const idx = headers.indexOf("current_games_without_hr");
+      if (idx >= 0) {
+        const num = parseFloat(cellValues[idx]);
+        if (Number.isNaN(num) || num < minCurrent) show = false;
+      }
+    }
+
+    if (show) {
+      for (const [key, valSet] of Object.entries(facetMap)) {
+        const idx = headers.indexOf(key);
+        if (idx >= 0) {
+          const val = cellValues[idx] || "";
+          if (!valSet.has(String(val))) {
+            show = false;
+            break;
+          }
+        }
+      }
+    }
+
+    tr.style.display = show ? "" : "none";
+  });
+}
+
+function renderAll() {
+  setMeta();
+  renderFinal();
+  renderGames();
+  renderResearchHome();
+  switchView(currentView);
+}
+
+function switchView(view) {
+  currentView = view;
+  document.getElementById("view-final").classList.toggle("hidden", view !== "final");
+  document.getElementById("view-games").classList.toggle("hidden", view !== "games");
+  document.getElementById("view-research").classList.toggle("hidden", view !== "research");
+  document.querySelectorAll(".tab").forEach(btn => btn.classList.toggle("active", btn.dataset.view === view));
+}
+
+document.querySelectorAll(".tab").forEach(btn => {
+  btn.addEventListener("click", () => switchView(btn.dataset.view));
+});
+
+document.getElementById("reloadBtn").addEventListener("click", async () => {
+  const btn = document.getElementById("reloadBtn");
+  const old = btn.textContent;
+  btn.textContent = "Reloading...";
   btn.disabled = true;
-  btn.textContent = 'Reloading...';
-  try {{
-    const res = await fetch(`/latest?t=${{Date.now()}}`, {{ cache: 'no-store' }});
-    const data = await res.json();
-    data.games = getGamesSortedFromIncoming(data);
-    appData = data;
-    researchState.openKey = null;
-    fmtHeader();
-    renderFinalCard();
-    renderGames();
-    renderResearchHome();
-  }} catch (e) {{
-    console.error(e);
-    alert('Reload failed.');
-  }} finally {{
+  try {
+    await loadData();
+  } finally {
+    btn.textContent = old;
     btn.disabled = false;
-    btn.textContent = oldText;
-  }}
-}}
+  }
+});
 
-function getGamesSortedFromIncoming(data) {{
-  const games = Array.isArray(data.games) ? [...data.games] : [];
-  const rankings = data.research?.game_rankings || [];
-  const fallbackMap = new Map();
-  rankings.forEach(r => {{
-    if (r.game && !fallbackMap.has(r.game)) fallbackMap.set(r.game, r);
-  }});
-  games.forEach(g => {{
-    const fb = fallbackMap.get(g.game) || {{}};
-    g.game_time_et = g.game_time_et || g.start_time_et || g.start_time || fb.game_time_et || fb.start_time_et || fb.start_time || null;
-    g.venue = g.venue || fb.venue || null;
-  }});
-  games.sort((a,b) => timeToSortValue(a.game_time_et) - timeToSortValue(b.game_time_et));
-  return games;
-}}
-
-fmtHeader();
-renderFinalCard();
-renderGames();
-renderResearchHome();
+loadData();
 </script>
 </body>
-</html>"""
+</html>
+"""
     return HTMLResponse(html)
