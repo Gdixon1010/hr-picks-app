@@ -152,12 +152,8 @@ def build_game_cards_json(player_rows, game_rankings, pitcher_line_value):
                     "pick_type": _clean_value(best_k.get("pick_type")),
                 }
 
-        game_time_et = _clean_value(game_rank.iloc[0].get("game_time_et")) if len(game_rank) > 0 else None
-        venue = _clean_value(game_rank.iloc[0].get("venue")) if len(game_rank) > 0 else None
         games_output.append({
             "game": game_name,
-            "game_time_et": game_time_et,
-            "venue": venue,
             "ml_lean": ml_lean,
             "top_hit_picks": game_hit_picks,
             "top_hr_picks": game_hr_picks,
@@ -227,7 +223,7 @@ def save_app_json(payload, output_path):
 
 
 DEFAULT_SEASON = 2026
-OUTPUT_DIR = Path(r"C:\Users\gdixo\OneDrive\Desktop\HR Search\output")
+OUTPUT_DIR = Path("output")
 SLEEP_BETWEEN_CALLS = 0.02
 
 GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
@@ -335,6 +331,19 @@ def innings_to_float(ip):
             return None
     return whole_i + {0: 0.0, 1: 1 / 3, 2: 2 / 3}.get(frac_i, 0.0)
 
+
+
+
+def safe_int(val):
+    try:
+        if val is None:
+            return None
+        s = str(val).strip().lower()
+        if s in ("", "nan", "none"):
+            return None
+        return int(float(val))
+    except Exception:
+        return None
 
 def safe_div(n, d, fallback=0.0):
     try:
@@ -672,17 +681,8 @@ def get_schedule_rows(target_date: str) -> pd.DataFrame:
             teams = g.get("teams", {})
             home = teams.get("home", {})
             away = teams.get("away", {})
-            game_dt = pd.to_datetime(g.get("gameDate"), utc=True, errors="coerce")
-            game_time_et = None
-            if pd.notna(game_dt):
-                try:
-                    game_time_et = game_dt.tz_convert("America/New_York").strftime("%-I:%M %p ET")
-                except Exception:
-                    game_time_et = game_dt.tz_convert("America/New_York").strftime("%I:%M %p ET").lstrip("0")
             rows.append({
                 "game_date": target_date,
-                "game_datetime_utc": game_dt.isoformat() if pd.notna(game_dt) else None,
-                "game_time_et": game_time_et,
                 "away_team": (away.get("team") or {}).get("name"),
                 "home_team": (home.get("team") or {}).get("name"),
                 "venue": (g.get("venue") or {}).get("name"),
@@ -895,7 +895,8 @@ def build_pitcher_metrics(schedule_rows: pd.DataFrame, season: int) -> pd.DataFr
                 continue
             print_step(f"🎯 Pitcher {counter}/{total}: {pitcher_name} ({team})")
             stat = get_pitcher_season_stats(pitcher_id, season)
-            logs = get_pitcher_game_logs(int(float(pitcher_id)), season) if pitcher_id else pd.DataFrame()
+            pid = safe_int(pitcher_id)
+            logs = get_pitcher_game_logs(pid, season) if pid is not None else pd.DataFrame()
             recent = summarize_recent_pitcher_form(logs)
             ip = stat.get("inningsPitched")
             so = stat.get("strikeOuts")
@@ -1050,8 +1051,6 @@ def build_game_rankings(schedule_rows, hr_rows, hit_rows, pitcher_metrics):
             team_score = round((offense_score * 0.55) + (nz(p_self.get("pitcher_score_adj")) * 0.45) - vol_penalty_ml - public_penalty_ml + short_leash_adj, 3)
             rows.append({
                 "game": f"{g.get('away_team')} @ {g.get('home_team')}",
-                "game_time_et": g.get("game_time_et"),
-                "game_datetime_utc": g.get("game_datetime_utc"),
                 "teamName": team, "opponentTeam": opp, "venue": g.get("venue"),
                 "offense_hr_score": offense_hr, "offense_hit_score": offense_hit, "offense_score": offense_score,
                 "team_volatility": get_team_volatility(team), "public_bias": get_public_bias(team),
