@@ -567,6 +567,13 @@ def grade_pending_history_rows(current_target_date: str, season: int) -> dict:
     if "graded_at_et" not in hist.columns:
         hist["graded_at_et"] = None
 
+    # Force flexible dtypes for grading output columns so string details do not
+    # crash when older CSVs were inferred as float-only by pandas.
+    hist["result_status"] = hist["result_status"].astype("object")
+    hist["result_detail"] = hist["result_detail"].astype("object")
+    hist["actual_value"] = hist["actual_value"].astype("object")
+    hist["graded_at_et"] = hist["graded_at_et"].astype("object")
+
     to_grade = hist[(hist["target_date"].astype(str) <= str(current_target_date)) & (hist["result_status"].fillna("pending") == "pending")].copy()
     graded_rows = []
     if not to_grade.empty:
