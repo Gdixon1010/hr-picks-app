@@ -86,7 +86,10 @@ def load_latest_data():
         saved_label = snapshot.get("saved_at_et")
         display = saved_label
 
-    frozen_latest = read_json_file(history_dir / "final_card_by_date_latest.json", {})
+    lock_dir = OUTPUT_DIR / "final_card_lock"
+    frozen_latest = read_json_file(lock_dir / "final_card_by_date_latest.json", {})
+    if not frozen_latest:
+        frozen_latest = read_json_file(history_dir / "final_card_by_date_latest.json", {})
     frozen_rows = frozen_latest.get("rows") or []
     frozen_date = frozen_latest.get("target_date")
 
