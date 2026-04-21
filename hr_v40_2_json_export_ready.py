@@ -273,9 +273,22 @@ def upsert_history_csv(path: Path, rows: list[dict]) -> None:
     else:
         combined = new_df.copy()
 
-    dedupe_cols = [c for c in ["run_id", "history_type", "game", "pick", "team", "slot"] if c in combined.columns]
+    # Track ONLY official frozen Final Card picks and dedupe them across refreshes.
+    if "history_type" in combined.columns:
+        combined = combined[combined["history_type"].astype(str).eq("final_card")].copy()
+
+    for col in [
+        "target_date", "history_type", "bet_type", "pick", "team", "opponent", "slot",
+        "confidence", "source_tab", "result_status", "result_detail", "generated_at_et", "json_filename"
+    ]:
+        if col not in combined.columns:
+            combined[col] = None
+
+    dedupe_cols = [c for c in ["target_date", "history_type", "bet_type", "pick", "team", "opponent", "slot"] if c in combined.columns]
     if dedupe_cols:
         combined = combined.drop_duplicates(subset=dedupe_cols, keep="last")
+
+    combined = combined.sort_values([c for c in ["target_date", "slot", "bet_type", "pick"] if c in combined.columns], ascending=True)
     combined.to_csv(path, index=False)
 
 
@@ -284,8 +297,13 @@ def build_pick_history_rows(target_date: str, run_ts_et: dt.datetime, json_filen
     run_ts_label = run_ts_et.strftime("%Y-%m-%d %I:%M:%S %p ET")
     rows: list[dict] = []
 
+    # Official tracking = Final Card only.
     if final_card_df is not None and not final_card_df.empty:
         for _, r in final_card_df.iterrows():
+            pick = _clean_value(r.get("pick"))
+            bet_type = _clean_value(r.get("bet_type"))
+            if not pick or str(bet_type).lower() == "no plays":
+                continue
             rows.append({
                 "run_id": run_id,
                 "history_type": "final_card",
@@ -293,8 +311,8 @@ def build_pick_history_rows(target_date: str, run_ts_et: dt.datetime, json_filen
                 "generated_at_et": run_ts_label,
                 "json_filename": json_filename,
                 "slot": _clean_value(r.get("slot")),
-                "bet_type": _clean_value(r.get("bet_type")),
-                "pick": _clean_value(r.get("pick")),
+                "bet_type": bet_type,
+                "pick": pick,
                 "team": _clean_value(r.get("team")),
                 "opponent": _clean_value(r.get("opponent")),
                 "game": None,
@@ -302,77 +320,6 @@ def build_pick_history_rows(target_date: str, run_ts_et: dt.datetime, json_filen
                 "score": None,
                 "why_it_made_the_card": _clean_value(r.get("why_it_made_the_card")),
                 "source_tab": _clean_value(r.get("source_tab")),
-                "result_status": "pending",
-                "result_detail": None,
-            })
-
-    if top_picks_df is not None and not top_picks_df.empty:
-        for _, r in top_picks_df.iterrows():
-            score = r.get("HR_score") if pd.notna(r.get("HR_score")) else r.get("Hit_score")
-            rows.append({
-                "run_id": run_id,
-                "history_type": "top_pick",
-                "target_date": target_date,
-                "generated_at_et": run_ts_label,
-                "json_filename": json_filename,
-                "slot": _clean_value(r.get("type")),
-                "bet_type": "HR" if _clean_value(r.get("type")) == "HR" else "1+ Hit",
-                "pick": _clean_value(r.get("playerName")),
-                "team": _clean_value(r.get("teamName")),
-                "opponent": None,
-                "game": None,
-                "confidence": None,
-                "score": _clean_value(score),
-                "why_it_made_the_card": None,
-                "source_tab": "Top_Picks",
-                "result_status": "pending",
-                "result_detail": None,
-            })
-
-    if game_rankings_df is not None and not game_rankings_df.empty:
-        best_ml = game_rankings_df.sort_values(["game", "edge_vs_opponent"], ascending=[True, False]).groupby("game", as_index=False).head(1)
-        for _, r in best_ml.iterrows():
-            rows.append({
-                "run_id": run_id,
-                "history_type": "ml_lean",
-                "target_date": target_date,
-                "generated_at_et": run_ts_label,
-                "json_filename": json_filename,
-                "slot": None,
-                "bet_type": "Moneyline",
-                "pick": f"{_clean_value(r.get('teamName'))} ML",
-                "team": _clean_value(r.get("teamName")),
-                "opponent": _clean_value(r.get("opponentTeam")),
-                "game": _clean_value(r.get("game")),
-                "confidence": _clean_value(r.get("win_rating")),
-                "score": _clean_value(r.get("edge_vs_opponent")),
-                "why_it_made_the_card": _clean_value(r.get("recommended_play")),
-                "source_tab": "Game_Rankings",
-                "result_status": "pending",
-                "result_detail": None,
-            })
-
-    if pitcher_line_value_df is not None and not pitcher_line_value_df.empty:
-        for _, r in pitcher_line_value_df.iterrows():
-            if str(r.get("recommended_k_action") or "").startswith("Pass"):
-                continue
-            rows.append({
-                "run_id": run_id,
-                "history_type": "k_prop",
-                "target_date": target_date,
-                "generated_at_et": run_ts_label,
-                "json_filename": json_filename,
-                "slot": None,
-                "bet_type": "K Prop",
-                "pick": _clean_value(r.get("pitcherName")),
-                "team": _clean_value(r.get("teamName")),
-                "opponent": _clean_value(r.get("opponentTeam")),
-                "game": None,
-                "confidence": _clean_value(r.get("k_value_tier")),
-                "score": _clean_value(r.get("projected_k_mid")),
-                "max_playable_k_line": _clean_value(r.get("max_playable_k_line")),
-                "why_it_made_the_card": _clean_value(r.get("recommended_k_action")),
-                "source_tab": "Pitcher_Line_Value",
                 "result_status": "pending",
                 "result_detail": None,
             })
