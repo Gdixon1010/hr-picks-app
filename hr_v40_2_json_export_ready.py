@@ -284,7 +284,9 @@ def upsert_history_csv(path: Path, rows: list[dict]) -> None:
         if col not in combined.columns:
             combined[col] = None
 
-    dedupe_cols = [c for c in ["target_date", "history_type", "bet_type", "pick", "team", "opponent", "slot"] if c in combined.columns]
+    # Dedupe official picks across refreshes. Do NOT include slot or run_id,
+    # because the same official pick may move positions on the card during the day.
+    dedupe_cols = [c for c in ["target_date", "history_type", "bet_type", "pick", "team", "opponent"] if c in combined.columns]
     if dedupe_cols:
         combined = combined.drop_duplicates(subset=dedupe_cols, keep="last")
 
@@ -518,6 +520,11 @@ def grade_pending_history_rows(current_target_date: str, season: int) -> dict:
         return {"graded_rows": 0, "latest_results": latest_results, "performance": perf_latest}
 
     hist = pd.read_csv(csv_path)
+    # Clean up any duplicate official picks already stored from earlier versions.
+    hist_dedupe_cols = [c for c in ["target_date", "history_type", "bet_type", "pick", "team", "opponent"] if c in hist.columns]
+    if hist_dedupe_cols:
+        hist = hist.drop_duplicates(subset=hist_dedupe_cols, keep="last")
+        hist.to_csv(csv_path, index=False)
     if hist.empty:
         latest_payload = {"graded_rows": 0, "message": "Pick history empty", "rows": []}
         latest_results.write_text(json.dumps(latest_payload, indent=2), encoding="utf-8")
@@ -612,7 +619,8 @@ def grade_pending_history_rows(current_target_date: str, season: int) -> dict:
         else:
             combined = pd.DataFrame(graded_rows)
         if not combined.empty:
-            dedupe_cols = [c for c in ["run_id", "history_type", "pick", "team", "target_date"] if c in combined.columns]
+            # Dedupe graded results by official-pick identity, not by run_id.
+            dedupe_cols = [c for c in ["target_date", "history_type", "bet_type", "pick", "team", "opponent"] if c in combined.columns]
             if dedupe_cols:
                 combined = combined.drop_duplicates(subset=dedupe_cols, keep="last")
             combined.to_csv(csv_results, index=False)
