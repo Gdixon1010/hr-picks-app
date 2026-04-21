@@ -379,10 +379,11 @@ def save_latest_app_snapshot(target_date: str, app_payload: dict, json_filename:
 
 
 def save_frozen_daily_final_card(target_date: str, final_card_df: pd.DataFrame) -> pd.DataFrame:
-    history_dir = OUTPUT_DIR / "history"
-    history_dir.mkdir(parents=True, exist_ok=True)
-    store_path = history_dir / "final_card_by_date.json"
-    latest_path = history_dir / "final_card_by_date_latest.json"
+    # Store the frozen day-level Final Card separately from results/history cleanup.
+    lock_dir = OUTPUT_DIR / "final_card_lock"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    store_path = lock_dir / "final_card_by_date.json"
+    latest_path = lock_dir / "final_card_by_date_latest.json"
 
     try:
         store = json.loads(store_path.read_text(encoding="utf-8")) if store_path.exists() else {}
@@ -419,6 +420,17 @@ def save_frozen_daily_final_card(target_date: str, final_card_df: pd.DataFrame) 
     }
     with open(latest_path, "w", encoding="utf-8") as f:
         json.dump(latest_payload, f, indent=2, ensure_ascii=False)
+
+    # Backward-compatible mirror in history for older app readers, but the lock dir is source of truth.
+    history_dir = OUTPUT_DIR / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(history_dir / "final_card_by_date.json", "w", encoding="utf-8") as f:
+            json.dump(store, f, indent=2, ensure_ascii=False)
+        with open(history_dir / "final_card_by_date_latest.json", "w", encoding="utf-8") as f:
+            json.dump(latest_payload, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
 
     return pd.DataFrame(frozen_rows)
 
