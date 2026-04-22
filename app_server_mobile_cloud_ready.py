@@ -86,10 +86,7 @@ def load_latest_data():
         saved_label = snapshot.get("saved_at_et")
         display = saved_label
 
-    lock_dir = OUTPUT_DIR / "final_card_lock"
-    frozen_latest = read_json_file(lock_dir / "final_card_by_date_latest.json", {})
-    if not frozen_latest:
-        frozen_latest = read_json_file(history_dir / "final_card_by_date_latest.json", {})
+    frozen_latest = read_json_file(history_dir / "final_card_by_date_latest.json", {})
     frozen_rows = frozen_latest.get("rows") or []
     frozen_date = frozen_latest.get("target_date")
 
@@ -110,7 +107,21 @@ def load_latest_data():
             "Filter for overdue players, favorable parks, and weaker pitcher types to isolate stronger spots.",
             "Treat Strong SP as a warning for hitter props and Short Leash Risk or Attack With Hitters as friendlier hitting environments."
         ],
+        "card_logic": [
+            {"label": "Core 1", "meaning": "Highest-priority main play on the card. Usually the cleanest overall edge among the non-HR hitter or ML plays."},
+            {"label": "Core 2", "meaning": "Strong play that ranks just below Core 1. Still a main card option, but slightly less clean than the top play."},
+            {"label": "Core 3", "meaning": "Solid playable pick that made the card, but with a little less edge or a little more volatility than the top two cores."},
+            {"label": "Pitch 1", "meaning": "Top strikeout prop on the card based on projected Ks versus the listed line and matchup context."},
+            {"label": "Power 1", "meaning": "Top home run upside play on the card. This is the highest-variance play type and should usually be bet smaller."}
+        ],
+        "unit_strategy": [
+            "Use a consistent unit size instead of changing bet size emotionally. A common baseline is 1 unit = 1% of bankroll.",
+            "Suggested sizing: Core 1 = 1.0u, Core 2 = 0.75u, Core 3 = 0.5u to 0.75u, Pitch 1 = 0.75u to 1.0u, Power 1 = 0.25u to 0.5u.",
+            "Treat HR picks as the most volatile part of the card. They can be valuable, but they should usually carry the smallest risk.",
+            "Do not chase losses, double units after a bad day, or force action on every pick. The card works best when sizing stays disciplined over time."
+        ],
         "terms": [
+            {"term": "Model Insight", "meaning": "A short plain-English explanation of why a pick made the card based on the model's edge, matchup, and context signals."},
             {"term": "Attack With Hitters", "meaning": "Pitcher or pitching environment is vulnerable enough to target hitters."},
             {"term": "Strong SP", "meaning": "Strong starting pitcher. Usually a downgrade for hitter props."},
             {"term": "Short Leash Risk", "meaning": "Pitcher may not work deep into the game, which can help hitters later against the bullpen."},
@@ -388,6 +399,61 @@ function finalCardRows() {
   return Array.isArray(fallback) ? fallback : [];
 }
 
+function buildModelInsight(p) {
+  if (p?.model_insight) return String(p.model_insight);
+  const betType = String(p?.bet_type || "");
+  const reason = String(p?.why_it_made_the_card || p?.reason || "");
+  const lower = reason.toLowerCase();
+
+  if (betType === "Moneyline") {
+    if (lower.includes("strong sp") && lower.includes("short leash")) {
+      return "Model sees a starting pitching stability edge here, with the opponent carrying early-exit risk that can force more bullpen exposure.";
+    }
+    if (lower.includes("strong sp")) {
+      return "Model is leaning on the starting pitching advantage and expected game control in this matchup.";
+    }
+    if (lower.includes("edge")) {
+      return "Model shows a meaningful game-level edge based on matchup strength, pitching context, and overall team situation.";
+    }
+    return "Model sees this team as the stronger side today based on the full matchup profile.";
+  }
+
+  if (betType === "1+ Hit") {
+    if (lower.includes("short leash")) {
+      return "Model likes the hitter's contact opportunity here, especially with a chance to face weaker bullpen arms if the starter exits early.";
+    }
+    if (lower.includes("slot 1") || lower.includes("slot 2") || lower.includes("slot 3")) {
+      return "Model likes the hitter's lineup position and projected plate appearance volume in this matchup.";
+    }
+    if (lower.includes("park favorable")) {
+      return "Model sees a favorable hitting environment here along with enough underlying hit probability to make the card.";
+    }
+    return "Model sees enough contact probability, matchup support, and opportunity volume to back this hitter for a hit.";
+  }
+
+  if (betType === "HR") {
+    if (lower.includes("park favorable")) {
+      return "Model sees home run upside from the power profile plus a favorable hitting environment, but this remains a higher-variance play.";
+    }
+    if (lower.includes("short leash")) {
+      return "Model sees power upside here, with extra appeal if the starter exits early and the hitter gets bullpen exposure.";
+    }
+    return "Model sees enough power, matchup, and upside context to justify a smaller-stake HR shot.";
+  }
+
+  if (betType === "K Prop") {
+    if (lower.includes("projected") && lower.includes("over up to")) {
+      return "Model projects strikeouts above the listed number and sees enough matchup support to justify the over.";
+    }
+    if (lower.includes("k upside")) {
+      return "Model likes the strikeout setup here based on the opponent profile and the pitcher's swing-and-miss potential.";
+    }
+    return "Model sees enough strikeout potential versus the line to put this prop on the card.";
+  }
+
+  return "Model found enough edge and supporting context for this pick to make the final card.";
+}
+
 function renderFinal() {
   const mount = document.getElementById("view-final");
   const plays = finalCardRows();
@@ -395,7 +461,9 @@ function renderFinal() {
     mount.innerHTML = '<div class="card"><h2>No final card available.</h2></div>';
     return;
   }
-  mount.innerHTML = '<div class="cards">' + plays.map(p => `
+  mount.innerHTML = '<div class="cards">' + plays.map(p => {
+    const insight = buildModelInsight(p);
+    return `
     <div class="card">
       <div class="pill">${esc(fmt(p.slot || p.play_type || p.section || "Play"))}</div>
       <h2>${esc(fmt(p.pick || p.playerName || "Play"))}</h2>
@@ -404,9 +472,10 @@ function renderFinal() {
       <div class="line"><span class="label">Opponent:</span> ${esc(fmt(p.opponent || p.opponentTeam))}</div>
       <div class="line"><span class="label">Confidence:</span> ${esc(fmt(p.confidence))}</div>
       <div class="kicker">${esc(fmt(p.why_it_made_the_card || p.reason))}</div>
+      <div class="line"><span class="label">Model Insight:</span> ${esc(fmt(insight))}</div>
       <div class="muted">Source: ${esc(fmt(p.source_tab))}</div>
-    </div>
-  `).join("") + "</div>";
+    </div>`;
+  }).join("") + "</div>";
 }
 
 function normalizedGames() {
@@ -730,6 +799,8 @@ function renderInfo() {
   const info = APP_DATA?.info || {};
   const terms = Array.isArray(info.terms) ? info.terms : [];
   const how = Array.isArray(info.how_to_use) ? info.how_to_use : [];
+  const cardLogic = Array.isArray(info.card_logic) ? info.card_logic : [];
+  const unitStrategy = Array.isArray(info.unit_strategy) ? info.unit_strategy : [];
   mount.innerHTML = `
     <div class="cards">
       <div class="card">
@@ -739,6 +810,16 @@ function renderInfo() {
       <div class="card">
         <h2>What To Look For</h2>
         <ul class="list">${how.map(x => `<li>${esc(x)}</li>`).join("")}</ul>
+      </div>
+    </div>
+    <div class="cards" style="margin-top:18px;">
+      <div class="card">
+        <h2>How To Read The Final Card</h2>
+        <ul class="list">${cardLogic.map(x => `<li><strong>${esc(fmt(x.label))}:</strong> ${esc(fmt(x.meaning))}</li>`).join("")}</ul>
+      </div>
+      <div class="card">
+        <h2>Suggested Unit Strategy</h2>
+        <ul class="list">${unitStrategy.map(x => `<li>${esc(x)}</li>`).join("")}</ul>
       </div>
     </div>
     <div class="table-shell" style="margin-top:18px;">
