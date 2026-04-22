@@ -1761,8 +1761,76 @@ def build_daily_card(game_rankings, refined_picks, pitcher_line_value, hr_drough
                 break
     return pd.DataFrame(rows)
 
+
+def generate_model_insight(bet_type, row=None, why_text=None):
+    row = row or {}
+    why_text = str(why_text or "")
+    if bet_type == "Moneyline":
+        edge = row.get("edge_vs_opponent")
+        own_pt = str(row.get("pitcher_pick_type") or "")
+        opp_pt = str(row.get("opponent_pitcher_pick_type") or "")
+        offense = row.get("offense_score")
+        parts = []
+        if edge is not None:
+            try:
+                edge_f = float(edge)
+                if edge_f >= 15:
+                    parts.append("Model sees a clear game-control edge here.")
+                elif edge_f >= 10:
+                    parts.append("Model shows a solid overall edge in this matchup.")
+            except Exception:
+                pass
+        if own_pt and opp_pt:
+            parts.append(f"Starting pitching setup favors this side with {own_pt} against {opp_pt}.")
+        elif own_pt:
+            parts.append(f"Starting pitcher profile grades as {own_pt}.")
+        try:
+            if offense is not None and float(offense) >= 2.5:
+                parts.append("Offense also projects well enough to support the pitching edge.")
+        except Exception:
+            pass
+        return " ".join(parts[:2]) or "Model favors the overall matchup based on pitching edge, team context, and game environment."
+
+    if bet_type == "1+ Hit":
+        slot = row.get("slot_num") or row.get("batting_order_slot")
+        opp_type = str(row.get("opponent_pitcher_pick_type") or "")
+        park = str(row.get("park_favorability") or "")
+        parts = []
+        try:
+            if slot is not None and float(slot) <= 5:
+                parts.append("Projected for strong plate-appearance volume near the top of the order.")
+        except Exception:
+            pass
+        if opp_type:
+            if opp_type == "Strong SP":
+                parts.append("Matchup is tougher than ideal, but the overall hit profile still cleared the card.")
+            else:
+                parts.append(f"Pitcher matchup grades as {opp_type}, which supports contact opportunity.")
+        if park == "Favorable":
+            parts.append("Game environment is also friendly for offense.")
+        return " ".join(parts[:2]) or "Model likes the contact profile, lineup opportunity, and matchup context for at least one hit."
+
+    if bet_type == "HR":
+        opp_type = str(row.get("opponent_pitcher_pick_type") or "")
+        park = str(row.get("park_favorability") or "")
+        parts = []
+        if opp_type:
+            parts.append(f"Power matchup grades well against a {opp_type} pitcher profile.")
+        if park == "Favorable":
+            parts.append("Park conditions add to the home-run upside.")
+        parts.append("This is a higher-variance play and is sized lighter than core hit or moneyline spots.")
+        return " ".join(parts[:2]) or "Model sees enough power, matchup, and environment upside to justify a home-run shot."
+
+    if bet_type == "K Prop":
+        action = why_text
+        if "projected" in action.lower():
+            return f"Projection cleared the playable strikeout line based on recent form, workload, and opponent tendency."
+        return "Model projects enough strikeout volume to justify this prop if the posted line is still in range."
+
+    return "Model selected this play based on score, matchup, and contextual edge signals."
+
 def build_final_card(player_rows, game_rankings, pitcher_line_value):
-    cols = ["slot","bet_type","pick","team","opponent","confidence","why_it_made_the_card","source_tab"]
+    cols = ["slot","bet_type","pick","team","opponent","confidence","why_it_made_the_card","model_insight","source_tab"]
     rows = []
     used_players = set()
     team_counts = {}
@@ -1770,10 +1838,10 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
     def can_use_team(team, limit=2):
         return team_counts.get(team, 0) < limit
 
-    def add_row(slot, bet_type, pick, team, opponent, confidence, why, source_tab):
+    def add_row(slot, bet_type, pick, team, opponent, confidence, why, source_tab, model_insight=None):
         rows.append({
             "slot": slot, "bet_type": bet_type, "pick": pick, "team": team, "opponent": opponent,
-            "confidence": confidence, "why_it_made_the_card": why, "source_tab": source_tab
+            "confidence": confidence, "why_it_made_the_card": why, "model_insight": model_insight, "source_tab": source_tab
         })
         team_counts[team] = team_counts.get(team, 0) + 1
         used_players.add((team, pick))
@@ -1788,17 +1856,19 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
         ].copy().sort_values(["edge_vs_opponent","team_score"], ascending=[False, False])
         if not ml_pool.empty:
             best = ml_pool.iloc[0]
+            ml_why = f"Edge {best['edge_vs_opponent']}; {best['pitcher_pick_type']} vs {best['opponent_pitcher_pick_type']}"
             rows.append({
                 "slot": "Core 1", "bet_type": "Moneyline", "pick": f"{best['teamName']} ML", "team": best["teamName"],
                 "opponent": best["opponentTeam"], "confidence": "A",
-                "why_it_made_the_card": f"Edge {best['edge_vs_opponent']}; {best['pitcher_pick_type']} vs {best['opponent_pitcher_pick_type']}",
+                "why_it_made_the_card": ml_why,
+                "model_insight": generate_model_insight("Moneyline", best.to_dict(), ml_why),
                 "source_tab": "Game_Rankings"
             })
             team_counts[best["teamName"]] = 1
 
     if player_rows is None or player_rows.empty:
         if not rows:
-            return pd.DataFrame([{"slot":"Info","bet_type":"No Plays","pick":"No final card plays qualified","team":"","opponent":"","confidence":"Pass","why_it_made_the_card":"No data available","source_tab":"Final_Card"}], columns=cols)
+            return pd.DataFrame([{"slot":"Info","bet_type":"No Plays","pick":"No final card plays qualified","team":"","opponent":"","confidence":"Pass","why_it_made_the_card":"No data available","model_insight":"No eligible pregame plays cleared the current thresholds.","source_tab":"Final_Card"}], columns=cols)
         return pd.DataFrame(rows, columns=cols)
 
     base = player_rows.copy()
@@ -1821,10 +1891,12 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
             break
         if (r["teamName"], r["playerName"]) in used_players or not can_use_team(r["teamName"], 2):
             continue
+        hit_why = f"Hit_score {r['Hit_score']:.3f}; slot {int(r['slot_num'])}; opp {r.get('opponent_pitcher_pick_type')}; park {r.get('park_favorability')}"
         add_row(
             f"Core {len(rows)+1}", "1+ Hit", r["playerName"], r["teamName"], r.get("opponentTeam"), "A",
-            f"Hit_score {r['Hit_score']:.3f}; slot {int(r['slot_num'])}; opp {r.get('opponent_pitcher_pick_type')}; park {r.get('park_favorability')}",
-            "Refined_Picks"
+            hit_why,
+            "Refined_Picks",
+            generate_model_insight("1+ Hit", r.to_dict(), hit_why)
         )
         hit_added += 1
 
@@ -1844,10 +1916,12 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
             break
         if (r["teamName"], r["playerName"]) in used_players or not can_use_team(r["teamName"], 2):
             continue
+        hr_why = f"HR_score {r['HR_score']:.3f}; slot {int(r['slot_num'])}; power ok; opp {r.get('opponent_pitcher_pick_type')}; park Favorable"
         add_row(
             f"Power {hr_added+1}", "HR", r["playerName"], r["teamName"], r.get("opponentTeam"), "B",
-            f"HR_score {r['HR_score']:.3f}; slot {int(r['slot_num'])}; power ok; opp {r.get('opponent_pitcher_pick_type')}; park Favorable",
-            "Refined_Picks"
+            hr_why,
+            "Refined_Picks",
+            generate_model_insight("HR", r.to_dict(), hr_why)
         )
         hr_added += 1
 
@@ -1862,16 +1936,18 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
         for _, r in k_pool.iterrows():
             if not can_use_team(r["teamName"], 2):
                 continue
+            k_why = f"{r['recommended_k_action']}; projected {r['projected_k_floor']}-{r['projected_k_ceiling']} Ks"
             add_row(
                 f"Pitch {1}", "K Prop", r["pitcherName"], r["teamName"], r["opponentTeam"],
                 "A" if r["k_value_tier"] == "Hammer" else "B",
-                f"{r['recommended_k_action']}; projected {r['projected_k_floor']}-{r['projected_k_ceiling']} Ks",
-                "Pitcher_Line_Value"
+                k_why,
+                "Pitcher_Line_Value",
+                generate_model_insight("K Prop", r.to_dict(), k_why)
             )
             break
 
     if not rows:
-        return pd.DataFrame([{"slot":"Info","bet_type":"No Plays","pick":"No final card plays qualified","team":"","opponent":"","confidence":"Pass","why_it_made_the_card":"Final-card thresholds removed all plays","source_tab":"Final_Card"}], columns=cols)
+        return pd.DataFrame([{"slot":"Info","bet_type":"No Plays","pick":"No final card plays qualified","team":"","opponent":"","confidence":"Pass","why_it_made_the_card":"Final-card thresholds removed all plays","model_insight":"No eligible pregame plays cleared the current thresholds.","source_tab":"Final_Card"}], columns=cols)
 
     return pd.DataFrame(rows, columns=cols)
 
