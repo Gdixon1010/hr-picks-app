@@ -1944,17 +1944,28 @@ def main(season: int, target_date: str):
         "opponentTeam":"teamName","pitcherName":"opponent_pitcher","pick_type":"opponent_pitcher_pick_type"
     }) if not pitcher_metrics.empty else pd.DataFrame(columns=["teamName","opponent_pitcher","opponent_pitcher_pick_type"])
 
-    # Ensure Final_Card logic always has opponent pitcher type available on player rows.
-    if not player_rows.empty:
-        if "opponent_pitcher_pick_type" not in player_rows.columns:
-            player_rows = player_rows.merge(opp_map[["teamName", "opponent_pitcher_pick_type"]].drop_duplicates(), on="teamName", how="left")
+    # Ensure Final_Card logic always has opponent pitcher type available on the pregame player rows.
+    if not pregame_player_rows.empty:
+        if "opponent_pitcher_pick_type" not in pregame_player_rows.columns:
+            pregame_player_rows = pregame_player_rows.merge(
+                opp_map[["teamName", "opponent_pitcher_pick_type"]].drop_duplicates(),
+                on="teamName",
+                how="left",
+            )
         else:
-            missing_mask = player_rows["opponent_pitcher_pick_type"].isna()
+            missing_mask = pregame_player_rows["opponent_pitcher_pick_type"].isna()
             if missing_mask.any():
                 fill_map = opp_map[["teamName", "opponent_pitcher_pick_type"]].drop_duplicates()
-                player_rows = player_rows.merge(fill_map, on="teamName", how="left", suffixes=("", "_fill"))
-                player_rows["opponent_pitcher_pick_type"] = player_rows["opponent_pitcher_pick_type"].fillna(player_rows["opponent_pitcher_pick_type_fill"])
-                player_rows = player_rows.drop(columns=["opponent_pitcher_pick_type_fill"])
+                pregame_player_rows = pregame_player_rows.merge(
+                    fill_map,
+                    on="teamName",
+                    how="left",
+                    suffixes=("", "_fill"),
+                )
+                pregame_player_rows["opponent_pitcher_pick_type"] = pregame_player_rows[
+                    "opponent_pitcher_pick_type"
+                ].fillna(pregame_player_rows["opponent_pitcher_pick_type_fill"])
+                pregame_player_rows = pregame_player_rows.drop(columns=["opponent_pitcher_pick_type_fill"])
 
     hr_drought = player_rows[["season","teamName","playerName","avg_games_between_hrs","current_games_without_hr","longest_games_without_hr","hr_status","homeRuns","last_hr_date","gamesPlayed","park_favorability","lineup_status","batting_order_slot","starter_only_flag"]].rename(columns={"hr_status":"status"}).merge(opp_map, on="teamName", how="left")
     hit_drought = player_rows[["season","teamName","playerName","avg_games_between_hits","current_games_without_hit","longestHitDrought","hit_status","totalHits","gamesPlayed","park_favorability","lineup_status","batting_order_slot","starter_only_flag"]].rename(columns={"hit_status":"status"}).merge(opp_map, on="teamName", how="left")
