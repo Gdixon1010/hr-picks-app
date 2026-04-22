@@ -442,7 +442,7 @@ def get_schedule_results_for_date(target_date: str) -> pd.DataFrame:
             params={"sportId": 1, "date": target_date, "hydrate": "team,linescore"},
         )
     except Exception:
-        return pd.DataFrame(columns=["game","team","opponent","team_score","opp_score","winner_team","completed"])
+        return pd.DataFrame(columns=["game","home_team","away_team","home_score","away_score","winner_team","completed","status"])
 
     rows = []
     for d in data.get("dates", []):
@@ -471,6 +471,7 @@ def get_schedule_results_for_date(target_date: str) -> pd.DataFrame:
                 "away_score": away_score,
                 "winner_team": winner_team,
                 "completed": completed,
+                "status": status,
             })
     return pd.DataFrame(rows)
 
@@ -577,42 +578,54 @@ def grade_pending_history_rows(current_target_date: str, season: int) -> dict:
             detail = None
             actual = None
 
+            game_row = sched[(sched["home_team"] == opponent) & (sched["away_team"] == team)]
+            if game_row.empty:
+                game_row = sched[((sched["home_team"] == team) & (sched["away_team"] == opponent)) | ((sched["home_team"] == opponent) & (sched["away_team"] == team))]
+            game_completed = bool(game_row.iloc[0].get("completed")) if not game_row.empty else False
+            game_status = str(game_row.iloc[0].get("status") or "") if not game_row.empty else ""
+
             try:
                 if bet_type == "Moneyline":
-                    game_row = sched[(sched["home_team"] == opponent) & (sched["away_team"] == team)]
-                    if game_row.empty:
-                        game_row = sched[((sched["home_team"] == team) & (sched["away_team"] == opponent)) | ((sched["home_team"] == opponent) & (sched["away_team"] == team))]
-                    if not game_row.empty and bool(game_row.iloc[0].get("completed")):
+                    if not game_row.empty and game_completed:
                         winner = game_row.iloc[0].get("winner_team")
                         actual = winner
                         status = "win" if winner == team else "loss"
                         detail = f"Winner: {winner}"
+                    else:
+                        detail = f"Pending — game not final ({game_status or 'Not Started'})"
                 elif bet_type in ("1+ Hit", "HR"):
-                    pid = get_player_id_by_name_team(str(pick), str(team), season)
-                    if pid:
-                        stat = get_player_game_log_for_date(pid, season, tdate, "hitting")
-                        if stat:
-                            hits = int(stat.get("hits", 0) or 0)
-                            hrs = int(stat.get("homeRuns", 0) or 0)
-                            actual = hits if bet_type == "1+ Hit" else hrs
-                            status = "win" if (hits > 0 if bet_type == "1+ Hit" else hrs > 0) else "loss"
-                            detail = f"Hits: {hits}; HR: {hrs}"
-                elif bet_type == "K Prop":
-                    pid = get_player_id_by_name_team(str(pick), str(team), season)
-                    if pid:
-                        stat = get_player_game_log_for_date(pid, season, tdate, "pitching")
-                        if stat:
-                            ks = float(stat.get("strikeOuts", 0) or 0)
-                            line = None
-                            if "score" in row and pd.notna(row.get("score")):
-                                pass
-                            line = parse_line_from_text(row.get("why_it_made_the_card"))
-                            actual = ks
-                            if line is not None:
-                                status = "win" if ks > line else "loss"
-                                detail = f"Ks: {ks}; line: {line}"
+                    if not game_completed:
+                        detail = f"Pending — game not final ({game_status or 'In Progress'})"
+                    else:
+                        pid = get_player_id_by_name_team(str(pick), str(team), season)
+                        if pid:
+                            stat = get_player_game_log_for_date(pid, season, tdate, "hitting")
+                            if stat:
+                                hits = int(stat.get("hits", 0) or 0)
+                                hrs = int(stat.get("homeRuns", 0) or 0)
+                                actual = hits if bet_type == "1+ Hit" else hrs
+                                status = "win" if (hits > 0 if bet_type == "1+ Hit" else hrs > 0) else "loss"
+                                detail = f"Hits: {hits}; HR: {hrs}"
                             else:
-                                detail = f"Ks: {ks}"
+                                detail = "Pending — no final player log yet"
+                elif bet_type == "K Prop":
+                    if not game_completed:
+                        detail = f"Pending — game not final ({game_status or 'In Progress'})"
+                    else:
+                        pid = get_player_id_by_name_team(str(pick), str(team), season)
+                        if pid:
+                            stat = get_player_game_log_for_date(pid, season, tdate, "pitching")
+                            if stat:
+                                ks = float(stat.get("strikeOuts", 0) or 0)
+                                line = parse_line_from_text(row.get("why_it_made_the_card"))
+                                actual = ks
+                                if line is not None:
+                                    status = "win" if ks > line else "loss"
+                                    detail = f"Ks: {ks}; line: {line}"
+                                else:
+                                    detail = f"Ks: {ks}"
+                            else:
+                                detail = "Pending — no final pitcher log yet"
             except Exception as e:
                 detail = f"Grade error: {e}"
 
@@ -755,6 +768,31 @@ def format_game_time_et(game_date_str: str | None) -> str | None:
             return dt_et.strftime("%I:%M %p ET").lstrip("0")
     except Exception:
         return None
+
+
+def game_has_started(game_datetime_utc: str | None, now_et: dt.datetime | None = None, buffer_minutes: int = 5) -> bool:
+    """Return True when first pitch time has arrived (with a small safety buffer)."""
+    if not game_datetime_utc:
+        return False
+    try:
+        s = str(game_datetime_utc).replace("Z", "+00:00")
+        game_dt = dt.datetime.fromisoformat(s)
+        if game_dt.tzinfo is None:
+            game_dt = game_dt.replace(tzinfo=dt.timezone.utc)
+        game_et = game_dt.astimezone(ZoneInfo("America/New_York"))
+        now_et = now_et or dt.datetime.now(ZoneInfo("America/New_York"))
+        return now_et >= (game_et - dt.timedelta(minutes=buffer_minutes))
+    except Exception:
+        return False
+
+def filter_pregame_schedule_rows(schedule_rows: pd.DataFrame, now_et: dt.datetime | None = None, buffer_minutes: int = 5) -> pd.DataFrame:
+    """Only games that have not started yet are eligible for NEW picks."""
+    if schedule_rows is None or schedule_rows.empty:
+        return schedule_rows.copy()
+    now_et = now_et or dt.datetime.now(ZoneInfo("America/New_York"))
+    out = schedule_rows.copy()
+    out["game_started_flag"] = out["game_datetime_utc"].apply(lambda x: game_has_started(x, now_et, buffer_minutes))
+    return out[out["game_started_flag"] == False].copy()
 
 def park_value(s: str) -> float:
     return {"Favorable": 10.0, "Neutral": 5.0, "Unfavorable": 0.0}.get(s or "Neutral", 5.0)
@@ -1864,6 +1902,9 @@ def main(season: int, target_date: str):
     OUTPUT_DIR.mkdir(exist_ok=True)
     print_step("🚀 V40.1 final-card rebuild started...")
     sched_ctx, schedule_rows = get_schedule_game_context(target_date)
+    now_et = dt.datetime.now(ZoneInfo("America/New_York"))
+    eligible_schedule_rows = filter_pregame_schedule_rows(schedule_rows, now_et=now_et, buffer_minutes=5)
+    print_step(f"⏱️ Pregame-eligible games: {len(eligible_schedule_rows)} of {len(schedule_rows)}")
 
     all_players = build_scheduled_player_pool(schedule_rows, season)
     lineup_map, slot_map = get_confirmed_lineups(target_date)
@@ -1890,7 +1931,14 @@ def main(season: int, target_date: str):
     pitcher_metrics = enrich_pitcher_metrics_with_team_context(pitcher_metrics, team_context_df)
     pitcher_line_value = build_pitcher_line_value(pitcher_metrics)
     game_rankings = build_game_rankings(schedule_rows, player_rows, player_rows, pitcher_metrics)
-    refined_picks = build_refined_picks(player_rows, pitcher_metrics, game_rankings)
+
+    eligible_games = set((eligible_schedule_rows.get("away_team", pd.Series(dtype=object)).fillna("") + " @ " + eligible_schedule_rows.get("home_team", pd.Series(dtype=object)).fillna("")).tolist())
+    eligible_teams = set(eligible_schedule_rows.get("away_team", pd.Series(dtype=object)).dropna().tolist() + eligible_schedule_rows.get("home_team", pd.Series(dtype=object)).dropna().tolist())
+
+    pregame_player_rows = player_rows[player_rows["teamName"].isin(eligible_teams)].copy() if not player_rows.empty else player_rows
+    pregame_pitcher_line_value = pitcher_line_value[pitcher_line_value["teamName"].isin(eligible_teams)].copy() if not pitcher_line_value.empty else pitcher_line_value
+    pregame_game_rankings = game_rankings[game_rankings["game"].isin(eligible_games)].copy() if not game_rankings.empty else game_rankings
+    refined_picks = build_refined_picks(pregame_player_rows, pitcher_metrics, pregame_game_rankings)
 
     opp_map = pitcher_metrics[["opponentTeam","pitcherName","pick_type"]].drop_duplicates().rename(columns={
         "opponentTeam":"teamName","pitcherName":"opponent_pitcher","pick_type":"opponent_pitcher_pick_type"
@@ -1911,8 +1959,8 @@ def main(season: int, target_date: str):
     hr_drought = player_rows[["season","teamName","playerName","avg_games_between_hrs","current_games_without_hr","longest_games_without_hr","hr_status","homeRuns","last_hr_date","gamesPlayed","park_favorability","lineup_status","batting_order_slot","starter_only_flag"]].rename(columns={"hr_status":"status"}).merge(opp_map, on="teamName", how="left")
     hit_drought = player_rows[["season","teamName","playerName","avg_games_between_hits","current_games_without_hit","longestHitDrought","hit_status","totalHits","gamesPlayed","park_favorability","lineup_status","batting_order_slot","starter_only_flag"]].rename(columns={"hit_status":"status"}).merge(opp_map, on="teamName", how="left")
 
-    daily_card = build_daily_card(game_rankings, refined_picks, pitcher_line_value, hr_drought)
-    final_card = build_final_card(player_rows, game_rankings, pitcher_line_value)
+    daily_card = build_daily_card(pregame_game_rankings, refined_picks, pregame_pitcher_line_value, hr_drought[hr_drought['teamName'].isin(eligible_teams)].copy() if not hr_drought.empty else hr_drought)
+    final_card = build_final_card(pregame_player_rows, pregame_game_rankings, pregame_pitcher_line_value)
     frozen_final_card = save_frozen_daily_final_card(target_date, final_card)
 
     ts = dt.datetime.now().strftime("%Y-%m-%d_%H%M")
@@ -1940,10 +1988,10 @@ def main(season: int, target_date: str):
 
         top_hr = pd.DataFrame()
         top_hit = pd.DataFrame()
-        if not player_rows.empty:
-            top_hr = player_rows.nlargest(6, "HR_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","HR_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
+        if not pregame_player_rows.empty:
+            top_hr = pregame_player_rows.nlargest(6, "HR_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","HR_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
             top_hr.insert(0, "type", "HR")
-            top_hit = player_rows.nlargest(6, "Hit_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","Hit_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
+            top_hit = pregame_player_rows.nlargest(6, "Hit_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","Hit_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
             top_hit.insert(0, "type", "HIT")
         top_picks = pd.concat([top_hr, top_hit], ignore_index=True)
         top_picks.to_excel(writer, sheet_name="Top_Picks", index=False)
