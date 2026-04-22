@@ -1,239 +1,840 @@
-
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse, HTMLResponse
 from pathlib import Path
 import json
 import datetime as dt
-from hr_v40_2_json_export_ready import main as run_model_main
+import os
+from zoneinfo import ZoneInfo
+
+from hr_v41_cloud_ready import main as run_model_main
 
 app = FastAPI()
 
-OUTPUT_DIR = Path("output")
-OUTPUT_DIR.mkdir(exist_ok=True)
+
+
+def resolve_storage_dir() -> Path:
+    configured = os.getenv("HR_APP_DATA_DIR")
+    if configured:
+        p = Path(configured)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    # Helpful default for Render Disk users if they mount to /var/data
+    render_default = Path("/var/data/hr-picks/output")
+    if render_default.parent.exists():
+        render_default.mkdir(parents=True, exist_ok=True)
+        return render_default
+
+    local_default = Path("output")
+    local_default.mkdir(parents=True, exist_ok=True)
+    return local_default
+
+
+OUTPUT_DIR = resolve_storage_dir()
+
 
 def get_latest_json_file():
-    files = sorted(
-        OUTPUT_DIR.glob("HR_Hit_Drought_v40_appdata-*.json"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True
-    )
+    patterns = [
+        "HR_Hit_Drought_v41_appdata-*.json",
+        "HR_Hit_Drought_v40_appdata-*.json",
+    ]
+    files = []
+    for pat in patterns:
+        files.extend(OUTPUT_DIR.glob(pat))
+    files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
     return files[0] if files else None
 
+
+
+
+def read_json_file(path: Path, default):
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default
+
+
 def load_latest_data():
-    latest_file = get_latest_json_file()
-    if not latest_file:
-        raise HTTPException(status_code=404, detail="No JSON file found in output folder")
-    with open(latest_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    history_dir = OUTPUT_DIR / "history"
+    latest = get_latest_json_file()
+
+    if latest and latest.exists():
+        with open(latest, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        filename = latest.name
+        path_str = str(latest)
+        try:
+            eastern_now = dt.datetime.fromtimestamp(latest.stat().st_mtime, ZoneInfo("America/New_York"))
+            display = eastern_now.strftime("%b %d, %Y %I:%M %p ET").replace(" 0", " ")
+        except Exception:
+            eastern_now = None
+            display = None
+    else:
+        snapshot = read_json_file(history_dir / "latest_app_data.json", {})
+        data = snapshot.get("app_payload") or {
+            "date": None,
+            "final_card": {"generated_section": "final_card", "plays": []},
+            "games": [],
+            "research": {},
+        }
+        filename = snapshot.get("json_filename")
+        path_str = str(history_dir / "latest_app_data.json") if snapshot else None
+        eastern_now = None
+        saved_label = snapshot.get("saved_at_et")
+        display = saved_label
+
+    lock_dir = OUTPUT_DIR / "final_card_lock"
+    frozen_latest = read_json_file(lock_dir / "final_card_by_date_latest.json", {})
+    if not frozen_latest:
+        frozen_latest = read_json_file(history_dir / "final_card_by_date_latest.json", {})
+    frozen_rows = frozen_latest.get("rows") or []
+    frozen_date = frozen_latest.get("target_date")
+
+    data_date = str(data.get("date")) if data.get("date") else None
+    if frozen_rows and frozen_date and (data_date is None or frozen_date == data_date):
+        data["final_card"] = {"generated_section": "final_card", "plays": frozen_rows}
+        if not data.get("date"):
+            data["date"] = frozen_date
+
+    data["results"] = read_json_file(history_dir / "performance_summary_latest.json", {"overall": {}, "by_bet_type": [], "by_confidence": [], "recent_results": []})
+    data["results_latest"] = read_json_file(history_dir / "results_history_latest.json", {"graded_rows": 0, "rows": []})
+    data["info"] = {
+        "purpose": "This app finds MLB betting edges by combining player trends, drought logic, matchup strength, pitcher quality, lineup context, and park factors.",
+        "how_to_use": [
+            "Start on Final Card for the strongest condensed plays.",
+            "Use Games to see matchup context, start time, and top game-level picks.",
+            "Use Research to drill into HR drought, hit drought, pitcher metrics, and game rankings.",
+            "Filter for overdue players, favorable parks, and weaker pitcher types to isolate stronger spots.",
+            "Treat Strong SP as a warning for hitter props and Short Leash Risk or Attack With Hitters as friendlier hitting environments."
+        ],
+        "terms": [
+            {"term": "Attack With Hitters", "meaning": "Pitcher or pitching environment is vulnerable enough to target hitters."},
+            {"term": "Strong SP", "meaning": "Strong starting pitcher. Usually a downgrade for hitter props."},
+            {"term": "Short Leash Risk", "meaning": "Pitcher may not work deep into the game, which can help hitters later against the bullpen."},
+            {"term": "K Upside", "meaning": "Pitcher has a favorable strikeout profile for K props."},
+            {"term": "On Pace", "meaning": "Current drought is normal relative to the player’s average pattern."},
+            {"term": "Slightly Overdue", "meaning": "Player is running a bit longer than usual without the event."},
+            {"term": "Overdue", "meaning": "Player is well beyond normal drought range and may be due for regression."},
+            {"term": "Hit Score", "meaning": "Composite score for hit probability using matchup, context, and trend inputs. Higher is better."},
+            {"term": "HR Score", "meaning": "Composite score for home run appeal using power, park, matchup, and drought context. Higher is better."},
+            {"term": "Moneyline Lean", "meaning": "The model sees an edge on that team, but size depends on edge strength and matchup quality."}
+        ]
+    }
     data["_meta"] = {
-        "filename": latest_file.name,
-        "modified": latest_file.stat().st_mtime,
-        "path": str(latest_file),
+        "filename": filename,
+        "path": path_str,
+        "last_updated_display": display,
+        "eastern_now": eastern_now.strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ") if eastern_now else None,
     }
     return data
 
-@app.get("/")
-def home():
-    return {
-        "message": "HR app server v3 is running",
-        "endpoints": ["/app", "/refresh-data", "/latest", "/final-card", "/games", "/research"]
-    }
-
-@app.post("/refresh-data")
-def refresh_data():
-    today = dt.date.today().strftime("%Y-%m-%d")
-    run_model_main(2026, today)
-    return {"status": "ok", "message": "Data refreshed", "date": today}
 
 @app.get("/latest")
 def latest():
-    return JSONResponse(content=load_latest_data())
-
-@app.get("/final-card")
-def final_card():
-    data = load_latest_data()
-    return JSONResponse(content=data.get("final_card", {}))
-
-@app.get("/games")
-def games():
-    data = load_latest_data()
-    return JSONResponse(content=data.get("games", []))
-
-@app.get("/research")
-def research():
-    data = load_latest_data()
-    return JSONResponse(content=data.get("research", {}))
+    return JSONResponse(load_latest_data())
 
 
-HTML = r"""
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-<title>HR Picks v4</title>
-<style>
-:root{--bg:#070b24;--panel:#121938;--panel2:#1a2248;--line:#3a4b9a;--text:#f2f4ff;--muted:#adb4da;--accent:#8ea2ff;--good:#45d483;--warn:#f2c66d}
-*{box-sizing:border-box} body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:linear-gradient(180deg,#05091d 0%, #070b24 100%);color:var(--text)}
-.wrap{max-width:980px;margin:0 auto;padding:22px 16px 48px} h1{font-size:32px;line-height:1.1;margin:12px 0 10px} .meta{color:var(--muted);font-size:16px;margin-bottom:18px}
-.row{display:flex;gap:12px;flex-wrap:wrap}.btn{border:none;border-radius:18px;padding:18px 22px;background:var(--panel2);color:var(--text);font-size:15px;font-weight:700;border:1px solid #334181}.btn.primary{background:var(--accent);color:#fff}
-.tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:18px 0 20px}.tab{text-align:center;padding:20px 10px;border-radius:22px;background:var(--panel);border:1px solid #334181;color:var(--text);font-size:17px;font-weight:800}.tab.active{outline:2px solid var(--accent)}
-.section{display:none}.section.active{display:block}.card{background:rgba(18,25,56,.95);border:1px solid #2e3b7d;border-radius:26px;padding:18px 18px 16px;margin:14px 0}.eyebrow{font-size:14px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:800}.big{font-size:24px;font-weight:900;line-height:1.15;margin:4px 0}.mid{font-size:18px;color:var(--muted);margin:3px 0}.small{font-size:14px;color:var(--muted);margin-top:8px}.pill{width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#27326f;border:1px solid #3a4b9a;font-weight:900;font-size:28px}.flex{display:flex;justify-content:space-between;gap:14px;align-items:flex-start}.kv{margin-top:8px;color:var(--muted);font-size:15px}.notice{padding:14px 16px;background:#171f43;border:1px dashed #5066c7;border-radius:18px;color:var(--muted)}.game-title{font-size:22px;font-weight:900;line-height:1.2;margin:0 0 12px}.subtle{color:var(--muted);font-size:13px;text-transform:uppercase;letter-spacing:.08em;font-weight:800}.pickline{margin:8px 0 0;font-size:17px;line-height:1.4}.pickline strong{color:#fff}.hr{height:1px;background:#2a376f;margin:14px 0}
-.panel{background:rgba(18,25,56,.95);border:1px solid #2e3b7d;border-radius:22px;margin:12px 0;overflow:hidden}.panel-head{padding:18px 18px;font-size:19px;font-weight:900;border-bottom:1px solid #28366e}.details-body{padding:0 12px 14px}
-.tools{display:flex;gap:10px;flex-wrap:wrap;padding:12px}.tools input[type="text"], .tools input[type="number"], .tools select{background:#0f1532;color:#fff;border:1px solid #344281;border-radius:12px;padding:10px 12px;font-size:14px}
-.table-wrap{overflow:auto;max-height:65vh}.filter-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:0 12px 12px}.filter-box{background:#0f1532;border:1px solid #344281;border-radius:16px;padding:10px 12px}.filter-title{font-size:12px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}.check-list{display:grid;grid-template-columns:1fr;gap:6px;max-height:170px;overflow:auto;padding-right:4px}.check-item{display:flex;align-items:center;gap:8px;font-size:14px;color:#eef1ff}.check-item input{width:16px;height:16px}.action-row{display:flex;gap:10px;flex-wrap:wrap;padding:0 12px 12px}.mini-btn{background:#27326f;color:#fff;border:1px solid #4153a5;padding:10px 12px;border-radius:12px;font-weight:700}
-table{width:100%;border-collapse:collapse;font-size:14px} th,td{padding:10px 12px;border-bottom:1px solid #28366e;vertical-align:top;text-align:left} th{color:#c8cff5;font-size:13px;cursor:pointer;position:sticky;top:0;background:#141c40} td{color:#eef1ff}
-.badge{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:800;background:#27326f;border:1px solid #4153a5;color:#fff}.empty{color:var(--muted);font-size:17px;padding:8px 2px}
-@media (max-width:700px){.filter-grid{grid-template-columns:1fr}.big{font-size:18px}.game-title{font-size:18px}th,td{padding:8px 10px;font-size:13px}}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <h1>HR Picks</h1>
-  <div class="meta" id="meta">Loading…</div>
-  <div class="row">
-    <button class="btn primary" onclick="reloadData()">Refresh Data on Server</button>
-    <button class="btn" onclick="location.reload()">Reload App</button>
-  </div>
-  <div class="tabs">
-    <button class="tab active" data-target="final-card">Final Card</button>
-    <button class="tab" data-target="games">Games</button>
-    <button class="tab" data-target="research">Research</button>
-  </div>
-  <section id="final-card" class="section active"></section>
-  <section id="games" class="section"></section>
-  <section id="research" class="section"></section>
-</div>
-<script>
-let APPDATA=null; let RESEARCH_SORT={}; let RESEARCH_FILTER_STATE={}; let RESEARCH_OPEN_STATE={};
-function nice(v){if(v===null||v===undefined||v==="") return "—"; return String(v)}
-function fmtNum(v){if(v===null||v===undefined||v==="") return "—"; const n=Number(v); return Number.isNaN(n)?String(v):n.toFixed(3).replace(/\.000$/,'')}
-function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function tabSetup(){document.querySelectorAll('.tab').forEach(btn=>{btn.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.section').forEach(x=>x.classList.remove('active'));btn.classList.add('active');document.getElementById(btn.dataset.target).classList.add('active')}})}
-async function loadData(){const res=await fetch('/latest'); APPDATA=await res.json(); renderAll()}
-async function reloadData(){
-  document.getElementById('meta').textContent='Refreshing server data…';
-  const res = await fetch('/refresh-data', {method:'POST'});
-  if(!res.ok){
-    document.getElementById('meta').textContent='Refresh failed';
-    return;
-  }
-  await loadData();
-}
-function renderMeta(){const d=APPDATA.date||'—'; const loaded=new Date().toLocaleTimeString(); const file=APPDATA._meta?.filename||''; document.getElementById('meta').textContent=`Date: ${d} • Loaded ${loaded} • ${file}`}
-function renderFinalCard(){const el=document.getElementById('final-card'); const plays=APPDATA.final_card?.plays||[]; if(!plays.length){el.innerHTML=`<div class="notice">No final card plays qualified today.</div>`; return}
-const grouped={Moneyline:[], '1+ Hit':[], HR:[], 'K Prop':[]}; plays.forEach(p=>{if(!grouped[p.bet_type]) grouped[p.bet_type]=[]; grouped[p.bet_type].push(p)});
-function block(title, items, emptyMsg){if(!items.length){return `<div class="card"><div class="eyebrow">${esc(title)}</div><div class="empty">${esc(emptyMsg)}</div></div>`} return items.map(p=>`<div class="card"><div class="flex"><div style="flex:1"><div class="eyebrow">${esc(p.slot)} · ${esc(p.bet_type)}</div><div class="big">${esc(p.pick)}</div><div class="mid">${esc(p.team)} vs ${esc(p.opponent)}</div><div class="kv">${esc(p.why_it_made_the_card)}</div><div class="small">Source: ${esc(p.source_tab)}</div></div><div class="pill">${esc(p.confidence||'')}</div></div></div>`).join('')}
-el.innerHTML=`${block('Moneyline', grouped['Moneyline']||[], 'No qualified moneyline play today.')}${block('Hit Picks', grouped['1+ Hit']||[], 'No qualified hit picks today.')}${block('HR Picks', grouped['HR']||[], 'No qualified HR picks today.')}${block('K Prop', grouped['K Prop']||[], 'No qualified K prop today.')}`}
-function buildGameCards(){const games=APPDATA.games||[]; const topPicks=APPDATA.research?.top_picks||[]; const pitcherVals=APPDATA.research?.pitcher_line_value||[]; return games.map(g=>{let hits=Array.isArray(g.top_hit_picks)?[...g.top_hit_picks]:[]; let hrs=Array.isArray(g.top_hr_picks)?[...g.top_hr_picks]:[]; const teams=[]; if(g.ml_lean?.team) teams.push(g.ml_lean.team); if(g.ml_lean?.opponent) teams.push(g.ml_lean.opponent); if(!hits.length){hits=topPicks.filter(r=>r.type==='HIT'&&teams.includes(r.teamName)).sort((a,b)=>(Number(b.Hit_score||0)-Number(a.Hit_score||0))).slice(0,2).map(r=>({playerName:r.playerName,teamName:r.teamName,Hit_score:r.Hit_score,lineup_status:r.lineup_status,batting_order_slot:r.batting_order_slot}))} if(!hrs.length){hrs=topPicks.filter(r=>r.type==='HR'&&teams.includes(r.teamName)).sort((a,b)=>(Number(b.HR_score||0)-Number(a.HR_score||0))).slice(0,2).map(r=>({playerName:r.playerName,teamName:r.teamName,HR_score:r.HR_score,lineup_status:r.lineup_status,batting_order_slot:r.batting_order_slot}))} let k=g.top_k_pick; if(!k&&teams.length){const p=pitcherVals.filter(r=>teams.includes(r.teamName)).sort((a,b)=>Number(b.projected_k_mid||0)-Number(a.projected_k_mid||0))[0]; if(p){k=p}} return {...g, top_hit_picks:hits, top_hr_picks:hrs, top_k_pick:k}})}
-function renderGames(){const el=document.getElementById('games'); const cards=buildGameCards(); if(!cards.length){el.innerHTML=`<div class="notice">No game cards available.</div>`; return} el.innerHTML=cards.map(g=>{const ml=g.ml_lean||{}; const hits=g.top_hit_picks||[]; const hrs=g.top_hr_picks||[]; const k=g.top_k_pick||null; return `<div class="card"><div class="game-title">${esc(g.game)}</div><div class="subtle">Model Lean</div><div class="pickline"><strong>${esc(ml.team||'No side')}</strong> vs ${esc(ml.opponent||'—')}</div><div class="kv">Model edge: ${fmtNum(ml.edge_vs_opponent)} · Model note: ${esc(ml.recommended_play||'—')}</div><div class="hr"></div><div class="subtle">Top Hit Picks</div>${hits.length?hits.map(p=>`<div class="pickline"><strong>${esc(p.playerName)}</strong> · ${esc(p.teamName)} · Hit score ${fmtNum(p.Hit_score)}</div>`).join(''):`<div class="empty">No qualified hit picks shown for this game.</div>`}<div class="hr"></div><div class="subtle">Top HR Picks</div>${hrs.length?hrs.map(p=>`<div class="pickline"><strong>${esc(p.playerName)}</strong> · ${esc(p.teamName)} · HR score ${fmtNum(p.HR_score)}</div>`).join(''):`<div class="empty">No qualified HR picks shown for this game.</div>`}<div class="hr"></div><div class="subtle">Top K Pick</div>${k?`<div class="pickline"><strong>${esc(k.pitcherName||'—')}</strong> · ${esc(k.teamName||'—')} · ${esc(k.recommended_k_action||'—')}</div><div class="kv">Projected Ks: ${fmtNum(k.projected_k_floor)}-${fmtNum(k.projected_k_ceiling)} · Max line: ${nice(k.max_playable_k_line)}</div>`:`<div class="empty">No K pick for this game.</div>`}</div>`}).join('')}
-function getResearchTableColumns(rows){const set=new Set(); rows.slice(0,50).forEach(r=>Object.keys(r).forEach(k=>set.add(k))); return Array.from(set)}
-function sortRows(rows,key,dir){const copy=[...rows]; copy.sort((a,b)=>{const av=a[key], bv=b[key]; const an=Number(av), bn=Number(bv); const aNum=!Number.isNaN(an)&&av!==null&&av!==""; const bNum=!Number.isNaN(bn)&&bv!==null&&bv!==""; let cmp=0; if(aNum&&bNum) cmp=an-bn; else cmp=String(av??"").localeCompare(String(bv??"")); return dir==='asc'?cmp:-cmp}); return copy}
-function getUniqueValues(rows,key){const vals=new Set(); (rows||[]).forEach(r=>{const v=r[key]; if(v!==null&&v!==undefined&&String(v).trim()!=='') vals.add(String(v))}); return Array.from(vals).sort((a,b)=>a.localeCompare(b))}
-function initFilterState(name, rows){if(RESEARCH_FILTER_STATE[name]) return; RESEARCH_FILTER_STATE[name]={search:'', teams:[], statuses:[], parks:[], opps:[], overdueOnly:false, minDrought:''}; if(name==='top_picks') RESEARCH_OPEN_STATE[name]=true;}
-function updateTextFilter(name, value){initFilterState(name,[]); RESEARCH_FILTER_STATE[name].search=value; renderOneResearchTable(name, APPDATA.research?.[name]||[])}
-function updateCheckArray(name,key,val,checked){initFilterState(name,[]); const arr=RESEARCH_FILTER_STATE[name][key]; const idx=arr.indexOf(val); if(checked && idx===-1) arr.push(val); if(!checked && idx!==-1) arr.splice(idx,1); renderOneResearchTable(name, APPDATA.research?.[name]||[])}
-function updateSimpleFilter(name,key,val){initFilterState(name,[]); RESEARCH_FILTER_STATE[name][key]=val; renderOneResearchTable(name, APPDATA.research?.[name]||[])}
-function clearFilters(name){initFilterState(name,[]); RESEARCH_FILTER_STATE[name]={search:'', teams:[], statuses:[], parks:[], opps:[], overdueOnly:false, minDrought:''}; RESEARCH_SORT[name]=RESEARCH_SORT[name]||{}; renderResearch()}
-function toggleSort(name,key){if(!RESEARCH_SORT[name]||RESEARCH_SORT[name].key!==key){RESEARCH_SORT[name]={key,dir:'desc'}}else{RESEARCH_SORT[name].dir=RESEARCH_SORT[name].dir==='desc'?'asc':'desc'} renderOneResearchTable(name, APPDATA.research?.[name]||[])}
-function applyAdvancedFilters(name, rows){let data=[...rows]; const f=RESEARCH_FILTER_STATE[name]||{}; const q=(f.search||'').toLowerCase().trim(); if(q){data=data.filter(r=>JSON.stringify(r).toLowerCase().includes(q))} if(['hr_drought','hit_drought'].includes(name)){ if(f.teams?.length) data=data.filter(r=>f.teams.includes(String(r.teamName||''))); if(f.statuses?.length) data=data.filter(r=>f.statuses.includes(String(r.status||''))); if(f.parks?.length) data=data.filter(r=>f.parks.includes(String(r.park_favorability||''))); if(f.opps?.length) data=data.filter(r=>f.opps.includes(String(r.opponent_pitcher_pick_type||''))); if(f.overdueOnly) data=data.filter(r=>String(r.status||'').toLowerCase().includes('overdue')); if(f.minDrought!==''){const threshold=Number(f.minDrought); const col=name==='hr_drought'?'current_games_without_hr':'current_games_without_hit'; if(!Number.isNaN(threshold)) data=data.filter(r=>Number(r[col]||0)>=threshold)}} return data}
-function buildCheckboxGroup(name,key,title,vals){const state=RESEARCH_FILTER_STATE[name]||{}; const selected=state[key]||[]; return `<div class="filter-box"><div class="filter-title">${esc(title)}</div><div class="check-list">${vals.map(v=>`<label class="check-item"><input type="checkbox" ${selected.includes(v)?'checked':''} onchange="updateCheckArray('${name}','${key}', ${JSON.stringify(v)}, this.checked)"><span>${esc(v)}</span></label>`).join('') || '<div class="empty">No options</div>'}</div></div>`}
-function buildAdvancedFilterUI(name, rows){if(!['hr_drought','hit_drought'].includes(name)) return ''; initFilterState(name, rows); const state=RESEARCH_FILTER_STATE[name]; const teams=getUniqueValues(rows,'teamName'); const statuses=getUniqueValues(rows,'status'); const parks=getUniqueValues(rows,'park_favorability'); const opps=getUniqueValues(rows,'opponent_pitcher_pick_type'); const label=name==='hr_drought'?'Min HR Drought':'Min Hit Drought'; return `<div class="tools"><input type="text" placeholder="Search this table" value="${esc(state.search)}" oninput="updateTextFilter('${name}', this.value)"><label class="check-item filter-box" style="max-width:220px"><input type="checkbox" ${state.overdueOnly?'checked':''} onchange="updateSimpleFilter('${name}','overdueOnly', this.checked)"><span>Overdue only</span></label><input type="number" min="0" placeholder="${label}" value="${esc(state.minDrought)}" oninput="updateSimpleFilter('${name}','minDrought', this.value)"></div><div class="filter-grid">${buildCheckboxGroup(name,'teams','Teams',teams)}${buildCheckboxGroup(name,'statuses','Status',statuses)}${buildCheckboxGroup(name,'parks','Park',parks)}${buildCheckboxGroup(name,'opps','Opponent Pitcher Type',opps)}</div><div class="action-row"><button class="mini-btn" onclick="clearFilters('${name}')">Clear Filters</button></div>`}
-function renderOneResearchTable(name, rows){initFilterState(name, rows); const sortKey=RESEARCH_SORT[name]?.key||null; const sortDir=RESEARCH_SORT[name]?.dir||'desc'; let data=Array.isArray(rows)?[...rows]:[]; data=applyAdvancedFilters(name, data); if(sortKey){data=sortRows(data, sortKey, sortDir)} const cols=getResearchTableColumns(data.length?data:rows); const target=document.getElementById(`tbl_${name}`); if(!target) return; if(!data.length){target.innerHTML=`<div class="details-body"><div class="empty">No rows to show.</div></div>`; return} target.innerHTML=`<div class="details-body table-wrap"><table><thead><tr>${cols.map(c=>`<th onclick="toggleSort('${name}','${c}')">${esc(c)}${sortKey===c?(sortDir==='asc'?' ▲':' ▼'):''}</th>`).join('')}</tr></thead><tbody>${data.map(r=>`<tr>${cols.map(c=>`<td>${esc(r[c]??'—')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`}
-function renderResearch(){const el=document.getElementById('research'); const sections=APPDATA.research||{}; const order=['game_rankings','pitcher_line_value','pitcher_metrics','top_picks','refined_picks','hr_drought','hit_drought']; const labels={game_rankings:'Game Rankings',pitcher_line_value:'Pitcher Line Value',pitcher_metrics:'Pitcher Metrics',top_picks:'Top Picks',refined_picks:'Refined Picks',hr_drought:'HR Drought',hit_drought:'Hit Drought'}; if(!el.dataset.built){ el.innerHTML=order.map(name=>`<div class="panel"><div class="panel-head">${labels[name]}</div>${['hr_drought','hit_drought'].includes(name)?buildAdvancedFilterUI(name, sections[name]||[]):`<div class="tools"><input type="text" placeholder="Search this table" oninput="updateTextFilter('${name}', this.value)"></div>`}<div id="tbl_${name}"></div></div>`).join(''); el.dataset.built='1'; } order.forEach(name=>renderOneResearchTable(name, sections[name]||[]))}
-function renderAll(){renderMeta();renderFinalCard();renderGames(); document.getElementById('research').innerHTML=''; document.getElementById('research').dataset.built=''; renderResearch()}
-tabSetup(); loadData();
-</script>
-</body>
-</html>
-"""
+@app.get("/refresh-data")
+def refresh_data():
+    today = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    run_model_main(2026, today)
+    return JSONResponse({"status": "ok", "message": "Data refreshed", "date": today, "timezone": "America/New_York"})
 
+
+@app.get("/")
 @app.get("/app")
-def app_page():
-    return HTMLResponse(HTML)
-HTML = """
+def app_view():
+    html = """
 <!doctype html>
 <html>
 <head>
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>HR Picks</title>
-<style>
-:root{--bg:#070d2a;--panel:#121a44;--panel2:#172055;--text:#f3f5ff;--muted:#aeb7e6;--line:#33408d;--accent:#8ea2ff}
-*{box-sizing:border-box} body{margin:0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;background:linear-gradient(180deg,#05091d,#07113a 40%,#05091d);color:var(--text)}
-.wrap{max-width:980px;margin:0 auto;padding:22px 16px 40px}.title{font-size:30px;font-weight:800;margin:8px 0 6px}.meta{color:var(--muted);font-size:14px;margin-bottom:14px}.row{display:flex;gap:12px;flex-wrap:wrap}.btn,.tab{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:18px;padding:14px 18px;font-weight:700}.btn.primary{background:var(--accent);color:#fff;border-color:transparent}.tabs{margin:14px 0 18px}.tab.active{outline:2px solid var(--accent)}.section{display:none}.section.active{display:block}.card,.panel{background:rgba(18,26,68,.92);border:1px solid var(--line);border-radius:24px;padding:18px;margin:14px 0}.eyebrow,.subtle{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:700}.big,.game-title{font-size:18px;font-weight:800;margin:8px 0}.mid,.pickline,.kv,.small,.empty{color:var(--muted)}.flex{display:flex;gap:14px;align-items:flex-start}.pill{background:#26306e;border:1px solid var(--line);width:44px;height:44px;border-radius:999px;display:flex;align-items:center;justify-content:center;font-weight:800}.notice{padding:18px;border:1px dashed var(--line);border-radius:18px;color:var(--muted)}
-.panel-head{font-size:16px;font-weight:800;margin-bottom:12px}.tools{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}.tools input[type=text],.tools input[type=number],.tools select{background:#0b1235;color:var(--text);border:1px solid var(--line);border-radius:14px;padding:12px 14px;min-width:150px}.mini-btn{background:#26306e;color:#fff;border:1px solid var(--line);border-radius:14px;padding:10px 14px;font-weight:700}.filter-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:12px 0}@media(max-width:700px){.filter-grid{grid-template-columns:1fr}}
-.filter-box{border:1px solid var(--line);border-radius:18px;padding:12px;background:#0b1235}.filter-title{font-size:12px;color:var(--muted);text-transform:uppercase;font-weight:800;margin-bottom:8px}.check-list{max-height:160px;overflow:auto;padding-right:6px}.check-item{display:flex;gap:10px;align-items:flex-start;margin:8px 0;color:var(--text)}
-.table-wrap{overflow:auto;max-height:560px}.table-wrap table{width:100%;border-collapse:collapse;font-size:14px}.table-wrap th,.table-wrap td{padding:12px 10px;border-bottom:1px solid rgba(142,162,255,.2);vertical-align:top;text-align:left}.table-wrap th{position:sticky;top:0;background:#152057;cursor:pointer}
-.hr{height:1px;background:rgba(142,162,255,.18);margin:12px 0}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HR Picks App</title>
+  <style>
+    :root {
+      --bg: #050914;
+      --card: #121925;
+      --card2: #0e1522;
+      --border: #26324a;
+      --text: #eef2f8;
+      --muted: #b8c1d1;
+      --accent: #4c83ff;
+      --accent2: #2f5ec7;
+      --chip: #172132;
+      --soft: #0c1320;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    .wrap { max-width: 1520px; margin: 0 auto; padding: 18px 22px 48px; }
+    h1 { margin: 0 0 6px; font-size: 68px; line-height: 0.95; font-weight: 900; letter-spacing: -1px; }
+    .meta { color: var(--muted); font-size: 18px; margin-bottom: 18px; }
+    .topbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+    .btn {
+      background: var(--accent);
+      color: white;
+      border: 0;
+      border-radius: 16px;
+      padding: 14px 22px;
+      font-weight: 800;
+      font-size: 16px;
+      cursor: pointer;
+      box-shadow: 0 8px 24px rgba(76,131,255,.2);
+    }
+    .btn:hover { background: var(--accent2); }
+    .btn:disabled { opacity: .7; cursor: wait; }
+    .btn.secondary {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+      box-shadow: none;
+    }
+    .tabs { display: flex; gap: 12px; flex-wrap: wrap; margin: 18px 0 22px; }
+    .tab {
+      background: var(--chip);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 999px;
+      padding: 12px 16px;
+      cursor: pointer;
+      font-size: 16px;
+    }
+    .tab.active { background: #24324d; }
+    .hidden { display: none !important; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 18px; }
+    .card {
+      background: linear-gradient(180deg, var(--card), var(--card2));
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      padding: 22px 22px 18px;
+      box-shadow: 0 14px 40px rgba(0,0,0,.25);
+    }
+    .card h2 { margin: 0 0 14px; font-size: 24px; line-height: 1.15; }
+    .kicker { color: var(--muted); margin: 8px 0 18px; font-size: 15px; }
+    .line { margin: 8px 0; font-size: 17px; color: var(--text); }
+    .label { font-weight: 800; }
+    .muted { color: var(--muted); }
+    .pill {
+      display: inline-block; padding: 4px 10px; border-radius: 999px; background: #1d2740; border: 1px solid var(--border);
+      font-size: 13px; color: var(--muted);
+    }
+    .list { margin: 8px 0 0; padding-left: 18px; }
+    .list li { margin: 6px 0; }
+    .research-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+    .research-card { cursor: pointer; }
+    .research-card:hover { border-color: #4a5f8b; }
+    .research-title { font-size: 22px; font-weight: 900; margin-bottom: 10px; }
+    .table-shell {
+      background: linear-gradient(180deg, var(--card), var(--card2));
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      padding: 18px;
+      overflow: hidden;
+    }
+    .toolbar { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+    .input, select {
+      background: var(--soft);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 12px 14px;
+      font-size: 15px;
+      min-width: 180px;
+    }
+    .facet-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin: 6px 0 16px; }
+    .facet-box {
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 12px;
+      background: rgba(23,33,50,.35);
+      min-height: 100px;
+    }
+    .facet-title { font-weight: 800; margin-bottom: 10px; }
+    .facet-scroll { max-height: 180px; overflow: auto; padding-right: 4px; }
+    .facet-item { display: flex; align-items: center; gap: 10px; margin: 8px 0; color: var(--muted); }
+    .facet-item input { transform: scale(1.05); }
+    .checkbox-inline { display: flex; align-items: center; gap: 10px; color: var(--text); }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td {
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid #1f2940;
+      vertical-align: top;
+      white-space: nowrap;
+    }
+    td.wrap, th.wrap { white-space: normal; }
+    th { color: var(--text); position: sticky; top: 0; background: #0f1726; z-index: 1; }
+    td { color: var(--muted); }
+    .table-wrap { overflow: auto; max-height: 70vh; border-radius: 16px; }
+    .backrow { margin-bottom: 14px; }
+    .subhead { font-size: 13px; color: var(--muted); margin-top: -4px; margin-bottom: 8px; }
+    @media (max-width: 700px) {
+      h1 { font-size: 54px; }
+      .wrap { padding: 18px 16px 38px; }
+      .cards { grid-template-columns: 1fr; }
+    }
+  </style>
 </head>
 <body>
-<div class="wrap">
-  <div class="title">HR Picks</div>
-  <div id="meta" class="meta">Loading…</div>
-  <div class="row">
-    <button class="btn primary" onclick="reloadData()">Refresh</button>
-    <button class="btn" onclick="location.reload()">Reload App</button>
+  <div class="wrap">
+    <div class="topbar">
+      <div>
+        <h1>HR Picks App</h1>
+        <div id="meta" class="meta">Loading...</div>
+      </div>
+      <div>
+        <button class="btn" id="reloadBtn">Reload App</button>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <button class="tab active" data-view="final">Final Card</button>
+      <button class="tab" data-view="games">Games</button>
+      <button class="tab" data-view="research">Research</button>
+      <button class="tab" data-view="info">Info</button>
+      <button class="tab" data-view="results">Results</button>
+    </div>
+
+    <section id="view-final"></section>
+    <section id="view-games" class="hidden"></section>
+    <section id="view-research" class="hidden"></section>
+    <section id="view-info" class="hidden"></section>
+    <section id="view-results" class="hidden"></section>
   </div>
-  <div class="row tabs">
-    <button class="tab active" data-target="final-card">Final Card</button>
-    <button class="tab" data-target="games">Games</button>
-    <button class="tab" data-target="research">Research</button>
-  </div>
-  <section id="final-card" class="section active"></section>
-  <section id="games" class="section"></section>
-  <section id="research" class="section"></section>
-</div>
+
 <script>
-let APPDATA=null; let RESEARCH_SORT={}; let RESEARCH_SEARCH={};
-function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function nice(v){if(v===null||v===undefined||v==="") return "—"; return String(v)}
-function fmtNum(v){if(v===null||v===undefined||v==="") return "—"; const n=Number(v); return Number.isNaN(n)?String(v):n.toFixed(3).replace(/\.000$/,'')}
-function tabSetup(){document.querySelectorAll('.tab').forEach(btn=>btn.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.section').forEach(x=>x.classList.remove('active'));btn.classList.add('active');document.getElementById(btn.dataset.target).classList.add('active')})}
-async function loadData(){const res=await fetch('/latest'); APPDATA=await res.json(); renderAll()}
-async function reloadData(){
-  document.getElementById('meta').textContent='Refreshing server data…';
-  const res = await fetch('/refresh-data', {method:'POST'});
-  if(!res.ok){
-    document.getElementById('meta').textContent='Refresh failed';
+let APP_DATA = null;
+let currentView = "final";
+let CURRENT_RESEARCH_KEY = null;
+let CURRENT_RESEARCH_ROWS = [];
+let CURRENT_SORT_COLUMN = "";
+let CURRENT_SORT_DIR = "asc";
+
+function esc(v) {
+  if (v === null || v === undefined) return "";
+  return String(v)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function fmt(v) {
+  if (v === null || v === undefined || v === "") return "—";
+  return typeof v === "number" ? String(v) : String(v);
+}
+
+function titleize(key) {
+  return String(key || "").replaceAll("_", " ").replace(/\b\w/g, m => m.toUpperCase());
+}
+
+function parseEtTimeToMinutes(t) {
+  if (!t) return 99999;
+  const s = String(t).toUpperCase().replace("ET", "").trim();
+  const m = s.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/);
+  if (!m) return 99999;
+  let hh = parseInt(m[1], 10);
+  const mm = parseInt(m[2], 10);
+  const ap = m[3];
+  if (ap === "PM" && hh !== 12) hh += 12;
+  if (ap === "AM" && hh === 12) hh = 0;
+  return hh * 60 + mm;
+}
+
+function buildGameTimeLookup() {
+  const map = {};
+  const games = APP_DATA?.games || [];
+  games.forEach(g => {
+    const gameName = g?.game;
+    if (gameName) {
+      map[gameName] = g.game_time_et || g.start_time_et || g.startTimeEt || g.game_datetime_utc || null;
+    }
+  });
+  const rankings = APP_DATA?.research?.game_rankings || [];
+  rankings.forEach(r => {
+    const gameName = r?.game;
+    if (gameName && !map[gameName]) {
+      map[gameName] = r.game_time_et || r.start_time_et || r.startTimeEt || r.game_datetime_utc || null;
+    }
+  });
+  return map;
+}
+
+function setMeta() {
+  const date = APP_DATA?.date || "—";
+  const lu = APP_DATA?._meta?.last_updated_display || "—";
+  document.getElementById("meta").textContent = "Date: " + date + " • Last Updated: " + lu;
+}
+
+async function loadData() {
+  const res = await fetch("/latest?t=" + Date.now(), { cache: "no-store" });
+  APP_DATA = await res.json();
+  renderAll();
+}
+
+function finalCardRows() {
+  const plays = APP_DATA?.final_card?.plays;
+  if (Array.isArray(plays) && plays.length) return plays;
+  const fallback = APP_DATA?.research?.final_card;
+  return Array.isArray(fallback) ? fallback : [];
+}
+
+function renderFinal() {
+  const mount = document.getElementById("view-final");
+  const plays = finalCardRows();
+  if (!plays.length) {
+    mount.innerHTML = '<div class="card"><h2>No final card available.</h2></div>';
     return;
   }
-  await loadData();
+  mount.innerHTML = '<div class="cards">' + plays.map(p => `
+    <div class="card">
+      <div class="pill">${esc(fmt(p.slot || p.play_type || p.section || "Play"))}</div>
+      <h2>${esc(fmt(p.pick || p.playerName || "Play"))}</h2>
+      <div class="line"><span class="label">Bet Type:</span> ${esc(fmt(p.bet_type))}</div>
+      <div class="line"><span class="label">Team:</span> ${esc(fmt(p.team || p.teamName))}</div>
+      <div class="line"><span class="label">Opponent:</span> ${esc(fmt(p.opponent || p.opponentTeam))}</div>
+      <div class="line"><span class="label">Confidence:</span> ${esc(fmt(p.confidence))}</div>
+      <div class="kicker">${esc(fmt(p.why_it_made_the_card || p.reason))}</div>
+      <div class="muted">Source: ${esc(fmt(p.source_tab))}</div>
+    </div>
+  `).join("") + "</div>";
 }
-function renderMeta(){const d=APPDATA.date||'—'; document.getElementById('meta').textContent=`Date: ${d} • Loaded ${new Date().toLocaleTimeString()}`}
-function renderFinalCard(){const el=document.getElementById('final-card'); const plays=APPDATA.final_card?.plays||[]; if(!plays.length){el.innerHTML='<div class="notice">No final card plays qualified today.</div>'; return} const groups={'Moneyline':[],'1+ Hit':[],'HR':[],'K Prop':[]}; plays.forEach(p=>{if(!groups[p.bet_type]) groups[p.bet_type]=[]; groups[p.bet_type].push(p)}); function block(title,items,emptyMsg){if(!items.length) return `<div class="card"><div class="eyebrow">${esc(title)}</div><div class="empty">${esc(emptyMsg)}</div></div>`; return items.map(p=>`<div class="card"><div class="flex"><div style="flex:1"><div class="eyebrow">${esc(p.slot)} · ${esc(p.bet_type)}</div><div class="big">${esc(p.pick)}</div><div class="mid">${esc(p.team)} vs ${esc(p.opponent)}</div><div class="kv">${esc(p.why_it_made_the_card)}</div><div class="small">Source: ${esc(p.source_tab)}</div></div><div class="pill">${esc(p.confidence||'')}</div></div></div>`).join('')} el.innerHTML=block('Moneyline',groups['Moneyline']||[],'No qualified moneyline play today.')+block('Hit Picks',groups['1+ Hit']||[],'No qualified hit picks today.')+block('HR Picks',groups['HR']||[],'No qualified HR picks today.')+block('K Prop',groups['K Prop']||[],'No qualified K prop today.')}
-function buildGameCards(){const games=APPDATA.games||[]; const topPicks=APPDATA.research?.top_picks||[]; const pitcherVals=APPDATA.research?.pitcher_line_value||[]; return games.map(g=>{let hits=Array.isArray(g.top_hit_picks)?[...g.top_hit_picks]:[]; let hrs=Array.isArray(g.top_hr_picks)?[...g.top_hr_picks]:[]; const teams=[]; if(g.ml_lean?.team) teams.push(g.ml_lean.team); if(g.ml_lean?.opponent) teams.push(g.ml_lean.opponent); if(!hits.length){hits=topPicks.filter(r=>r.type==='HIT'&&teams.includes(r.teamName)).sort((a,b)=>(Number(b.Hit_score||0)-Number(a.Hit_score||0))).slice(0,2).map(r=>({playerName:r.playerName,teamName:r.teamName,Hit_score:r.Hit_score}))} if(!hrs.length){hrs=topPicks.filter(r=>r.type==='HR'&&teams.includes(r.teamName)).sort((a,b)=>(Number(b.HR_score||0)-Number(a.HR_score||0))).slice(0,2).map(r=>({playerName:r.playerName,teamName:r.teamName,HR_score:r.HR_score}))} let k=g.top_k_pick; if(!k&&teams.length){const p=pitcherVals.filter(r=>teams.includes(r.teamName)).sort((a,b)=>Number(b.projected_k_mid||0)-Number(a.projected_k_mid||0))[0]; if(p) k=p} return {...g,top_hit_picks:hits,top_hr_picks:hrs,top_k_pick:k}})}
-function renderGames(){const el=document.getElementById('games'); const cards=buildGameCards(); if(!cards.length){el.innerHTML='<div class="notice">No game cards available.</div>'; return} el.innerHTML=cards.map(g=>{const ml=g.ml_lean||{}; const hits=g.top_hit_picks||[]; const hrs=g.top_hr_picks||[]; const k=g.top_k_pick||null; return `<div class="card"><div class="game-title">${esc(g.game)}</div><div class="subtle">Model Lean</div><div class="pickline"><strong>${esc(ml.team||'No side')}</strong> vs ${esc(ml.opponent||'—')}</div><div class="kv">Model edge: ${fmtNum(ml.edge_vs_opponent)} · Model note: ${esc(ml.recommended_play||'—')}</div><div class="hr"></div><div class="subtle">Top Hit Picks</div>${hits.length?hits.map(p=>`<div class="pickline"><strong>${esc(p.playerName)}</strong> · ${esc(p.teamName)} · Hit score ${fmtNum(p.Hit_score)}</div>`).join(''):'<div class="empty">No qualified hit picks shown for this game.</div>'}<div class="hr"></div><div class="subtle">Top HR Picks</div>${hrs.length?hrs.map(p=>`<div class="pickline"><strong>${esc(p.playerName)}</strong> · ${esc(p.teamName)} · HR score ${fmtNum(p.HR_score)}</div>`).join(''):'<div class="empty">No qualified HR picks shown for this game.</div>'}<div class="hr"></div><div class="subtle">Top K Pick</div>${k?`<div class="pickline"><strong>${esc(k.pitcherName||'—')}</strong> · ${esc(k.teamName||'—')} · ${esc(k.recommended_k_action||'—')}</div><div class="kv">Projected Ks: ${fmtNum(k.projected_k_floor)}-${fmtNum(k.projected_k_ceiling)} · Max line: ${nice(k.max_playable_k_line)}</div>`:'<div class="empty">No K pick for this game.</div>'}</div>`}).join('')}
-function getResearchTableColumns(rows){const s=new Set(); rows.slice(0,50).forEach(r=>Object.keys(r).forEach(k=>s.add(k))); return Array.from(s)}
-function sortRows(rows,key,dir){const copy=[...rows]; copy.sort((a,b)=>{const av=a[key],bv=b[key]; const an=Number(av),bn=Number(bv); const aNum=!Number.isNaN(an)&&av!==null&&av!==''; const bNum=!Number.isNaN(bn)&&bv!==null&&bv!==''; let cmp=0; if(aNum&&bNum) cmp=an-bn; else cmp=String(av??'').localeCompare(String(bv??'')); return dir==='asc'?cmp:-cmp}); return copy}
-function toggleSort(name,key){if(!RESEARCH_SORT[name]||RESEARCH_SORT[name].key!==key){RESEARCH_SORT[name]={key,dir:'desc'}}else{RESEARCH_SORT[name].dir=RESEARCH_SORT[name].dir==='desc'?'asc':'desc'} renderOneResearchTable(name)}
-function getRows(name){return Array.isArray(APPDATA.research?.[name])?[...APPDATA.research[name]]:[]}
-function getSelectedValues(prefix){return Array.from(document.querySelectorAll(`input[data-group="${prefix}"]:checked`)).map(x=>x.value)}
-function applyPanelFilters(name, rows){let data=[...rows]; const search=(document.getElementById(`${name}-search`)?.value||'').toLowerCase().trim(); if(search) data=data.filter(r=>JSON.stringify(r).toLowerCase().includes(search)); if(['hr_drought','hit_drought'].includes(name)){
- const teams=getSelectedValues(`${name}-teams`); const statuses=getSelectedValues(`${name}-statuses`); const parks=getSelectedValues(`${name}-parks`); const opps=getSelectedValues(`${name}-opps`); const overdue=document.getElementById(`${name}-overdue`)?.checked; const minVal=Number(document.getElementById(`${name}-mindrought`)?.value||'');
- if(teams.length) data=data.filter(r=>teams.includes(String(r.teamName||'')));
- if(statuses.length) data=data.filter(r=>statuses.includes(String(r.status||'')));
- if(parks.length) data=data.filter(r=>parks.includes(String(r.park_favorability||'')));
- if(opps.length) data=data.filter(r=>opps.includes(String(r.opponent_pitcher_pick_type||'')));
- if(overdue) data=data.filter(r=>String(r.status||'').toLowerCase().includes('overdue'));
- if(!Number.isNaN(minVal)){const col=name==='hr_drought'?'current_games_without_hr':'current_games_without_hit'; data=data.filter(r=>Number(r[col]||0)>=minVal)}
- }
- return data}
-function renderCheckboxGroup(id,title,vals){return `<div class="filter-box"><div class="filter-title">${esc(title)}</div><div class="check-list">${vals.map(v=>`<label class="check-item"><input type="checkbox" data-group="${id}" value="${esc(v)}"><span>${esc(v)}</span></label>`).join('')||'<div class="empty">No options</div>'}</div></div>`}
-function uniq(rows,key){return [...new Set(rows.map(r=>String(r[key]??'')).filter(v=>v.trim()!==''))].sort((a,b)=>a.localeCompare(b))}
-function buildResearchPanel(name,label){const rows=getRows(name); const searchable=['hr_drought','hit_drought'].includes(name); let html=`<div class="panel"><div class="panel-head">${esc(label)}</div>`;
- if(searchable){html += `<div class="tools"><input id="${name}-search" type="text" placeholder="Search this table"><label class="check-item filter-box" style="max-width:220px"><input id="${name}-overdue" type="checkbox"><span>Overdue only</span></label><input id="${name}-mindrought" type="number" min="0" placeholder="${name==='hr_drought'?'Min HR Drought':'Min Hit Drought'}"></div>`;
- html += `<div class="filter-grid">${renderCheckboxGroup(name+'-teams','Teams',uniq(rows,'teamName'))}${renderCheckboxGroup(name+'-statuses','Status',uniq(rows,'status'))}${renderCheckboxGroup(name+'-parks','Park',uniq(rows,'park_favorability'))}${renderCheckboxGroup(name+'-opps','Opponent Pitcher Type',uniq(rows,'opponent_pitcher_pick_type'))}</div>`;
- html += `<div class="row"><button class="mini-btn" onclick="applyResearchFilters('${name}')">Apply Filters</button><button class="mini-btn" onclick="clearResearchFilters('${name}')">Clear Filters</button></div>`;
- } else {html += `<div class="tools"><input id="${name}-search" type="text" placeholder="Search this table"><button class="mini-btn" onclick="applyResearchFilters('${name}')">Apply Filters</button><button class="mini-btn" onclick="clearResearchFilters('${name}')">Clear Filters</button></div>`}
- html += `<div id="tbl_${name}"></div></div>`; return html}
-function applyResearchFilters(name){renderOneResearchTable(name)}
-function clearResearchFilters(name){const panel=document.getElementById(`tbl_${name}`).closest('.panel'); panel.querySelectorAll('input[type="checkbox"]').forEach(x=>x.checked=false); panel.querySelectorAll('input[type="text"], input[type="number"]').forEach(x=>x.value=''); RESEARCH_SORT[name]=RESEARCH_SORT[name]||{}; renderOneResearchTable(name)}
-function renderOneResearchTable(name){const baseRows=getRows(name); let rows=applyPanelFilters(name,baseRows); const search=document.getElementById(`${name}-search`)?.value||''; if(search&&!['hr_drought','hit_drought'].includes(name)){rows=rows.filter(r=>JSON.stringify(r).toLowerCase().includes(search.toLowerCase().trim()))} const sortKey=RESEARCH_SORT[name]?.key||null; const sortDir=RESEARCH_SORT[name]?.dir||'desc'; if(sortKey) rows=sortRows(rows,sortKey,sortDir); const cols=getResearchTableColumns(rows.length?rows:baseRows); const target=document.getElementById(`tbl_${name}`); if(!target) return; if(!rows.length){target.innerHTML='<div class="notice">No rows to show.</div>'; return} target.innerHTML=`<div class="table-wrap"><table><thead><tr>${cols.map(c=>`<th onclick="toggleSort('${name}','${c}')">${esc(c)}${sortKey===c?(sortDir==='asc'?' ▲':' ▼'):''}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr>${cols.map(c=>`<td>${esc(r[c]??'—')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`}
-function renderResearch(){const el=document.getElementById('research'); const labels={game_rankings:'Game Rankings',pitcher_line_value:'Pitcher Line Value',pitcher_metrics:'Pitcher Metrics',top_picks:'Top Picks',refined_picks:'Refined Picks',hr_drought:'HR Drought',hit_drought:'Hit Drought'}; const order=['game_rankings','pitcher_line_value','pitcher_metrics','top_picks','refined_picks','hr_drought','hit_drought']; el.innerHTML=order.map(name=>buildResearchPanel(name,labels[name])).join(''); order.forEach(name=>renderOneResearchTable(name))}
-function renderAll(){renderMeta(); renderFinalCard(); renderGames(); renderResearch()}
-tabSetup(); loadData();
+
+function normalizedGames() {
+  const rawGames = Array.isArray(APP_DATA?.games) ? APP_DATA.games.slice() : [];
+  const timeMap = buildGameTimeLookup();
+  return rawGames.map(g => {
+    const time = g.game_time_et || g.start_time_et || g.startTimeEt || timeMap[g.game] || null;
+    return { ...g, _sortTime: parseEtTimeToMinutes(time), _displayTime: time || "not available yet" };
+  }).sort((a, b) => a._sortTime - b._sortTime || String(a.game || "").localeCompare(String(b.game || "")));
+}
+
+function renderGames() {
+  const mount = document.getElementById("view-games");
+  const games = normalizedGames();
+  if (!games.length) {
+    mount.innerHTML = '<div class="card"><h2>No game cards available.</h2></div>';
+    return;
+  }
+
+  mount.innerHTML = '<div class="cards">' + games.map(g => {
+    const venueHtml = g.venue ? `<p class="line"><span class="label">Venue:</span> ${esc(g.venue)}</p>` : "";
+    const hits = (g.top_hit_picks || []).map(x => `<li>${esc(x.playerName)} (${esc(x.teamName)})</li>`).join("") || "<li>—</li>";
+    const hrs = (g.top_hr_picks || []).map(x => `<li>${esc(x.playerName)} (${esc(x.teamName)})</li>`).join("") || "<li>—</li>";
+    const kp = g.top_k_pick
+      ? `${esc(fmt(g.top_k_pick.pitcherName))} (${esc(fmt(g.top_k_pick.teamName))}) — ${esc(fmt(g.top_k_pick.recommended_k_action))}`
+      : "—";
+    const ml = g.ml_lean || {};
+    const mlPlay = `${esc(fmt(ml.team))} (edge ${esc(fmt(ml.edge_vs_opponent))})`;
+    return `
+      <div class="card">
+        <h2>${esc(fmt(g.game))}</h2>
+        <p class="line"><span class="label">Start Time:</span> ${esc(g._displayTime)}</p>
+        ${venueHtml}
+        <p class="line"><span class="label">ML Lean:</span> ${mlPlay}</p>
+        <p class="muted">${esc(fmt(ml.recommended_play))}</p>
+        <h2 style="font-size:20px;margin-top:18px;">Top Hit Picks</h2>
+        <ul class="list">${hits}</ul>
+        <h2 style="font-size:20px;margin-top:18px;">Top HR Picks</h2>
+        <ul class="list">${hrs}</ul>
+        <h2 style="font-size:20px;margin-top:18px;">Top K Pick</h2>
+        <p class="line">${kp}</p>
+      </div>
+    `;
+  }).join("") + '</div>';
+}
+
+function visibleResearchEntries() {
+  const research = APP_DATA?.research || {};
+  const hide = new Set(["final_card"]);
+  return Object.entries(research).filter(([k, v]) => Array.isArray(v) && !hide.has(k));
+}
+
+function renderResearchHome() {
+  const mount = document.getElementById("view-research");
+  const entries = visibleResearchEntries();
+  if (!entries.length) {
+    mount.innerHTML = '<div class="card"><h2>No research tables available.</h2></div>';
+    return;
+  }
+  mount.innerHTML = '<div class="research-grid">' + entries.map(([k, rows]) => `
+    <div class="card research-card" data-key="${esc(k)}">
+      <div class="research-title">${esc(titleize(k))}</div>
+      <div class="muted">${rows.length} rows</div>
+    </div>
+  `).join("") + '</div>';
+
+  mount.querySelectorAll(".research-card").forEach(el => {
+    el.addEventListener("click", () => openResearchTable(el.dataset.key));
+  });
+}
+
+function uniqueValues(rows, key) {
+  const set = new Set();
+  rows.forEach(r => {
+    const v = r[key];
+    if (v !== null && v !== undefined && String(v).trim() !== "") set.add(String(v));
+  });
+  return Array.from(set).sort((a, b) => a.localeCompare(b));
+}
+
+function buildFacetBox(label, key, values) {
+  if (!values.length) return "";
+  const checks = values.map(v => `
+    <label class="facet-item">
+      <input type="checkbox" class="facet-check" data-key="${esc(key)}" value="${esc(v)}">
+      <span>${esc(v)}</span>
+    </label>
+  `).join("");
+  return `
+    <div class="facet-box">
+      <div class="facet-title">${esc(label)}</div>
+      <div class="facet-scroll">${checks}</div>
+    </div>
+  `;
+}
+
+function openResearchTable(key) {
+  CURRENT_RESEARCH_KEY = key;
+  CURRENT_RESEARCH_ROWS = APP_DATA?.research?.[key] || [];
+
+  const rows = CURRENT_RESEARCH_ROWS;
+  const mount = document.getElementById("view-research");
+  const columns = rows.length ? Object.keys(rows[0]) : [];
+  const options = columns.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+
+  const facets = [];
+  const facetColumns = [
+    ["Teams", "teamName"],
+    ["Status", "status"],
+    ["Park", "park_favorability"],
+    ["Opponent Pitcher Type", "opponent_pitcher_pick_type"],
+    ["Lineup Status", "lineup_status"]
+  ];
+  facetColumns.forEach(([label, keyName]) => {
+    if (columns.includes(keyName)) {
+      facets.push(buildFacetBox(label, keyName, uniqueValues(rows, keyName)));
+    }
+  });
+
+  const numericFilters = [];
+  if (columns.includes("avg_games_between_hrs")) {
+    numericFilters.push('<input id="minAvgInput" class="input" placeholder="Min avg drought" oninput="filterResearchTable()">');
+  }
+  if (columns.includes("current_games_without_hr")) {
+    numericFilters.push('<input id="minCurrentInput" class="input" placeholder="Min games since HR" oninput="filterResearchTable()">');
+  }
+
+  mount.innerHTML = `
+    <div class="backrow">
+      <button class="btn secondary" id="backBtn">← Back</button>
+    </div>
+    <div class="table-shell">
+      <h2 style="margin-top:0;">${esc(titleize(key))}</h2>
+      <div class="subhead">Search + filters are active for this table.</div>
+      <div class="toolbar">
+        <input id="searchBox" class="input" placeholder="Search this table" oninput="filterResearchTable()">
+        <select id="columnSelect" onchange="filterResearchTable()">
+          <option value="">All columns</option>
+          ${options}
+        </select>
+        <select id="sortSelect" onchange="filterResearchTable()">
+          <option value="">Default order</option>
+          <option value="asc">A → Z</option>
+          <option value="desc">Z → A</option>
+        </select>
+        <label class="checkbox-inline">
+          <input type="checkbox" id="overdueOnly" onchange="filterResearchTable()">
+          <span>Overdue only</span>
+        </label>
+        ${numericFilters.join("")}
+        <button class="btn secondary" id="clearFiltersBtn">Clear Filters</button>
+      </div>
+      ${facets.length ? `<div class="facet-grid">${facets.join("")}</div>` : ""}
+      <div class="table-wrap">
+        <table id="researchTable">
+          <thead><tr>${columns.map(c => `<th data-col="${esc(c)}" class="sortable ${String(c).length > 18 ? 'wrap' : ''}">${esc(c)}</th>`).join("")}</tr></thead>
+          <tbody>
+            ${rows.map(r => `<tr>${columns.map(c => `<td class="${String(c).length > 18 ? 'wrap' : ''}">${esc(fmt(r[c]))}</td>`).join("")}</tr>`).join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+
+  document.getElementById("backBtn").addEventListener("click", renderResearchHome);
+  const clearBtn = document.getElementById("clearFiltersBtn");
+  clearBtn.addEventListener("click", clearResearchFilters);
+  mount.querySelectorAll(".facet-check").forEach(el => {
+    el.addEventListener("change", filterResearchTable);
+  });
+  mount.querySelectorAll("thead th.sortable").forEach(th => {
+    th.style.cursor = "pointer";
+    th.addEventListener("click", () => {
+      const col = th.dataset.col || "";
+      if (CURRENT_SORT_COLUMN === col) {
+        CURRENT_SORT_DIR = CURRENT_SORT_DIR === "asc" ? "desc" : "asc";
+      } else {
+        CURRENT_SORT_COLUMN = col;
+        CURRENT_SORT_DIR = "asc";
+      }
+      filterResearchTable();
+    });
+  });
+
+  filterResearchTable();
+}
+
+function clearResearchFilters() {
+  const search = document.getElementById("searchBox");
+  const col = document.getElementById("columnSelect");
+  const overdue = document.getElementById("overdueOnly");
+  const sortSel = document.getElementById("sortSelect");
+  const minAvg = document.getElementById("minAvgInput");
+  const minCurrent = document.getElementById("minCurrentInput");
+
+  if (search) search.value = "";
+  if (col) col.value = "";
+  if (overdue) overdue.checked = false;
+  if (sortSel) sortSel.value = "";
+  if (minAvg) minAvg.value = "";
+  if (minCurrent) minCurrent.value = "";
+  document.querySelectorAll(".facet-check").forEach(c => c.checked = false);
+  CURRENT_SORT_COLUMN = "";
+  CURRENT_SORT_DIR = "asc";
+  filterResearchTable();
+}
+
+function selectedFacetMap() {
+  const map = {};
+  document.querySelectorAll(".facet-check:checked").forEach(el => {
+    const key = el.dataset.key;
+    map[key] = map[key] || new Set();
+    map[key].add(String(el.value));
+  });
+  return map;
+}
+
+function filterResearchTable() {
+  const search = (document.getElementById("searchBox")?.value || "").toLowerCase();
+  const column = document.getElementById("columnSelect")?.value || "";
+  const overdueOnly = !!document.getElementById("overdueOnly")?.checked;
+  const minAvg = parseFloat(document.getElementById("minAvgInput")?.value || "");
+  const minCurrent = parseFloat(document.getElementById("minCurrentInput")?.value || "");
+  const facetMap = selectedFacetMap();
+  const sortValue = document.getElementById("sortSelect")?.value || "";
+
+  const table = document.getElementById("researchTable");
+  if (!table) return;
+
+  const headers = Array.from(table.querySelectorAll("thead th")).map(th => th.dataset.col || th.textContent || "");
+  const tbody = table.querySelector("tbody");
+  if (!tbody) return;
+
+  let rows = Array.isArray(CURRENT_RESEARCH_ROWS) ? [...CURRENT_RESEARCH_ROWS] : [];
+
+  rows = rows.filter(r => {
+    const getVal = (key) => String(r?.[key] ?? "");
+    const headerVals = headers.map(h => getVal(h));
+    const lowerHeaderVals = headerVals.map(v => v.toLowerCase());
+
+    if (search) {
+      if (column) {
+        const hay = getVal(column).toLowerCase();
+        if (!hay.includes(search)) return false;
+      } else {
+        if (!lowerHeaderVals.join(" | ").includes(search)) return false;
+      }
+    }
+
+    if (overdueOnly) {
+      const statusVal = getVal("status").toLowerCase();
+      if (!statusVal.includes("overdue")) return false;
+    }
+
+    if (!Number.isNaN(minAvg)) {
+      const avgKey = headers.includes("avg_games_between_hrs") ? "avg_games_between_hrs" : (headers.includes("avg_games_between_hits") ? "avg_games_between_hits" : "");
+      if (avgKey) {
+        const num = parseFloat(getVal(avgKey));
+        if (Number.isNaN(num) || num < minAvg) return false;
+      }
+    }
+
+    if (!Number.isNaN(minCurrent)) {
+      const curKey = headers.includes("current_games_without_hr") ? "current_games_without_hr" : (headers.includes("current_games_without_hit") ? "current_games_without_hit" : "");
+      if (curKey) {
+        const num = parseFloat(getVal(curKey));
+        if (Number.isNaN(num) || num < minCurrent) return false;
+      }
+    }
+
+    for (const [key, valSet] of Object.entries(facetMap)) {
+      const val = getVal(key);
+      if (!valSet.has(String(val))) return false;
+    }
+
+    return true;
+  });
+
+  if (CURRENT_SORT_COLUMN) {
+    rows.sort((a, b) => {
+      const av = String(a?.[CURRENT_SORT_COLUMN] ?? "");
+      const bv = String(b?.[CURRENT_SORT_COLUMN] ?? "");
+      const an = parseFloat(av);
+      const bn = parseFloat(bv);
+      const bothNumeric = !Number.isNaN(an) && !Number.isNaN(bn) && av.trim() !== "" && bv.trim() !== "";
+      if (bothNumeric) {
+        return CURRENT_SORT_DIR === "asc" ? an - bn : bn - an;
+      }
+      return CURRENT_SORT_DIR === "asc"
+        ? av.localeCompare(bv, undefined, {numeric:true, sensitivity:"base"})
+        : bv.localeCompare(av, undefined, {numeric:true, sensitivity:"base"});
+    });
+  } else if (sortValue) {
+    const sortKey = headers.includes("playerName") ? "playerName" : headers[0];
+    rows.sort((a, b) => {
+      const av = String(a?.[sortKey] ?? "");
+      const bv = String(b?.[sortKey] ?? "");
+      return sortValue === "asc"
+        ? av.localeCompare(bv, undefined, {numeric:true, sensitivity:"base"})
+        : bv.localeCompare(av, undefined, {numeric:true, sensitivity:"base"});
+    });
+  }
+
+  tbody.innerHTML = rows.map(r => `<tr>${headers.map(c => `<td class="${String(c).length > 18 ? 'wrap' : ''}">${esc(fmt(r[c]))}</td>`).join("")}</tr>`).join("");
+
+  document.querySelectorAll("thead th.sortable").forEach(th => {
+    const col = th.dataset.col || "";
+    const base = col;
+    if (CURRENT_SORT_COLUMN === col) {
+      th.textContent = `${base} ${CURRENT_SORT_DIR === 'asc' ? '↑' : '↓'}`;
+    } else {
+      th.textContent = base;
+    }
+  });
+}
+
+
+
+function renderInfo() {
+  const mount = document.getElementById("view-info");
+  const info = APP_DATA?.info || {};
+  const terms = Array.isArray(info.terms) ? info.terms : [];
+  const how = Array.isArray(info.how_to_use) ? info.how_to_use : [];
+  mount.innerHTML = `
+    <div class="cards">
+      <div class="card">
+        <h2>What This App Does</h2>
+        <div class="line">${esc(fmt(info.purpose || "This app ranks MLB betting edges across hits, HRs, Ks, and moneyline spots."))}</div>
+      </div>
+      <div class="card">
+        <h2>What To Look For</h2>
+        <ul class="list">${how.map(x => `<li>${esc(x)}</li>`).join("")}</ul>
+      </div>
+    </div>
+    <div class="table-shell" style="margin-top:18px;">
+      <h2 style="margin-top:0;">Key Terms</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Term</th><th class="wrap">Meaning</th></tr></thead>
+          <tbody>${terms.map(t => `<tr><td>${esc(fmt(t.term))}</td><td class="wrap">${esc(fmt(t.meaning))}</td></tr>`).join("")}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function renderResults() {
+  const mount = document.getElementById("view-results");
+  const results = APP_DATA?.results || {};
+  const overall = results.overall || {};
+  const byType = Array.isArray(results.by_bet_type) ? results.by_bet_type : [];
+  const byConf = Array.isArray(results.by_confidence) ? results.by_confidence : [];
+  const recent = Array.isArray(results.recent_results) ? results.recent_results : [];
+  mount.innerHTML = `
+    <div class="cards">
+      <div class="card"><h2>Overall Performance</h2>
+        <div class="line"><span class="label">Graded Picks:</span> ${esc(fmt(overall.graded_picks))}</div>
+        <div class="line"><span class="label">Wins:</span> ${esc(fmt(overall.wins))}</div>
+        <div class="line"><span class="label">Losses:</span> ${esc(fmt(overall.losses))}</div>
+        <div class="line"><span class="label">Win Rate:</span> ${overall.win_rate !== undefined && overall.win_rate !== null ? esc((overall.win_rate * 100).toFixed(1) + '%') : '—'}</div>
+      </div>
+      <div class="card"><h2>What This Is For</h2>
+        <div class="line">This tab tracks how saved picks perform over time so you can see what the model does well and where it needs tightening.</div>
+      </div>
+    </div>
+    <div class="cards" style="margin-top:18px;">
+      <div class="table-shell">
+        <h2 style="margin-top:0;">By Bet Type</h2>
+        <div class="table-wrap"><table><thead><tr><th>Bet Type</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
+        ${byType.map(r => `<tr><td>${esc(fmt(r.bet_type))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${r.win_rate !== undefined && r.win_rate !== null ? esc((Number(r.win_rate) * 100).toFixed(1) + '%') : '—'}</td></tr>`).join("") || '<tr><td colspan="5">No graded results yet.</td></tr>'}
+        </tbody></table></div>
+      </div>
+      <div class="table-shell">
+        <h2 style="margin-top:0;">By Confidence</h2>
+        <div class="table-wrap"><table><thead><tr><th>Confidence</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
+        ${byConf.map(r => `<tr><td>${esc(fmt(r.confidence))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${r.win_rate !== undefined && r.win_rate !== null ? esc((Number(r.win_rate) * 100).toFixed(1) + '%') : '—'}</td></tr>`).join("") || '<tr><td colspan="5">No confidence-level results yet.</td></tr>'}
+        </tbody></table></div>
+      </div>
+    </div>
+    <div class="table-shell" style="margin-top:18px;">
+      <h2 style="margin-top:0;">Recent Graded Picks</h2>
+      <div class="table-wrap"><table><thead><tr><th>Date</th><th>Bet Type</th><th>Pick</th><th>Team</th><th>Opponent</th><th>Confidence</th><th>Result</th><th class="wrap">Detail</th></tr></thead><tbody>
+      ${recent.map(r => `<tr><td>${esc(fmt(r.target_date))}</td><td>${esc(fmt(r.bet_type))}</td><td>${esc(fmt(r.pick))}</td><td>${esc(fmt(r.team))}</td><td>${esc(fmt(r.opponent))}</td><td>${esc(fmt(r.confidence))}</td><td>${esc(fmt(r.result_status))}</td><td class="wrap">${esc(fmt(r.result_detail))}</td></tr>`).join("") || '<tr><td colspan="8">No graded picks yet.</td></tr>'}
+      </tbody></table></div>
+    </div>
+  `;
+}
+
+function renderAll() {
+  setMeta();
+  renderFinal();
+  renderGames();
+  renderResearchHome();
+  renderInfo();
+  renderResults();
+  switchView(currentView);
+}
+
+function switchView(view) {
+  currentView = view;
+  document.getElementById("view-final").classList.toggle("hidden", view !== "final");
+  document.getElementById("view-games").classList.toggle("hidden", view !== "games");
+  document.getElementById("view-research").classList.toggle("hidden", view !== "research");
+  document.getElementById("view-info").classList.toggle("hidden", view !== "info");
+  document.getElementById("view-results").classList.toggle("hidden", view !== "results");
+  document.querySelectorAll(".tab").forEach(btn => btn.classList.toggle("active", btn.dataset.view === view));
+}
+
+document.querySelectorAll(".tab").forEach(btn => {
+  btn.addEventListener("click", () => switchView(btn.dataset.view));
+});
+
+document.getElementById("reloadBtn").addEventListener("click", async () => {
+  const btn = document.getElementById("reloadBtn");
+  const old = btn.textContent;
+  btn.textContent = "Reloading...";
+  btn.disabled = true;
+  try {
+    await loadData();
+  } finally {
+    btn.textContent = old;
+    btn.disabled = false;
+  }
+});
+
+loadData();
 </script>
 </body>
 </html>
 """
+    return HTMLResponse(html)
