@@ -1017,10 +1017,19 @@ document.querySelectorAll(".tab").forEach(btn => {
 document.getElementById("reloadBtn").addEventListener("click", async () => {
   const btn = document.getElementById("reloadBtn");
   const old = btn.textContent;
-  btn.textContent = "Reloading...";
+  btn.textContent = "Running model...";
   btn.disabled = true;
   try {
+    const res = await fetch("/refresh-data?t=" + Date.now(), { cache: "no-store" });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(`Refresh failed: ${res.status} ${txt}`);
+    }
+    btn.textContent = "Loading app...";
     await loadData();
+  } catch (err) {
+    console.error(err);
+    alert("Refresh failed. Check Render logs for details. " + (err?.message || err));
   } finally {
     btn.textContent = old;
     btn.disabled = false;
