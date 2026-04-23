@@ -10,14 +10,22 @@ OUTPUT_DIR = Path(os.getenv("HR_APP_DATA_DIR", "output"))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _latest_v40_json() -> Path:
+def _matching_v40_json(target_date: str) -> Path:
+    """
+    Find the newest v40 appdata JSON whose filename includes the requested target_date.
+    Example filename:
+    HR_Hit_Drought_v40_appdata-2026_2026-04-23_2026-04-23_0647.json
+    """
+    pattern = f"HR_Hit_Drought_v40_appdata-*_{target_date}_{target_date}_*.json"
     files = sorted(
-        OUTPUT_DIR.glob("HR_Hit_Drought_v40_appdata-*.json"),
+        OUTPUT_DIR.glob(pattern),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
     if not files:
-        raise FileNotFoundError("No v40 appdata JSON was created.")
+        raise FileNotFoundError(
+            f"No v40 appdata JSON was created for target_date={target_date}."
+        )
     return files[0]
 
 
@@ -32,15 +40,20 @@ def _write_v41_json(data: dict, season: int, target_date: str) -> Path:
 
 
 def main(season: int, target_date: str):
-    # Run the v40 builder first. This creates the latest app snapshot on disk.
+    # Run the v40 builder first for the requested date.
     run_v40_main(season, target_date)
 
-    latest_v40 = _latest_v40_json()
+    # IMPORTANT: pick the v40 file that matches the requested target_date,
+    # not just the most recently modified file overall.
+    matching_v40 = _matching_v40_json(target_date)
 
-    with open(latest_v40, "r", encoding="utf-8") as f:
+    with open(matching_v40, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # For now, v41 is a pass-through wrapper around the latest v40 appdata.
+    # Safety: force the payload date to match the requested target_date.
+    data["date"] = target_date
+
+    # For now, v41 is a pass-through wrapper around the matching v40 appdata.
     v41_path = _write_v41_json(data, season, target_date)
 
     print(f"✅ v41 JSON created: {v41_path}")
@@ -48,7 +61,8 @@ def main(season: int, target_date: str):
     return {
         "status": "success",
         "message": "v41 built successfully",
-        "v40_source": str(latest_v40),
+        "target_date": target_date,
+        "v40_source": str(matching_v40),
         "v41_output": str(v41_path),
     }
 
