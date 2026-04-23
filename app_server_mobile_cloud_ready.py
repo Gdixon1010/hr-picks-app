@@ -402,8 +402,13 @@ function finalCardRows() {
 function buildModelInsight(p) {
   if (p?.model_insight) return String(p.model_insight);
   const betType = String(p?.bet_type || "");
+  const pickText = String(p?.pick || p?.playerName || "");
   const reason = String(p?.why_it_made_the_card || p?.reason || "");
   const lower = reason.toLowerCase();
+
+  if (betType === "No Plays" || pickText.toLowerCase().includes("no final card plays qualified")) {
+    return "Model did not find enough edge after today's filters, matchup checks, and pregame rules.";
+  }
 
   if (betType === "Moneyline") {
     if (lower.includes("strong sp") && lower.includes("short leash")) {
