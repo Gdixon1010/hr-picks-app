@@ -686,8 +686,21 @@ def get_schedule_rows(target_date: str) -> pd.DataFrame:
             teams = g.get("teams", {})
             home = teams.get("home", {})
             away = teams.get("away", {})
+            game_dt_raw = g.get("gameDate")
+            game_time_et = None
+            if game_dt_raw:
+                try:
+                    game_dt_et = pd.to_datetime(game_dt_raw, utc=True).tz_convert("America/New_York")
+                    game_time_et = game_dt_et.strftime("%-I:%M %p ET")
+                except Exception:
+                    try:
+                        game_time_et = pd.to_datetime(game_dt_raw, utc=True).tz_convert("America/New_York").strftime("%I:%M %p ET").lstrip("0")
+                    except Exception:
+                        game_time_et = None
             rows.append({
                 "game_date": target_date,
+                "game_datetime_utc": game_dt_raw,
+                "game_time_et": game_time_et,
                 "away_team": (away.get("team") or {}).get("name"),
                 "home_team": (home.get("team") or {}).get("name"),
                 "venue": (g.get("venue") or {}).get("name"),
@@ -1065,6 +1078,8 @@ def build_game_rankings(schedule_rows, hr_rows, hit_rows, pitcher_metrics):
             team_score = round((offense_score * 0.55) + (nz(p_self.get("pitcher_score_adj")) * 0.45) - vol_penalty_ml - public_penalty_ml + short_leash_adj, 3)
             rows.append({
                 "game": f"{g.get('away_team')} @ {g.get('home_team')}",
+                "game_time_et": g.get("game_time_et"),
+                "game_datetime_utc": g.get("game_datetime_utc"),
                 "teamName": team, "opponentTeam": opp, "venue": g.get("venue"),
                 "offense_hr_score": offense_hr, "offense_hit_score": offense_hit, "offense_score": offense_score,
                 "team_volatility": get_team_volatility(team), "public_bias": get_public_bias(team),
