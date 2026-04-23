@@ -361,6 +361,50 @@ function parseEtTimeToMinutes(t) {
   return hh * 60 + mm;
 }
 
+function parseSortableDate(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw || raw === "—") return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    const ts = Date.parse(raw + "T00:00:00Z");
+    return Number.isNaN(ts) ? null : ts;
+  }
+  const parsed = Date.parse(raw);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function compareMixedValues(a, b, dir = "asc") {
+  const av = a === null || a === undefined ? "" : String(a).trim();
+  const bv = b === null || b === undefined ? "" : String(b).trim();
+
+  const ad = parseSortableDate(av);
+  const bd = parseSortableDate(bv);
+  if (ad !== null || bd !== null) {
+    if (ad === null && bd === null) return 0;
+    if (ad === null) return 1;
+    if (bd === null) return -1;
+    return dir === "asc" ? ad - bd : bd - ad;
+  }
+
+  const an = parseFloat(av);
+  const bn = parseFloat(bv);
+  const aNum = !Number.isNaN(an) && av !== "" && av !== "—";
+  const bNum = !Number.isNaN(bn) && bv !== "" && bv !== "—";
+  if (aNum || bNum) {
+    if (!aNum && !bNum) return 0;
+    if (!aNum) return 1;
+    if (!bNum) return -1;
+    return dir === "asc" ? an - bn : bn - an;
+  }
+
+  if (!av && !bv) return 0;
+  if (!av || av === "—") return 1;
+  if (!bv || bv === "—") return -1;
+
+  return dir === "asc"
+    ? av.localeCompare(bv, undefined, { numeric: true, sensitivity: "base" })
+    : bv.localeCompare(av, undefined, { numeric: true, sensitivity: "base" });
+}
+
 function buildGameTimeLookup() {
   const map = {};
   const games = APP_DATA?.games || [];
@@ -760,28 +804,10 @@ function filterResearchTable() {
   });
 
   if (CURRENT_SORT_COLUMN) {
-    rows.sort((a, b) => {
-      const av = String(a?.[CURRENT_SORT_COLUMN] ?? "");
-      const bv = String(b?.[CURRENT_SORT_COLUMN] ?? "");
-      const an = parseFloat(av);
-      const bn = parseFloat(bv);
-      const bothNumeric = !Number.isNaN(an) && !Number.isNaN(bn) && av.trim() !== "" && bv.trim() !== "";
-      if (bothNumeric) {
-        return CURRENT_SORT_DIR === "asc" ? an - bn : bn - an;
-      }
-      return CURRENT_SORT_DIR === "asc"
-        ? av.localeCompare(bv, undefined, {numeric:true, sensitivity:"base"})
-        : bv.localeCompare(av, undefined, {numeric:true, sensitivity:"base"});
-    });
+    rows.sort((a, b) => compareMixedValues(a?.[CURRENT_SORT_COLUMN], b?.[CURRENT_SORT_COLUMN], CURRENT_SORT_DIR));
   } else if (sortValue) {
     const sortKey = headers.includes("playerName") ? "playerName" : headers[0];
-    rows.sort((a, b) => {
-      const av = String(a?.[sortKey] ?? "");
-      const bv = String(b?.[sortKey] ?? "");
-      return sortValue === "asc"
-        ? av.localeCompare(bv, undefined, {numeric:true, sensitivity:"base"})
-        : bv.localeCompare(av, undefined, {numeric:true, sensitivity:"base"});
-    });
+    rows.sort((a, b) => compareMixedValues(a?.[sortKey], b?.[sortKey], sortValue));
   }
 
   tbody.innerHTML = rows.map(r => `<tr>${headers.map(c => `<td class="${String(c).length > 18 ? 'wrap' : ''}">${esc(fmt(r[c]))}</td>`).join("")}</tr>`).join("");
