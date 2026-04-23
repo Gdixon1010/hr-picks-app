@@ -652,6 +652,11 @@ function openResearchTable(key) {
     numericFilters.push('<input id="minCurrentInput" class="input" placeholder="Min games since HR" oninput="filterResearchTable()">');
   }
 
+  const quickButtons = [];
+  if (columns.includes("last_hr_date")) {
+    quickButtons.push('<button class="btn secondary" id="hrTodayBtn">HR Today</button>');
+  }
+
   mount.innerHTML = `
     <div class="backrow">
       <button class="btn secondary" id="backBtn">← Back</button>
@@ -675,6 +680,7 @@ function openResearchTable(key) {
           <span>Overdue only</span>
         </label>
         ${numericFilters.join("")}
+        ${quickButtons.join("")}
         <button class="btn secondary" id="clearFiltersBtn">Clear Filters</button>
       </div>
       ${facets.length ? `<div class="facet-grid">${facets.join("")}</div>` : ""}
@@ -692,6 +698,10 @@ function openResearchTable(key) {
   document.getElementById("backBtn").addEventListener("click", renderResearchHome);
   const clearBtn = document.getElementById("clearFiltersBtn");
   clearBtn.addEventListener("click", clearResearchFilters);
+  const hrTodayBtn = document.getElementById("hrTodayBtn");
+  if (hrTodayBtn) {
+    hrTodayBtn.addEventListener("click", applyHrTodayQuickFilter);
+  }
   mount.querySelectorAll(".facet-check").forEach(el => {
     el.addEventListener("change", filterResearchTable);
   });
@@ -703,13 +713,20 @@ function openResearchTable(key) {
         CURRENT_SORT_DIR = CURRENT_SORT_DIR === "asc" ? "desc" : "asc";
       } else {
         CURRENT_SORT_COLUMN = col;
-        const lowerCol = String(col || "").toLowerCase();
-        CURRENT_SORT_DIR = lowerCol.includes("date") ? "desc" : "asc";
+        CURRENT_SORT_DIR = col.toLowerCase().includes("date") ? "desc" : "asc";
       }
       filterResearchTable();
     });
   });
 
+  filterResearchTable();
+}
+
+function applyHrTodayQuickFilter() {
+  const search = document.getElementById("searchBox");
+  const col = document.getElementById("columnSelect");
+  if (search) search.value = APP_DATA?.date || "";
+  if (col) col.value = "last_hr_date";
   filterResearchTable();
 }
 
