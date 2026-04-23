@@ -703,7 +703,8 @@ function openResearchTable(key) {
         CURRENT_SORT_DIR = CURRENT_SORT_DIR === "asc" ? "desc" : "asc";
       } else {
         CURRENT_SORT_COLUMN = col;
-        CURRENT_SORT_DIR = "asc";
+        const lowerCol = String(col || "").toLowerCase();
+        CURRENT_SORT_DIR = lowerCol.includes("date") ? "desc" : "asc";
       }
       filterResearchTable();
     });
