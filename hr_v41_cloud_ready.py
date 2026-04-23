@@ -6,15 +6,19 @@ from datetime import datetime
 from hr_v40_2_json_export_ready import main as run_v40_main
 
 
-OUTPUT_DIR = Path(os.getenv("HR_APP_DATA_DIR", "output"))
+# Force BOTH v40 and v41 to use the same shared Render output directory.
+RENDER_OUTPUT_DIR = "/var/data/hr-picks/output"
+os.environ["HR_APP_DATA_DIR"] = RENDER_OUTPUT_DIR
+
+OUTPUT_DIR = Path(os.getenv("HR_APP_DATA_DIR", RENDER_OUTPUT_DIR))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _matching_v40_json(target_date: str) -> Path:
     """
-    Find the newest v40 appdata JSON whose filename includes the requested target_date.
-    Example filename:
-    HR_Hit_Drought_v40_appdata-2026_2026-04-23_2026-04-23_0647.json
+    Find the newest v40 appdata JSON whose filename matches the requested target_date.
+    Example:
+    HR_Hit_Drought_v40_appdata-2026_2026-04-23_2026-04-23_1047.json
     """
     pattern = f"HR_Hit_Drought_v40_appdata-*_{target_date}_{target_date}_*.json"
     files = sorted(
@@ -24,7 +28,7 @@ def _matching_v40_json(target_date: str) -> Path:
     )
     if not files:
         raise FileNotFoundError(
-            f"No v40 appdata JSON was created for target_date={target_date}."
+            f"No v40 appdata JSON was created for target_date={target_date} in {OUTPUT_DIR}."
         )
     return files[0]
 
@@ -43,17 +47,16 @@ def main(season: int, target_date: str):
     # Run the v40 builder first for the requested date.
     run_v40_main(season, target_date)
 
-    # IMPORTANT: pick the v40 file that matches the requested target_date,
-    # not just the most recently modified file overall.
+    # Pick the newest v40 file that matches the requested date.
     matching_v40 = _matching_v40_json(target_date)
 
     with open(matching_v40, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # Safety: force the payload date to match the requested target_date.
+    # Safety: force payload date to match the requested target date.
     data["date"] = target_date
 
-    # For now, v41 is a pass-through wrapper around the matching v40 appdata.
+    # v41 is currently a pass-through wrapper around the date-matched v40 appdata.
     v41_path = _write_v41_json(data, season, target_date)
 
     print(f"✅ v41 JSON created: {v41_path}")
@@ -62,6 +65,7 @@ def main(season: int, target_date: str):
         "status": "success",
         "message": "v41 built successfully",
         "target_date": target_date,
+        "output_dir": str(OUTPUT_DIR),
         "v40_source": str(matching_v40),
         "v41_output": str(v41_path),
     }
