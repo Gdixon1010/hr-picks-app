@@ -6,30 +6,34 @@ from datetime import datetime
 from hr_v40_2_json_export_ready import main as run_v40_main
 
 
-# Force BOTH v40 and v41 to use the same shared Render output directory.
-RENDER_OUTPUT_DIR = "/var/data/hr-picks/output"
-os.environ["HR_APP_DATA_DIR"] = RENDER_OUTPUT_DIR
+def resolve_storage_dir() -> Path:
+    configured = os.getenv("HR_APP_DATA_DIR")
+    if configured:
+        p = Path(configured)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
 
-OUTPUT_DIR = Path(os.getenv("HR_APP_DATA_DIR", RENDER_OUTPUT_DIR))
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    render_default = Path("/var/data/hr-picks/output")
+    if render_default.parent.exists():
+        render_default.mkdir(parents=True, exist_ok=True)
+        return render_default
+
+    local_default = Path("output")
+    local_default.mkdir(parents=True, exist_ok=True)
+    return local_default
 
 
-def _matching_v40_json(target_date: str) -> Path:
-    """
-    Find the newest v40 appdata JSON whose filename matches the requested target_date.
-    Example:
-    HR_Hit_Drought_v40_appdata-2026_2026-04-23_2026-04-23_1047.json
-    """
-    pattern = f"HR_Hit_Drought_v40_appdata-*_{target_date}_{target_date}_*.json"
+OUTPUT_DIR = resolve_storage_dir()
+
+
+def _latest_v40_json() -> Path:
     files = sorted(
-        OUTPUT_DIR.glob(pattern),
+        OUTPUT_DIR.glob("HR_Hit_Drought_v40_appdata-*.json"),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
     if not files:
-        raise FileNotFoundError(
-            f"No v40 appdata JSON was created for target_date={target_date} in {OUTPUT_DIR}."
-        )
+        raise FileNotFoundError(f"No v40 JSON found in {OUTPUT_DIR}")
     return files[0]
 
 
@@ -44,19 +48,20 @@ def _write_v41_json(data: dict, season: int, target_date: str) -> Path:
 
 
 def main(season: int, target_date: str):
-    # Run the v40 builder first for the requested date.
+
+    # 🔑 FORCE OUTPUT PATH BEFORE RUNNING V40
+    os.environ["HR_APP_DATA_DIR"] = str(OUTPUT_DIR)
+
+    # Run v40
     run_v40_main(season, target_date)
 
-    # Pick the newest v40 file that matches the requested date.
-    matching_v40 = _matching_v40_json(target_date)
+    # Get latest file from SAME directory
+    latest_v40 = _latest_v40_json()
 
-    with open(matching_v40, "r", encoding="utf-8") as f:
+    with open(latest_v40, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # Safety: force payload date to match the requested target date.
-    data["date"] = target_date
-
-    # v41 is currently a pass-through wrapper around the date-matched v40 appdata.
+    # Write v41 to SAME location
     v41_path = _write_v41_json(data, season, target_date)
 
     print(f"✅ v41 JSON created: {v41_path}")
@@ -64,9 +69,7 @@ def main(season: int, target_date: str):
     return {
         "status": "success",
         "message": "v41 built successfully",
-        "target_date": target_date,
-        "output_dir": str(OUTPUT_DIR),
-        "v40_source": str(matching_v40),
+        "v40_source": str(latest_v40),
         "v41_output": str(v41_path),
     }
 
