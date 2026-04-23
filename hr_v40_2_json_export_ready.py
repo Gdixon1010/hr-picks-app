@@ -223,7 +223,24 @@ def save_app_json(payload, output_path):
 
 
 DEFAULT_SEASON = 2026
-OUTPUT_DIR = Path(r"C:\Users\gdixo\OneDrive\Desktop\HR Search\output")
+
+def resolve_storage_dir() -> Path:
+    configured = os.getenv("HR_APP_DATA_DIR")
+    if configured:
+        p = Path(configured)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    render_default = Path("/var/data/hr-picks/output")
+    if render_default.parent.exists():
+        render_default.mkdir(parents=True, exist_ok=True)
+        return render_default
+
+    local_default = Path("output")
+    local_default.mkdir(parents=True, exist_ok=True)
+    return local_default
+
+OUTPUT_DIR = resolve_storage_dir()
 SLEEP_BETWEEN_CALLS = 0.02
 
 GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
