@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import json
@@ -5,9 +6,7 @@ import argparse
 import datetime as dt
 import re
 import time
-import os
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -16,24 +15,6 @@ from openpyxl.styles import PatternFill
 
 
 
-def resolve_storage_dir() -> Path:
-    configured = os.getenv("HR_APP_DATA_DIR")
-    if configured:
-        p = Path(configured)
-        p.mkdir(parents=True, exist_ok=True)
-        return p
-
-    render_default = Path("/var/data/hr-picks/output")
-    if render_default.parent.exists():
-        render_default.mkdir(parents=True, exist_ok=True)
-        return render_default
-
-    local_default = Path("output")
-    local_default.mkdir(parents=True, exist_ok=True)
-    return local_default
-
-
-OUTPUT_DIR = resolve_storage_dir()
 def _clean_value(v):
     """Convert pandas/numpy values into JSON-safe Python values."""
     try:
@@ -94,8 +75,6 @@ def build_game_cards_json(player_rows, game_rankings, pitcher_line_value):
     """
     Layer 2: group picks by game.
     Each game gets:
-    - game_time_et
-    - venue
     - ml_lean
     - top 2 HR picks
     - top 2 hit picks
@@ -114,14 +93,6 @@ def build_game_cards_json(player_rows, game_rankings, pitcher_line_value):
 
     for game_name in unique_games:
         game_rank = gr[gr["game"] == game_name].copy()
-
-        venue = None
-        game_time_et = None
-        game_datetime_utc = None
-        if len(game_rank) > 0:
-            venue = _clean_value(game_rank.iloc[0].get("venue"))
-            game_time_et = _clean_value(game_rank.iloc[0].get("game_time_et"))
-            game_datetime_utc = _clean_value(game_rank.iloc[0].get("game_datetime_utc"))
 
         ml_lean = None
         if len(game_rank) > 0:
@@ -183,9 +154,6 @@ def build_game_cards_json(player_rows, game_rankings, pitcher_line_value):
 
         games_output.append({
             "game": game_name,
-            "game_time_et": game_time_et,
-            "game_datetime_utc": game_datetime_utc,
-            "venue": venue,
             "ml_lean": ml_lean,
             "top_hit_picks": game_hit_picks,
             "top_hr_picks": game_hr_picks,
@@ -193,6 +161,7 @@ def build_game_cards_json(player_rows, game_rankings, pitcher_line_value):
         })
 
     return games_output
+
 
 def build_research_json(
     game_rankings,
@@ -253,435 +222,8 @@ def save_app_json(payload, output_path):
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
-def append_jsonl_rows(path: Path, rows: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-
-def upsert_history_csv(path: Path, rows: list[dict]) -> None:
-    if not rows:
-        return
-    new_df = pd.DataFrame(rows)
-    if path.exists():
-        try:
-            old_df = pd.read_csv(path)
-            combined = pd.concat([old_df, new_df], ignore_index=True)
-        except Exception:
-            combined = new_df.copy()
-    else:
-        combined = new_df.copy()
-
-    # Track ONLY official frozen Final Card picks and dedupe them across refreshes.
-    if "history_type" in combined.columns:
-        combined = combined[combined["history_type"].astype(str).eq("final_card")].copy()
-
-    for col in [
-        "target_date", "history_type", "bet_type", "pick", "team", "opponent", "slot",
-        "confidence", "source_tab", "result_status", "result_detail", "generated_at_et", "json_filename"
-    ]:
-        if col not in combined.columns:
-            combined[col] = None
-
-    # Dedupe official picks across refreshes. Do NOT include slot or run_id,
-    # because the same official pick may move positions on the card during the day.
-    dedupe_cols = [c for c in ["target_date", "history_type", "bet_type", "pick", "team", "opponent"] if c in combined.columns]
-    if dedupe_cols:
-        combined = combined.drop_duplicates(subset=dedupe_cols, keep="last")
-
-    combined = combined.sort_values([c for c in ["target_date", "slot", "bet_type", "pick"] if c in combined.columns], ascending=True)
-    combined.to_csv(path, index=False)
-
-
-def build_pick_history_rows(target_date: str, run_ts_et: dt.datetime, json_filename: str, final_card_df: pd.DataFrame, top_picks_df: pd.DataFrame, game_rankings_df: pd.DataFrame, pitcher_line_value_df: pd.DataFrame) -> list[dict]:
-    run_id = f"{target_date}_{run_ts_et.strftime('%Y%m%d_%H%M%S')}"
-    run_ts_label = run_ts_et.strftime("%Y-%m-%d %I:%M:%S %p ET")
-    rows: list[dict] = []
-
-    # Official tracking = Final Card only.
-    if final_card_df is not None and not final_card_df.empty:
-        for _, r in final_card_df.iterrows():
-            pick = _clean_value(r.get("pick"))
-            bet_type = _clean_value(r.get("bet_type"))
-            if not pick or str(bet_type).lower() == "no plays":
-                continue
-            rows.append({
-                "run_id": run_id,
-                "history_type": "final_card",
-                "target_date": target_date,
-                "generated_at_et": run_ts_label,
-                "json_filename": json_filename,
-                "slot": _clean_value(r.get("slot")),
-                "bet_type": bet_type,
-                "pick": pick,
-                "team": _clean_value(r.get("team")),
-                "opponent": _clean_value(r.get("opponent")),
-                "game": None,
-                "confidence": _clean_value(r.get("confidence")),
-                "score": None,
-                "why_it_made_the_card": _clean_value(r.get("why_it_made_the_card")),
-                "source_tab": _clean_value(r.get("source_tab")),
-                "result_status": "pending",
-                "result_detail": None,
-            })
-
-    return rows
-
-
-def save_pick_history(target_date: str, json_filename: str, final_card_df: pd.DataFrame, top_picks_df: pd.DataFrame, game_rankings_df: pd.DataFrame, pitcher_line_value_df: pd.DataFrame) -> dict:
-    history_dir = OUTPUT_DIR / "history"
-    run_ts_et = dt.datetime.now(ZoneInfo("America/New_York"))
-    rows = build_pick_history_rows(target_date, run_ts_et, json_filename, final_card_df, top_picks_df, game_rankings_df, pitcher_line_value_df)
-
-    jsonl_path = history_dir / "pick_history.jsonl"
-    csv_path = history_dir / "pick_history.csv"
-    latest_path = history_dir / "pick_history_latest.json"
-
-    append_jsonl_rows(jsonl_path, rows)
-    upsert_history_csv(csv_path, rows)
-
-    latest_payload = {
-        "target_date": target_date,
-        "generated_at_et": run_ts_et.strftime("%Y-%m-%d %I:%M:%S %p ET"),
-        "json_filename": json_filename,
-        "records_saved": len(rows),
-        "history_jsonl": str(jsonl_path),
-        "history_csv": str(csv_path),
-        "rows": rows,
-    }
-    with open(latest_path, "w", encoding="utf-8") as f:
-        json.dump(latest_payload, f, indent=2, ensure_ascii=False)
-
-    return {
-        "rows_saved": len(rows),
-        "history_jsonl": jsonl_path,
-        "history_csv": csv_path,
-        "latest_json": latest_path,
-    }
-
-
-
-
-def save_latest_app_snapshot(target_date: str, app_payload: dict, json_filename: str) -> Path:
-    history_dir = OUTPUT_DIR / "history"
-    history_dir.mkdir(parents=True, exist_ok=True)
-    latest_path = history_dir / "latest_app_data.json"
-    payload = {
-        "target_date": target_date,
-        "saved_at_et": dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M:%S %p ET"),
-        "json_filename": json_filename,
-        "app_payload": app_payload,
-    }
-    with open(latest_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-    return latest_path
-
-
-def save_frozen_daily_final_card(target_date: str, final_card_df: pd.DataFrame) -> pd.DataFrame:
-    # Store the frozen day-level Final Card separately from results/history cleanup.
-    lock_dir = OUTPUT_DIR / "final_card_lock"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    store_path = lock_dir / "final_card_by_date.json"
-    latest_path = lock_dir / "final_card_by_date_latest.json"
-
-    try:
-        store = json.loads(store_path.read_text(encoding="utf-8")) if store_path.exists() else {}
-    except Exception:
-        store = {}
-
-    incoming_rows = df_to_records(final_card_df) if final_card_df is not None and not final_card_df.empty else []
-    existing_rows = store.get(str(target_date), []) or []
-
-    combined = existing_rows + incoming_rows
-    frozen_rows = []
-    seen = set()
-    for row in combined:
-        key = (
-            str(row.get("bet_type") or ""),
-            str(row.get("pick") or row.get("playerName") or ""),
-            str(row.get("team") or row.get("teamName") or ""),
-            str(row.get("opponent") or row.get("opponentTeam") or ""),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        frozen_rows.append(row)
-
-    store[str(target_date)] = frozen_rows
-
-    with open(store_path, "w", encoding="utf-8") as f:
-        json.dump(store, f, indent=2, ensure_ascii=False)
-
-    latest_payload = {
-        "target_date": str(target_date),
-        "saved_at_et": dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M:%S %p ET"),
-        "rows": frozen_rows,
-    }
-    with open(latest_path, "w", encoding="utf-8") as f:
-        json.dump(latest_payload, f, indent=2, ensure_ascii=False)
-
-    # Backward-compatible mirror in history for older app readers, but the lock dir is source of truth.
-    history_dir = OUTPUT_DIR / "history"
-    history_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        with open(history_dir / "final_card_by_date.json", "w", encoding="utf-8") as f:
-            json.dump(store, f, indent=2, ensure_ascii=False)
-        with open(history_dir / "final_card_by_date_latest.json", "w", encoding="utf-8") as f:
-            json.dump(latest_payload, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
-
-    return pd.DataFrame(frozen_rows)
-
-
-def get_schedule_results_for_date(target_date: str) -> pd.DataFrame:
-    try:
-        data = get_json(
-            "https://statsapi.mlb.com/api/v1/schedule",
-            params={"sportId": 1, "date": target_date, "hydrate": "team,linescore"},
-        )
-    except Exception:
-        return pd.DataFrame(columns=["game","home_team","away_team","home_score","away_score","winner_team","completed","status"])
-
-    rows = []
-    for d in data.get("dates", []):
-        for g in d.get("games", []):
-            teams = g.get("teams", {})
-            home = teams.get("home", {})
-            away = teams.get("away", {})
-            home_team = (home.get("team") or {}).get("name")
-            away_team = (away.get("team") or {}).get("name")
-            home_score = home.get("score")
-            away_score = away.get("score")
-            status = ((g.get("status") or {}).get("detailedState") or "")
-            completed = str(status).lower() in {"final", "game over", "completed early"}
-            winner_team = None
-            if completed and home_score is not None and away_score is not None:
-                if int(home_score) > int(away_score):
-                    winner_team = home_team
-                elif int(away_score) > int(home_score):
-                    winner_team = away_team
-            game_name = f"{away_team} @ {home_team}"
-            rows.append({
-                "game": game_name,
-                "home_team": home_team,
-                "away_team": away_team,
-                "home_score": home_score,
-                "away_score": away_score,
-                "winner_team": winner_team,
-                "completed": completed,
-                "status": status,
-            })
-    return pd.DataFrame(rows)
-
-
-def get_player_game_log_for_date(player_id: int, season: int, target_date: str, group: str = "hitting") -> dict:
-    logs = get_json(
-        f"https://statsapi.mlb.com/api/v1/people/{player_id}/stats",
-        params={"stats": "gameLog", "group": group, "season": season, "gameType": "R"},
-    )
-    stats = logs.get("stats") or []
-    if not stats:
-        return {}
-    for s in stats[0].get("splits", []) or []:
-        if s.get("date") == target_date:
-            return s.get("stat") or {}
-    return {}
-
-
-def get_player_id_by_name_team(player_name: str, team_name: str, season: int) -> int | None:
-    try:
-        teams = get_json("https://statsapi.mlb.com/api/v1/teams", params={"sportId": 1}).get("teams", []) or []
-        team_lookup = {t.get("name"): t.get("id") for t in teams if t.get("name") and t.get("id")}
-        team_id = team_lookup.get(team_name)
-        if not team_id:
-            return None
-        roster = get_team_roster(int(team_id), season)
-        target = normalize_name(player_name)
-        for pid, meta in roster.items():
-            if normalize_name(meta.get("playerName")) == target:
-                return int(pid)
-    except Exception:
-        return None
-    return None
-
-
-def parse_line_from_text(text_val):
-    txt = str(text_val or "")
-    m = re.search(r"(?:up to|at)\s+(\d+(?:\.\d+)?)", txt)
-    if m:
-        try:
-            return float(m.group(1))
-        except Exception:
-            return None
-    return None
-
-
-def grade_pending_history_rows(current_target_date: str, season: int) -> dict:
-    history_dir = OUTPUT_DIR / "history"
-    csv_path = history_dir / "pick_history.csv"
-    jsonl_results = history_dir / "results_history.jsonl"
-    csv_results = history_dir / "results_history.csv"
-    latest_results = history_dir / "results_history_latest.json"
-    perf_latest = history_dir / "performance_summary_latest.json"
-
-    if not csv_path.exists():
-        latest_payload = {"graded_rows": 0, "message": "No pick history found", "rows": []}
-        latest_results.write_text(json.dumps(latest_payload, indent=2), encoding="utf-8")
-        perf_latest.write_text(json.dumps({"overall": {}, "by_bet_type": [], "by_confidence": [], "recent_results": []}, indent=2), encoding="utf-8")
-        return {"graded_rows": 0, "latest_results": latest_results, "performance": perf_latest}
-
-    hist = pd.read_csv(csv_path)
-    # Clean up any duplicate official picks already stored from earlier versions.
-    hist_dedupe_cols = [c for c in ["target_date", "history_type", "bet_type", "pick", "team", "opponent"] if c in hist.columns]
-    if hist_dedupe_cols:
-        hist = hist.drop_duplicates(subset=hist_dedupe_cols, keep="last")
-        hist.to_csv(csv_path, index=False)
-    if hist.empty:
-        latest_payload = {"graded_rows": 0, "message": "Pick history empty", "rows": []}
-        latest_results.write_text(json.dumps(latest_payload, indent=2), encoding="utf-8")
-        perf_latest.write_text(json.dumps({"overall": {}, "by_bet_type": [], "by_confidence": [], "recent_results": []}, indent=2), encoding="utf-8")
-        return {"graded_rows": 0, "latest_results": latest_results, "performance": perf_latest}
-
-    if "result_status" not in hist.columns:
-        hist["result_status"] = "pending"
-    if "result_detail" not in hist.columns:
-        hist["result_detail"] = None
-    if "actual_value" not in hist.columns:
-        hist["actual_value"] = None
-    if "graded_at_et" not in hist.columns:
-        hist["graded_at_et"] = None
-
-    # Force flexible dtypes for grading output columns so string details do not
-    # crash when older CSVs were inferred as float-only by pandas.
-    hist["result_status"] = hist["result_status"].astype("object")
-    hist["result_detail"] = hist["result_detail"].astype("object")
-    hist["actual_value"] = hist["actual_value"].astype("object")
-    hist["graded_at_et"] = hist["graded_at_et"].astype("object")
-
-    to_grade = hist[(hist["target_date"].astype(str) <= str(current_target_date)) & (hist["result_status"].fillna("pending") == "pending")].copy()
-    graded_rows = []
-    if not to_grade.empty:
-        schedule_cache = {}
-        team_map_cache = {}
-        for idx, row in to_grade.iterrows():
-            tdate = str(row.get("target_date"))
-            if tdate not in schedule_cache:
-                schedule_cache[tdate] = get_schedule_results_for_date(tdate)
-            sched = schedule_cache[tdate]
-            bet_type = str(row.get("bet_type") or "")
-            team = row.get("team")
-            opponent = row.get("opponent")
-            pick = row.get("pick")
-            status = "pending"
-            detail = None
-            actual = None
-
-            game_row = sched[(sched["home_team"] == opponent) & (sched["away_team"] == team)]
-            if game_row.empty:
-                game_row = sched[((sched["home_team"] == team) & (sched["away_team"] == opponent)) | ((sched["home_team"] == opponent) & (sched["away_team"] == team))]
-            game_completed = bool(game_row.iloc[0].get("completed")) if not game_row.empty else False
-            game_status = str(game_row.iloc[0].get("status") or "") if not game_row.empty else ""
-
-            try:
-                if bet_type == "Moneyline":
-                    if not game_row.empty and game_completed:
-                        winner = game_row.iloc[0].get("winner_team")
-                        actual = winner
-                        status = "win" if winner == team else "loss"
-                        detail = f"Winner: {winner}"
-                    else:
-                        detail = f"Pending — game not final ({game_status or 'Not Started'})"
-                elif bet_type in ("1+ Hit", "HR"):
-                    if not game_completed:
-                        detail = f"Pending — game not final ({game_status or 'In Progress'})"
-                    else:
-                        pid = get_player_id_by_name_team(str(pick), str(team), season)
-                        if pid:
-                            stat = get_player_game_log_for_date(pid, season, tdate, "hitting")
-                            if stat:
-                                hits = int(stat.get("hits", 0) or 0)
-                                hrs = int(stat.get("homeRuns", 0) or 0)
-                                actual = hits if bet_type == "1+ Hit" else hrs
-                                status = "win" if (hits > 0 if bet_type == "1+ Hit" else hrs > 0) else "loss"
-                                detail = f"Hits: {hits}; HR: {hrs}"
-                            else:
-                                detail = "Pending — no final player log yet"
-                elif bet_type == "K Prop":
-                    if not game_completed:
-                        detail = f"Pending — game not final ({game_status or 'In Progress'})"
-                    else:
-                        pid = get_player_id_by_name_team(str(pick), str(team), season)
-                        if pid:
-                            stat = get_player_game_log_for_date(pid, season, tdate, "pitching")
-                            if stat:
-                                ks = float(stat.get("strikeOuts", 0) or 0)
-                                line = parse_line_from_text(row.get("why_it_made_the_card"))
-                                actual = ks
-                                if line is not None:
-                                    status = "win" if ks > line else "loss"
-                                    detail = f"Ks: {ks}; line: {line}"
-                                else:
-                                    detail = f"Ks: {ks}"
-                            else:
-                                detail = "Pending — no final pitcher log yet"
-            except Exception as e:
-                detail = f"Grade error: {e}"
-
-            if status in ("win", "loss"):
-                hist.at[idx, "result_status"] = status
-                hist.at[idx, "result_detail"] = detail
-                hist.at[idx, "actual_value"] = actual
-                hist.at[idx, "graded_at_et"] = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M:%S %p ET")
-                graded_rows.append({k: _clean_value(v) for k, v in hist.loc[idx].to_dict().items()})
-
-        hist.to_csv(csv_path, index=False)
-        append_jsonl_rows(jsonl_results, graded_rows)
-        if csv_results.exists():
-            old = pd.read_csv(csv_results)
-            combined = pd.concat([old, pd.DataFrame(graded_rows)], ignore_index=True) if graded_rows else old
-        else:
-            combined = pd.DataFrame(graded_rows)
-        if not combined.empty:
-            # Dedupe graded results by official-pick identity, not by run_id.
-            dedupe_cols = [c for c in ["target_date", "history_type", "bet_type", "pick", "team", "opponent"] if c in combined.columns]
-            if dedupe_cols:
-                combined = combined.drop_duplicates(subset=dedupe_cols, keep="last")
-            combined.to_csv(csv_results, index=False)
-    else:
-        combined = pd.read_csv(csv_results) if csv_results.exists() else pd.DataFrame()
-
-    latest_payload = {
-        "graded_rows": len(graded_rows),
-        "graded_for_run_date": current_target_date,
-        "rows": graded_rows[-50:],
-    }
-    latest_results.write_text(json.dumps(latest_payload, indent=2, ensure_ascii=False), encoding="utf-8")
-
-    summary = {"overall": {}, "by_bet_type": [], "by_confidence": [], "recent_results": []}
-    if not combined.empty:
-        graded = combined[combined["result_status"].isin(["win", "loss"])].copy()
-        if not graded.empty:
-            total = len(graded)
-            wins = int((graded["result_status"] == "win").sum())
-            summary["overall"] = {"graded_picks": total, "wins": wins, "losses": total - wins, "win_rate": round(wins / total, 3)}
-            bt = graded.groupby("bet_type")["result_status"].agg([("graded_picks", "count"), ("wins", lambda s: int((s == "win").sum()))]).reset_index()
-            bt["losses"] = bt["graded_picks"] - bt["wins"]
-            bt["win_rate"] = (bt["wins"] / bt["graded_picks"]).round(3)
-            summary["by_bet_type"] = df_to_records(bt)
-            if "confidence" in graded.columns:
-                cf = graded.groupby("confidence")["result_status"].agg([("graded_picks", "count"), ("wins", lambda s: int((s == "win").sum()))]).reset_index()
-                cf["losses"] = cf["graded_picks"] - cf["wins"]
-                cf["win_rate"] = (cf["wins"] / cf["graded_picks"]).round(3)
-                summary["by_confidence"] = df_to_records(cf)
-            recent_cols = [c for c in ["target_date", "bet_type", "pick", "team", "opponent", "confidence", "result_status", "result_detail"] if c in graded.columns]
-            recent = graded.sort_values(["target_date", "graded_at_et"], ascending=[False, False])[recent_cols].head(25)
-            summary["recent_results"] = df_to_records(recent)
-    perf_latest.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-    return {"graded_rows": len(graded_rows), "latest_results": latest_results, "performance": perf_latest}
-
 DEFAULT_SEASON = 2026
+OUTPUT_DIR = Path(r"C:\Users\gdixo\OneDrive\Desktop\HR Search\output")
 SLEEP_BETWEEN_CALLS = 0.02
 
 GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
@@ -752,48 +294,6 @@ def normalize_name(v: str) -> str:
     s = str(v).strip().lower().replace("’", "'").replace("`", "'")
     return re.sub(r"[^a-z0-9]+", "", s)
 
-
-def format_game_time_et(game_date_str: str | None) -> str | None:
-    if not game_date_str:
-        return None
-    try:
-        s = str(game_date_str).replace("Z", "+00:00")
-        dt_utc = dt.datetime.fromisoformat(s)
-        if dt_utc.tzinfo is None:
-            dt_utc = dt_utc.replace(tzinfo=dt.timezone.utc)
-        dt_et = dt_utc.astimezone(ZoneInfo("America/New_York"))
-        try:
-            return dt_et.strftime("%-I:%M %p ET")
-        except Exception:
-            return dt_et.strftime("%I:%M %p ET").lstrip("0")
-    except Exception:
-        return None
-
-
-def game_has_started(game_datetime_utc: str | None, now_et: dt.datetime | None = None, buffer_minutes: int = 5) -> bool:
-    """Return True when first pitch time has arrived (with a small safety buffer)."""
-    if not game_datetime_utc:
-        return False
-    try:
-        s = str(game_datetime_utc).replace("Z", "+00:00")
-        game_dt = dt.datetime.fromisoformat(s)
-        if game_dt.tzinfo is None:
-            game_dt = game_dt.replace(tzinfo=dt.timezone.utc)
-        game_et = game_dt.astimezone(ZoneInfo("America/New_York"))
-        now_et = now_et or dt.datetime.now(ZoneInfo("America/New_York"))
-        return now_et >= (game_et - dt.timedelta(minutes=buffer_minutes))
-    except Exception:
-        return False
-
-def filter_pregame_schedule_rows(schedule_rows: pd.DataFrame, now_et: dt.datetime | None = None, buffer_minutes: int = 5) -> pd.DataFrame:
-    """Only games that have not started yet are eligible for NEW picks."""
-    if schedule_rows is None or schedule_rows.empty:
-        return schedule_rows.copy()
-    now_et = now_et or dt.datetime.now(ZoneInfo("America/New_York"))
-    out = schedule_rows.copy()
-    out["game_started_flag"] = out["game_datetime_utc"].apply(lambda x: game_has_started(x, now_et, buffer_minutes))
-    return out[out["game_started_flag"] == False].copy()
-
 def park_value(s: str) -> float:
     return {"Favorable": 10.0, "Neutral": 5.0, "Unfavorable": 0.0}.get(s or "Neutral", 5.0)
 
@@ -832,16 +332,7 @@ def innings_to_float(ip):
     return whole_i + {0: 0.0, 1: 1 / 3, 2: 2 / 3}.get(frac_i, 0.0)
 
 
-def safe_int(v):
-    try:
-        if v is None or pd.isna(v):
-            return None
-        return int(float(v))
-    except Exception:
-        return None
-
 def safe_div(n, d, fallback=0.0):
-
     try:
         n = float(n)
         d = float(d)
@@ -1177,11 +668,8 @@ def get_schedule_rows(target_date: str) -> pd.DataFrame:
             teams = g.get("teams", {})
             home = teams.get("home", {})
             away = teams.get("away", {})
-            game_datetime_utc = g.get("gameDate")
             rows.append({
                 "game_date": target_date,
-                "game_datetime_utc": game_datetime_utc,
-                "game_time_et": format_game_time_et(game_datetime_utc),
                 "away_team": (away.get("team") or {}).get("name"),
                 "home_team": (home.get("team") or {}).get("name"),
                 "venue": (g.get("venue") or {}).get("name"),
@@ -1340,14 +828,6 @@ def determine_status(current_gap, avg_gap):
         return f"Slightly Overdue (+{current_gap - int(avg_gap)})"
     return f"Overdue (+{current_gap - int(avg_gap)})"
 
-
-def average_games_per_event(games_played, event_count):
-    gp = nz(games_played, None)
-    ec = nz(event_count, None)
-    if gp is None or ec is None or ec <= 0:
-        return None
-    return round(float(gp) / float(ec), 2)
-
 def get_pitcher_season_stats(pid: int, season: int) -> dict:
     if not pid:
         return {}
@@ -1402,8 +882,7 @@ def build_pitcher_metrics(schedule_rows: pd.DataFrame, season: int) -> pd.DataFr
                 continue
             print_step(f"🎯 Pitcher {counter}/{total}: {pitcher_name} ({team})")
             stat = get_pitcher_season_stats(pitcher_id, season)
-            pid = safe_int(pitcher_id)
-            logs = get_pitcher_game_logs(pid, season) if pid is not None else pd.DataFrame()
+            logs = get_pitcher_game_logs(int(float(pitcher_id)), season) if pitcher_id else pd.DataFrame()
             recent = summarize_recent_pitcher_form(logs)
             ip = stat.get("inningsPitched")
             so = stat.get("strikeOuts")
@@ -1497,13 +976,8 @@ def build_hit_hr_rows(pool_df: pd.DataFrame, season: int, sched_ctx: dict) -> pd
         logs = get_player_game_logs(int(row["playerId"]), season)
         hr_d = compute_drought_metrics(logs, "homeRuns")
         hit_d = compute_drought_metrics(logs, "hits")
-
-        avg_hr = average_games_per_event(row.get("gamesPlayed"), row.get("homeRuns"))
-        avg_hit = average_games_per_event(row.get("gamesPlayed"), row.get("hits"))
-
-        hr_status = determine_status(hr_d["current_gap"], avg_hr)
-        hit_status = determine_status(hit_d["current_gap"], avg_hit)
-
+        hr_status = determine_status(hr_d["current_gap"], hr_d["avg_games_between"])
+        hit_status = determine_status(hit_d["current_gap"], hit_d["avg_games_between"])
         last10 = logs.tail(10)
         hit_pct_last_10 = round((len(last10[last10["hits"] > 0]) / 10) * 100, 1) if len(last10) == 10 else None
         ctx = sched_ctx.get(row["teamName"], {})
@@ -1523,9 +997,9 @@ def build_hit_hr_rows(pool_df: pd.DataFrame, season: int, sched_ctx: dict) -> pd
         rows.append({
             "season": season, "teamName": row["teamName"], "playerName": row["playerName"], "playerId": row["playerId"],
             "homeRuns": row["homeRuns"], "gamesPlayed": row["gamesPlayed"], "totalHits": row["hits"],
-            "avg_games_between_hrs": avg_hr, "current_games_without_hr": hr_d["current_gap"],
+            "avg_games_between_hrs": hr_d["avg_games_between"], "current_games_without_hr": hr_d["current_gap"],
             "longest_games_without_hr": hr_d["longest_drought"], "last_hr_date": hr_d["last_event_date"],
-            "hr_status": hr_status, "avg_games_between_hits": avg_hit,
+            "hr_status": hr_status, "avg_games_between_hits": hit_d["avg_games_between"],
             "current_games_without_hit": hit_d["current_gap"], "longestHitDrought": hit_d["longest_drought"],
             "hit_status": hit_status, "hit_pct_last_10": hit_pct_last_10, "season_hit_pct": season_hit_pct,
             "auto_pitcher_name": ctx.get("opp_pitcher_name"), "auto_pitcher_hand": ctx.get("opp_pitcher_hand"),
@@ -1564,7 +1038,6 @@ def build_game_rankings(schedule_rows, hr_rows, hit_rows, pitcher_metrics):
             rows.append({
                 "game": f"{g.get('away_team')} @ {g.get('home_team')}",
                 "teamName": team, "opponentTeam": opp, "venue": g.get("venue"),
-                "game_time_et": g.get("game_time_et"), "game_datetime_utc": g.get("game_datetime_utc"),
                 "offense_hr_score": offense_hr, "offense_hit_score": offense_hit, "offense_score": offense_score,
                 "team_volatility": get_team_volatility(team), "public_bias": get_public_bias(team),
                 "volatility_penalty_ml": vol_penalty_ml, "public_penalty_ml": public_penalty_ml,
@@ -1778,20 +1251,22 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
         team_counts[team] = team_counts.get(team, 0) + 1
         used_players.add((team, pick))
 
-    # High-edge ML only
+    # Strict ML alignment with Game Rankings:
+    # Final Card ML is allowed ONLY when the visible Game Rankings label is an explicit ML green light.
     if game_rankings is not None and not game_rankings.empty:
+        allowed_ml_labels = {"Moneyline Lean", "Stack Spot"}
         ml_pool = game_rankings[
             (game_rankings["edge_vs_opponent"].fillna(0) >= 10) &
-            (~game_rankings["recommended_play"].astype(str).str.contains("Avoid", na=False)) &
+            (game_rankings["recommended_play"].astype(str).isin(allowed_ml_labels)) &
             (game_rankings["pitcher_pick_type"].isin(["Strong SP", "K Upside", "Neutral"])) &
             (game_rankings["opponent_pitcher_pick_type"].isin(["Short Leash Risk", "Attack With Hitters", "Low Sample", "Neutral"]))
-        ].copy().sort_values(["edge_vs_opponent","team_score"], ascending=[False, False])
+        ].copy().sort_values(["edge_vs_opponent", "team_score"], ascending=[False, False])
         if not ml_pool.empty:
             best = ml_pool.iloc[0]
             rows.append({
                 "slot": "Core 1", "bet_type": "Moneyline", "pick": f"{best['teamName']} ML", "team": best["teamName"],
                 "opponent": best["opponentTeam"], "confidence": "A",
-                "why_it_made_the_card": f"Edge {best['edge_vs_opponent']}; {best['pitcher_pick_type']} vs {best['opponent_pitcher_pick_type']}",
+                "why_it_made_the_card": f"Edge {best['edge_vs_opponent']}; {best['pitcher_pick_type']} vs {best['opponent_pitcher_pick_type']}; label {best['recommended_play']}",
                 "source_tab": "Game_Rankings"
             })
             team_counts[best["teamName"]] = 1
@@ -1902,9 +1377,6 @@ def main(season: int, target_date: str):
     OUTPUT_DIR.mkdir(exist_ok=True)
     print_step("🚀 V40.1 final-card rebuild started...")
     sched_ctx, schedule_rows = get_schedule_game_context(target_date)
-    now_et = dt.datetime.now(ZoneInfo("America/New_York"))
-    eligible_schedule_rows = filter_pregame_schedule_rows(schedule_rows, now_et=now_et, buffer_minutes=5)
-    print_step(f"⏱️ Pregame-eligible games: {len(eligible_schedule_rows)} of {len(schedule_rows)}")
 
     all_players = build_scheduled_player_pool(schedule_rows, season)
     lineup_map, slot_map = get_confirmed_lineups(target_date)
@@ -1931,14 +1403,7 @@ def main(season: int, target_date: str):
     pitcher_metrics = enrich_pitcher_metrics_with_team_context(pitcher_metrics, team_context_df)
     pitcher_line_value = build_pitcher_line_value(pitcher_metrics)
     game_rankings = build_game_rankings(schedule_rows, player_rows, player_rows, pitcher_metrics)
-
-    eligible_games = set((eligible_schedule_rows.get("away_team", pd.Series(dtype=object)).fillna("") + " @ " + eligible_schedule_rows.get("home_team", pd.Series(dtype=object)).fillna("")).tolist())
-    eligible_teams = set(eligible_schedule_rows.get("away_team", pd.Series(dtype=object)).dropna().tolist() + eligible_schedule_rows.get("home_team", pd.Series(dtype=object)).dropna().tolist())
-
-    pregame_player_rows = player_rows[player_rows["teamName"].isin(eligible_teams)].copy() if not player_rows.empty else player_rows
-    pregame_pitcher_line_value = pitcher_line_value[pitcher_line_value["teamName"].isin(eligible_teams)].copy() if not pitcher_line_value.empty else pitcher_line_value
-    pregame_game_rankings = game_rankings[game_rankings["game"].isin(eligible_games)].copy() if not game_rankings.empty else game_rankings
-    refined_picks = build_refined_picks(pregame_player_rows, pitcher_metrics, pregame_game_rankings)
+    refined_picks = build_refined_picks(player_rows, pitcher_metrics, game_rankings)
 
     opp_map = pitcher_metrics[["opponentTeam","pitcherName","pick_type"]].drop_duplicates().rename(columns={
         "opponentTeam":"teamName","pitcherName":"opponent_pitcher","pick_type":"opponent_pitcher_pick_type"
@@ -1948,39 +1413,19 @@ def main(season: int, target_date: str):
     if not player_rows.empty:
         if "opponent_pitcher_pick_type" not in player_rows.columns:
             player_rows = player_rows.merge(opp_map[["teamName", "opponent_pitcher_pick_type"]].drop_duplicates(), on="teamName", how="left")
-    # Ensure Final_Card logic always has opponent pitcher type available on the pregame player rows.
-    if not pregame_player_rows.empty:
-        if "opponent_pitcher_pick_type" not in pregame_player_rows.columns:
-            pregame_player_rows = pregame_player_rows.merge(
-                opp_map[["teamName", "opponent_pitcher_pick_type"]].drop_duplicates(),
-                on="teamName",
-                how="left",
-            )
         else:
             missing_mask = player_rows["opponent_pitcher_pick_type"].isna()
-            missing_mask = pregame_player_rows["opponent_pitcher_pick_type"].isna()
             if missing_mask.any():
                 fill_map = opp_map[["teamName", "opponent_pitcher_pick_type"]].drop_duplicates()
                 player_rows = player_rows.merge(fill_map, on="teamName", how="left", suffixes=("", "_fill"))
                 player_rows["opponent_pitcher_pick_type"] = player_rows["opponent_pitcher_pick_type"].fillna(player_rows["opponent_pitcher_pick_type_fill"])
                 player_rows = player_rows.drop(columns=["opponent_pitcher_pick_type_fill"])
-                pregame_player_rows = pregame_player_rows.merge(
-                    fill_map,
-                    on="teamName",
-                    how="left",
-                    suffixes=("", "_fill"),
-                )
-                pregame_player_rows["opponent_pitcher_pick_type"] = pregame_player_rows[
-                    "opponent_pitcher_pick_type"
-                ].fillna(pregame_player_rows["opponent_pitcher_pick_type_fill"])
-                pregame_player_rows = pregame_player_rows.drop(columns=["opponent_pitcher_pick_type_fill"])
 
     hr_drought = player_rows[["season","teamName","playerName","avg_games_between_hrs","current_games_without_hr","longest_games_without_hr","hr_status","homeRuns","last_hr_date","gamesPlayed","park_favorability","lineup_status","batting_order_slot","starter_only_flag"]].rename(columns={"hr_status":"status"}).merge(opp_map, on="teamName", how="left")
     hit_drought = player_rows[["season","teamName","playerName","avg_games_between_hits","current_games_without_hit","longestHitDrought","hit_status","totalHits","gamesPlayed","park_favorability","lineup_status","batting_order_slot","starter_only_flag"]].rename(columns={"hit_status":"status"}).merge(opp_map, on="teamName", how="left")
 
-    daily_card = build_daily_card(pregame_game_rankings, refined_picks, pregame_pitcher_line_value, hr_drought[hr_drought['teamName'].isin(eligible_teams)].copy() if not hr_drought.empty else hr_drought)
-    final_card = build_final_card(pregame_player_rows, pregame_game_rankings, pregame_pitcher_line_value)
-    frozen_final_card = save_frozen_daily_final_card(target_date, final_card)
+    daily_card = build_daily_card(game_rankings, refined_picks, pitcher_line_value, hr_drought)
+    final_card = build_final_card(player_rows, game_rankings, pitcher_line_value)
 
     ts = dt.datetime.now().strftime("%Y-%m-%d_%H%M")
     outfile = OUTPUT_DIR / f"HR_Hit_Drought_v40_stats-{season}_{ts}.xlsx"
@@ -2003,14 +1448,14 @@ def main(season: int, target_date: str):
         game_rankings.to_excel(writer, sheet_name="Game_Rankings", index=False)
         refined_picks.to_excel(writer, sheet_name="Refined_Picks", index=False)
         daily_card.to_excel(writer, sheet_name="Daily_Card", index=False)
-        frozen_final_card.to_excel(writer, sheet_name="Final_Card", index=False)
+        final_card.to_excel(writer, sheet_name="Final_Card", index=False)
 
         top_hr = pd.DataFrame()
         top_hit = pd.DataFrame()
-        if not pregame_player_rows.empty:
-            top_hr = pregame_player_rows.nlargest(6, "HR_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","HR_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
+        if not player_rows.empty:
+            top_hr = player_rows.nlargest(6, "HR_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","HR_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
             top_hr.insert(0, "type", "HR")
-            top_hit = pregame_player_rows.nlargest(6, "Hit_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","Hit_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
+            top_hit = player_rows.nlargest(6, "Hit_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","Hit_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
             top_hit.insert(0, "type", "HIT")
         top_picks = pd.concat([top_hr, top_hit], ignore_index=True)
         top_picks.to_excel(writer, sheet_name="Top_Picks", index=False)
@@ -2029,7 +1474,7 @@ def main(season: int, target_date: str):
 
     app_payload = build_app_payload(
         target_date=target_date,
-        final_card_df=frozen_final_card,
+        final_card_df=final_card,
         player_rows=player_rows,
         game_rankings=game_rankings,
         pitcher_metrics=pitcher_metrics,
@@ -2041,24 +1486,7 @@ def main(season: int, target_date: str):
     )
 
     save_app_json(app_payload, json_output_path)
-    latest_snapshot = save_latest_app_snapshot(target_date, app_payload, json_filename)
     print_step(f"🧾 JSON created: {json_output_path}")
-    print_step(f"🧾 Latest app snapshot: {latest_snapshot}")
-
-    history_info = save_pick_history(
-        target_date=target_date,
-        json_filename=json_filename,
-        final_card_df=frozen_final_card,
-        top_picks_df=top_picks,
-        game_rankings_df=game_rankings,
-        pitcher_line_value_df=pitcher_line_value,
-    )
-    print_step(f"🗂️ Pick history saved: {history_info['rows_saved']} rows")
-    print_step(f"🗂️ History CSV: {history_info['history_csv']}")
-
-    results_info = grade_pending_history_rows(target_date, season)
-    print_step(f"📈 Results graded this run: {results_info['graded_rows']}")
-    print_step(f"📈 Performance summary: {results_info['performance']}")
 
     print_step("✅ DONE!")
     print_step(f"Created: {outfile}")
