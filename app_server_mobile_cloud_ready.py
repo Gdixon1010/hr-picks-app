@@ -98,6 +98,7 @@ def load_latest_data():
 
     data["results"] = read_json_file(history_dir / "performance_summary_latest.json", {"overall": {}, "by_bet_type": [], "by_confidence": [], "recent_results": []})
     data["results_latest"] = read_json_file(history_dir / "results_history_latest.json", {"graded_rows": 0, "rows": []})
+    data["pick_history_latest"] = read_json_file(history_dir / "pick_history_latest.json", {"rows": [], "generated_at_et": None, "records_saved": 0})
     data["info"] = {
         "purpose": "This app finds MLB betting edges by combining player trends, drought logic, matchup strength, pitcher quality, lineup context, and park factors.",
         "how_to_use": [
@@ -865,13 +866,41 @@ function renderInfo() {
   `;
 }
 
+function normalizeResultLabel(v) {
+  const raw = String(v || '').trim().toLowerCase();
+  if (!raw) return '—';
+  if (raw === 'win') return 'Win';
+  if (raw === 'loss') return 'Loss';
+  if (raw === 'pending') return 'Pending';
+  return titleize(raw);
+}
+
+function statusBadgeClass(v) {
+  const raw = String(v || '').trim().toLowerCase();
+  if (raw === 'win') return 'badge good';
+  if (raw === 'loss') return 'badge bad';
+  return 'badge';
+}
+
 function renderResults() {
   const mount = document.getElementById("view-results");
   const results = APP_DATA?.results || {};
+  const resultsLatest = APP_DATA?.results_latest || {};
+  const latestHistory = APP_DATA?.pick_history_latest || {};
   const overall = results.overall || {};
   const byType = Array.isArray(results.by_bet_type) ? results.by_bet_type : [];
   const byConf = Array.isArray(results.by_confidence) ? results.by_confidence : [];
   const recent = Array.isArray(results.recent_results) ? results.recent_results : [];
+  const latestRows = Array.isArray(latestHistory.rows) ? latestHistory.rows : [];
+  const recentKeys = new Set(recent.map(r => [r.target_date, r.bet_type, r.pick, r.team, r.opponent].join("|")));
+  const pendingRows = latestRows.filter(r => !recentKeys.has([r.target_date, r.bet_type, r.pick, r.team, r.opponent].join("|")));
+  const gradedThisRun = Number(resultsLatest.graded_rows || 0);
+  const latestSavedAt = latestHistory.generated_at_et || APP_DATA?._meta?.last_updated_display || '—';
+  const hasGraded = Number(overall.graded_picks || 0) > 0;
+  const resultsMessage = hasGraded
+    ? 'This tab tracks official frozen Final Card picks after they are graded.'
+    : 'No official picks have been graded yet. Live or unfinished games should stay pending until the final result is available.';
+
   mount.innerHTML = `
     <div class="cards">
       <div class="card"><h2>Overall Performance</h2>
@@ -880,8 +909,10 @@ function renderResults() {
         <div class="line"><span class="label">Losses:</span> ${esc(fmt(overall.losses))}</div>
         <div class="line"><span class="label">Win Rate:</span> ${overall.win_rate !== undefined && overall.win_rate !== null ? esc((overall.win_rate * 100).toFixed(1) + '%') : '—'}</div>
       </div>
-      <div class="card"><h2>What This Is For</h2>
-        <div class="line">This tab tracks how saved picks perform over time so you can see what the model does well and where it needs tightening.</div>
+      <div class="card"><h2>Results Status</h2>
+        <div class="line"><span class="label">Graded This Refresh:</span> ${esc(fmt(gradedThisRun))}</div>
+        <div class="line"><span class="label">Latest Saved Card:</span> ${esc(fmt(latestSavedAt))}</div>
+        <div class="line wrap">${esc(resultsMessage)}</div>
       </div>
     </div>
     <div class="cards" style="margin-top:18px;">
@@ -899,9 +930,15 @@ function renderResults() {
       </div>
     </div>
     <div class="table-shell" style="margin-top:18px;">
+      <h2 style="margin-top:0;">Pending Official Picks</h2>
+      <div class="table-wrap"><table><thead><tr><th>Date</th><th>Bet Type</th><th>Pick</th><th>Team</th><th>Opponent</th><th>Confidence</th><th>Status</th><th class="wrap">Why It Made The Card</th></tr></thead><tbody>
+      ${pendingRows.map(r => `<tr><td>${esc(fmt(r.target_date))}</td><td>${esc(fmt(r.bet_type))}</td><td>${esc(fmt(r.pick))}</td><td>${esc(fmt(r.team))}</td><td>${esc(fmt(r.opponent))}</td><td>${esc(fmt(r.confidence))}</td><td><span class="${statusBadgeClass('pending')}">${normalizeResultLabel('pending')}</span></td><td class="wrap">${esc(fmt(r.why_it_made_the_card))}</td></tr>`).join("") || '<tr><td colspan="8">No pending official picks from the latest saved card.</td></tr>'}
+      </tbody></table></div>
+    </div>
+    <div class="table-shell" style="margin-top:18px;">
       <h2 style="margin-top:0;">Recent Graded Picks</h2>
       <div class="table-wrap"><table><thead><tr><th>Date</th><th>Bet Type</th><th>Pick</th><th>Team</th><th>Opponent</th><th>Confidence</th><th>Result</th><th class="wrap">Detail</th></tr></thead><tbody>
-      ${recent.map(r => `<tr><td>${esc(fmt(r.target_date))}</td><td>${esc(fmt(r.bet_type))}</td><td>${esc(fmt(r.pick))}</td><td>${esc(fmt(r.team))}</td><td>${esc(fmt(r.opponent))}</td><td>${esc(fmt(r.confidence))}</td><td>${esc(fmt(r.result_status))}</td><td class="wrap">${esc(fmt(r.result_detail))}</td></tr>`).join("") || '<tr><td colspan="8">No graded picks yet.</td></tr>'}
+      ${recent.map(r => `<tr><td>${esc(fmt(r.target_date))}</td><td>${esc(fmt(r.bet_type))}</td><td>${esc(fmt(r.pick))}</td><td>${esc(fmt(r.team))}</td><td>${esc(fmt(r.opponent))}</td><td>${esc(fmt(r.confidence))}</td><td><span class="${statusBadgeClass(r.result_status)}">${esc(normalizeResultLabel(r.result_status))}</span></td><td class="wrap">${esc(fmt(r.result_detail))}</td></tr>`).join("") || '<tr><td colspan="8">No graded picks yet.</td></tr>'}
       </tbody></table></div>
     </div>
   `;
