@@ -364,12 +364,26 @@ function parseEtTimeToMinutes(t) {
 function parseSortableDate(value) {
   const raw = String(value ?? "").trim();
   if (!raw || raw === "—") return null;
+
+  // Only treat true date-looking strings as dates.
+  // This avoids decimal values like "2.5" or "1.04" being misread by Date.parse()
+  // and breaking numeric sorts in drought tables.
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
     const ts = Date.parse(raw + "T00:00:00Z");
     return Number.isNaN(ts) ? null : ts;
   }
-  const parsed = Date.parse(raw);
-  return Number.isNaN(parsed) ? null : parsed;
+
+  if (/^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(raw)) {
+    const parsed = Date.parse(raw);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+
+  if (/^[A-Za-z]{3,9}\s+\d{1,2},\s*\d{4}$/.test(raw)) {
+    const parsed = Date.parse(raw);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+
+  return null;
 }
 
 function compareMixedValues(a, b, dir = "asc") {
@@ -713,8 +727,6 @@ function openResearchTable(key) {
         CURRENT_SORT_DIR = CURRENT_SORT_DIR === "asc" ? "desc" : "asc";
       } else {
         CURRENT_SORT_COLUMN = col;
-        const lowerCol = String(col || "").toLowerCase();
-        CURRENT_SORT_DIR = lowerCol.includes("date") ? "desc" : "asc";
         CURRENT_SORT_DIR = col.toLowerCase().includes("date") ? "desc" : "asc";
       }
       filterResearchTable();
