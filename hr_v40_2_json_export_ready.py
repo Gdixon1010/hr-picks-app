@@ -223,7 +223,7 @@ def save_app_json(payload, output_path):
 
 
 DEFAULT_SEASON = 2026
-OUTPUT_DIR = Path(r"C:\Users\gdixo\OneDrive\Desktop\HR Search\output")
+OUTPUT_DIR = Path("output")
 SLEEP_BETWEEN_CALLS = 0.02
 
 GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
@@ -1252,14 +1252,15 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
         used_players.add((team, pick))
 
     # High-edge ML only
+    # STRICT ALIGNMENT: only allow ML plays that are explicitly green-lit in Game Rankings.
+    # This prevents "Pass / Small Edge" rows from ever appearing on the Final Card.
     if game_rankings is not None and not game_rankings.empty:
         ml_pool = game_rankings[
             (game_rankings["edge_vs_opponent"].fillna(0) >= 10) &
-            (~game_rankings["recommended_play"].astype(str).str.contains("Avoid", na=False)) &
-            (~game_rankings["recommended_play"].astype(str).str.contains("Pass", na=False)) &
+            (game_rankings["recommended_play"].isin(["Moneyline Lean", "Stack Spot"])) &
             (game_rankings["pitcher_pick_type"].isin(["Strong SP", "K Upside", "Neutral"])) &
             (game_rankings["opponent_pitcher_pick_type"].isin(["Short Leash Risk", "Attack With Hitters", "Low Sample", "Neutral"]))
-        ].copy().sort_values(["edge_vs_opponent","team_score"], ascending=[False, False])
+        ].copy().sort_values(["edge_vs_opponent", "team_score"], ascending=[False, False])
         if not ml_pool.empty:
             best = ml_pool.iloc[0]
             rows.append({
