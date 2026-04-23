@@ -419,6 +419,57 @@ function compareMixedValues(a, b, dir = "asc") {
     : bv.localeCompare(av, undefined, { numeric: true, sensitivity: "base" });
 }
 
+
+function isStrictNumericColumn(col) {
+  const numericCols = new Set([
+    "avg_games_between_hrs",
+    "avg_games_between_hits",
+    "current_games_without_hr",
+    "current_games_without_hit",
+    "longest_games_without_hr",
+    "longestHitDrought",
+    "homeRuns",
+    "totalHits",
+    "gamesPlayed",
+    "batting_order_slot",
+    "HR_score",
+    "Hit_score",
+    "edge_vs_opponent",
+    "projected_k_floor",
+    "projected_k_mid",
+    "projected_k_ceiling",
+    "max_playable_k_line"
+  ]);
+  return numericCols.has(String(col || ""));
+}
+
+function compareColumnValues(a, b, col, dir = "asc") {
+  if (isStrictNumericColumn(col)) {
+    const avRaw = a === null || a === undefined ? "" : String(a).trim();
+    const bvRaw = b === null || b === undefined ? "" : String(b).trim();
+
+    const aBlank = avRaw === "" || avRaw === "—";
+    const bBlank = bvRaw === "" || bvRaw === "—";
+    if (aBlank && bBlank) return 0;
+    if (aBlank) return 1;
+    if (bBlank) return -1;
+
+    const an = Number(avRaw);
+    const bn = Number(bvRaw);
+    const aNum = !Number.isNaN(an);
+    const bNum = !Number.isNaN(bn);
+
+    if (aNum && bNum) {
+      return dir === "asc" ? an - bn : bn - an;
+    }
+    if (aNum && !bNum) return -1;
+    if (!aNum && bNum) return 1;
+  }
+
+  return compareMixedValues(a, b, dir);
+}
+
+
 function buildGameTimeLookup() {
   const map = {};
   const games = APP_DATA?.games || [];
@@ -836,10 +887,10 @@ function filterResearchTable() {
   });
 
   if (CURRENT_SORT_COLUMN) {
-    rows.sort((a, b) => compareMixedValues(a?.[CURRENT_SORT_COLUMN], b?.[CURRENT_SORT_COLUMN], CURRENT_SORT_DIR));
+    rows.sort((a, b) => compareColumnValues(a?.[CURRENT_SORT_COLUMN], b?.[CURRENT_SORT_COLUMN], CURRENT_SORT_COLUMN, CURRENT_SORT_DIR));
   } else if (sortValue) {
     const sortKey = headers.includes("playerName") ? "playerName" : headers[0];
-    rows.sort((a, b) => compareMixedValues(a?.[sortKey], b?.[sortKey], sortValue));
+    rows.sort((a, b) => compareColumnValues(a?.[sortKey], b?.[sortKey], sortKey, sortValue));
   }
 
   tbody.innerHTML = rows.map(r => `<tr>${headers.map(c => `<td class="${String(c).length > 18 ? 'wrap' : ''}">${esc(fmt(r[c]))}</td>`).join("")}</tr>`).join("");
