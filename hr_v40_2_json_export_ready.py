@@ -8,6 +8,7 @@ import re
 import time
 import os
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -711,6 +712,43 @@ def get_schedule_rows(target_date: str) -> pd.DataFrame:
                 "gamePk": g.get("gamePk"),
             })
     return pd.DataFrame(rows)
+
+
+def filter_pregame_schedule_rows(schedule_rows: pd.DataFrame, now_et=None, buffer_minutes: int = 0) -> pd.DataFrame:
+    """Keep only games that have not started yet for actionable Final Card picks."""
+    if schedule_rows is None or schedule_rows.empty:
+        return schedule_rows.copy() if schedule_rows is not None else pd.DataFrame()
+
+    rows = schedule_rows.copy()
+    if now_et is None:
+        now_et = dt.datetime.now(ZoneInfo("America/New_York"))
+    if now_et.tzinfo is None:
+        now_et = now_et.replace(tzinfo=ZoneInfo("America/New_York"))
+
+    try:
+        slate_date = pd.to_datetime(rows["game_date"].dropna().iloc[0]).date()
+        today_et = now_et.date()
+        if slate_date > today_et:
+            rows["game_lock_status"] = "Pregame - future date"
+            return rows
+        if slate_date < today_et:
+            rows["game_lock_status"] = "Locked - past date"
+            return rows.iloc[0:0].copy()
+    except Exception:
+        pass
+
+    if "game_datetime_utc" not in rows.columns:
+        rows["game_lock_status"] = "Locked - missing start time"
+        return rows.iloc[0:0].copy()
+
+    game_dt_utc = pd.to_datetime(rows["game_datetime_utc"], errors="coerce", utc=True)
+    game_dt_et = game_dt_utc.dt.tz_convert("America/New_York")
+    cutoff = now_et + dt.timedelta(minutes=buffer_minutes)
+    mask = game_dt_et > cutoff
+
+    rows["game_start_et_dt"] = game_dt_et
+    rows["game_lock_status"] = mask.map(lambda x: "Pregame" if x else "Locked - already started")
+    return rows[mask].copy()
 
 def get_pitcher_hand(pid):
     if not pid:
@@ -1421,6 +1459,10 @@ def main(season: int, target_date: str):
     print_step("🚀 V40.1 final-card rebuild started...")
     sched_ctx, schedule_rows = get_schedule_game_context(target_date)
 
+    now_et = dt.datetime.now(ZoneInfo("America/New_York"))
+    eligible_schedule_rows = filter_pregame_schedule_rows(schedule_rows, now_et=now_et, buffer_minutes=0)
+    print_step(f"⏱️ Pregame-eligible games for Final Card: {len(eligible_schedule_rows)} of {len(schedule_rows)}")
+
     all_players = build_scheduled_player_pool(schedule_rows, season)
     lineup_map, slot_map = get_confirmed_lineups(target_date)
     locked_players = build_locked_player_pool(all_players, lineup_map, slot_map)
@@ -1446,7 +1488,24 @@ def main(season: int, target_date: str):
     pitcher_metrics = enrich_pitcher_metrics_with_team_context(pitcher_metrics, team_context_df)
     pitcher_line_value = build_pitcher_line_value(pitcher_metrics)
     game_rankings = build_game_rankings(schedule_rows, player_rows, player_rows, pitcher_metrics)
-    refined_picks = build_refined_picks(player_rows, pitcher_metrics, game_rankings)
+
+    # Final Card protection: only generate actionable picks from games that have NOT started.
+    # Games/Research still show the full slate for context.
+    eligible_games = set(
+        (eligible_schedule_rows.get("away_team", pd.Series(dtype=object)).fillna("")
+         + " @ "
+         + eligible_schedule_rows.get("home_team", pd.Series(dtype=object)).fillna("")).tolist()
+    )
+    eligible_teams = set(
+        eligible_schedule_rows.get("away_team", pd.Series(dtype=object)).dropna().tolist()
+        + eligible_schedule_rows.get("home_team", pd.Series(dtype=object)).dropna().tolist()
+    )
+
+    pregame_player_rows = player_rows[player_rows["teamName"].isin(eligible_teams)].copy() if not player_rows.empty else player_rows
+    pregame_pitcher_line_value = pitcher_line_value[pitcher_line_value["teamName"].isin(eligible_teams)].copy() if not pitcher_line_value.empty else pitcher_line_value
+    pregame_game_rankings = game_rankings[game_rankings["game"].isin(eligible_games)].copy() if not game_rankings.empty else game_rankings
+
+    refined_picks = build_refined_picks(pregame_player_rows, pitcher_metrics, pregame_game_rankings)
 
     opp_map = pitcher_metrics[["opponentTeam","pitcherName","pick_type"]].drop_duplicates().rename(columns={
         "opponentTeam":"teamName","pitcherName":"opponent_pitcher","pick_type":"opponent_pitcher_pick_type"
@@ -1467,8 +1526,8 @@ def main(season: int, target_date: str):
     hr_drought = player_rows[["season","teamName","playerName","avg_games_between_hrs","current_games_without_hr","longest_games_without_hr","hr_status","homeRuns","last_hr_date","gamesPlayed","park_favorability","lineup_status","batting_order_slot","starter_only_flag"]].rename(columns={"hr_status":"status"}).merge(opp_map, on="teamName", how="left")
     hit_drought = player_rows[["season","teamName","playerName","avg_games_between_hits","current_games_without_hit","longestHitDrought","hit_status","totalHits","gamesPlayed","park_favorability","lineup_status","batting_order_slot","starter_only_flag"]].rename(columns={"hit_status":"status"}).merge(opp_map, on="teamName", how="left")
 
-    daily_card = build_daily_card(game_rankings, refined_picks, pitcher_line_value, hr_drought)
-    final_card = build_final_card(player_rows, game_rankings, pitcher_line_value)
+    daily_card = build_daily_card(pregame_game_rankings, refined_picks, pregame_pitcher_line_value, hr_drought)
+    final_card = build_final_card(pregame_player_rows, pregame_game_rankings, pregame_pitcher_line_value)
 
     ts = dt.datetime.now().strftime("%Y-%m-%d_%H%M")
     outfile = OUTPUT_DIR / f"HR_Hit_Drought_v40_stats-{season}_{ts}.xlsx"
@@ -1478,8 +1537,10 @@ def main(season: int, target_date: str):
         pd.DataFrame([
             ("requested_season", season),
             ("target_game_date", target_date),
-            ("message", "v39.3 full-slate rebuild with lineup tagging plus Top 200 HR and Top 50 HIT output"),
+            ("message", "v40 Render rebuild with strict pregame Final Card lock"),
             ("locked_players_count", len(locked_players)),
+            ("pregame_eligible_games_for_final_card", len(eligible_schedule_rows)),
+            ("run_time_et", now_et.strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ")),
         ], columns=["field","value"]).to_excel(writer, sheet_name="Run_Info", index=False)
 
         schedule_rows.to_excel(writer, sheet_name="Schedule_Context", index=False)
