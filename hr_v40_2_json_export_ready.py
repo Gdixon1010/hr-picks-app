@@ -1359,6 +1359,14 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
 
     base = player_rows.copy()
     base = base[base["auto_pitcher_name"].notna()].copy()
+
+    # Safety guard: after pregame filtering, some runs may not carry this column forward.
+    # Do not crash the refresh; default missing opponent pitcher type to Neutral.
+    if "opponent_pitcher_pick_type" not in base.columns:
+        base["opponent_pitcher_pick_type"] = "Neutral"
+    else:
+        base["opponent_pitcher_pick_type"] = base["opponent_pitcher_pick_type"].fillna("Neutral")
+
     base["lineup_ok"] = base["starter_only_flag"].fillna(False)
     base["slot_num"] = pd.to_numeric(base.get("batting_order_slot"), errors="coerce").fillna(9)
     base["power_filter"] = (base["homeRuns"].fillna(0) >= 3) | (base["avg_games_between_hrs"].fillna(99) <= 2.5)
