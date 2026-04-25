@@ -1332,22 +1332,42 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
         team_counts[team] = team_counts.get(team, 0) + 1
         used_players.add((team, pick))
 
-    # Strict ML alignment with Game Rankings:
-    # Final Card ML is allowed ONLY when the visible Game Rankings label is an explicit ML green light.
+    # Sharper ML gate:
+    # MLs should be selective. Do not use a team just because the raw edge is positive.
+    # Require visible Game Rankings alignment, a real starting-pitcher advantage, and a vulnerable opposing pitcher label.
     if game_rankings is not None and not game_rankings.empty:
+        gr_ml = game_rankings.copy()
+        for c, default in [
+            ("edge_vs_opponent", 0),
+            ("team_score", 0),
+            ("volatility_penalty_ml", 0),
+            ("public_penalty_ml", 0),
+            ("recommended_play", ""),
+            ("pitcher_pick_type", "Neutral"),
+            ("opponent_pitcher_pick_type", "Neutral"),
+        ]:
+            if c not in gr_ml.columns:
+                gr_ml[c] = default
+
         allowed_ml_labels = {"Moneyline Lean", "Stack Spot"}
-        ml_pool = game_rankings[
-            (game_rankings["edge_vs_opponent"].fillna(0) >= 10) &
-            (game_rankings["recommended_play"].astype(str).isin(allowed_ml_labels)) &
-            (game_rankings["pitcher_pick_type"].isin(["Strong SP", "K Upside", "Neutral"])) &
-            (game_rankings["opponent_pitcher_pick_type"].isin(["Short Leash Risk", "Attack With Hitters", "Low Sample", "Neutral"]))
+        strong_team_pitcher = {"Strong SP", "K Upside"}
+        vulnerable_opp_pitcher = {"Short Leash Risk", "Attack With Hitters", "Low Sample"}
+
+        ml_pool = gr_ml[
+            (pd.to_numeric(gr_ml["edge_vs_opponent"], errors="coerce").fillna(0) >= 18) &
+            (gr_ml["recommended_play"].astype(str).isin(allowed_ml_labels)) &
+            (gr_ml["pitcher_pick_type"].astype(str).isin(strong_team_pitcher)) &
+            (gr_ml["opponent_pitcher_pick_type"].astype(str).isin(vulnerable_opp_pitcher)) &
+            (pd.to_numeric(gr_ml["team_score"], errors="coerce").fillna(0) >= 8) &
+            (pd.to_numeric(gr_ml["volatility_penalty_ml"], errors="coerce").fillna(0) <= 0.30) &
+            (pd.to_numeric(gr_ml["public_penalty_ml"], errors="coerce").fillna(0) <= 0.30)
         ].copy().sort_values(["edge_vs_opponent", "team_score"], ascending=[False, False])
         if not ml_pool.empty:
             best = ml_pool.iloc[0]
             rows.append({
                 "slot": "Core 1", "bet_type": "Moneyline", "pick": f"{best['teamName']} ML", "team": best["teamName"],
                 "opponent": best["opponentTeam"], "confidence": "A",
-                "why_it_made_the_card": f"Edge {best['edge_vs_opponent']}; {best['pitcher_pick_type']} vs {best['opponent_pitcher_pick_type']}; label {best['recommended_play']}",
+                "why_it_made_the_card": f"Edge {best['edge_vs_opponent']}; strict ML gate; {best['pitcher_pick_type']} vs {best['opponent_pitcher_pick_type']}; label {best['recommended_play']}",
                 "source_tab": "Game_Rankings"
             })
             team_counts[best["teamName"]] = 1
