@@ -243,6 +243,116 @@ def _write_json(path: Path, obj):
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
 
+
+def _is_real_play(play: dict) -> bool:
+    if not isinstance(play, dict):
+        return False
+    bet_type = str(play.get("bet_type") or "")
+    pick = str(play.get("pick") or "")
+    if bet_type == "No Plays":
+        return False
+    if pick.lower().startswith("no final card"):
+        return False
+    return bool(pick and pick.strip() and pick != "—")
+
+
+def _play_key(play: dict):
+    return (
+        str(play.get("bet_type") or "").strip().lower(),
+        str(play.get("pick") or "").strip().lower(),
+        str(play.get("team") or "").strip().lower(),
+        str(play.get("opponent") or "").strip().lower(),
+    )
+
+
+def _slot_sort_key(play: dict):
+    slot = str(play.get("slot") or "")
+    m = re.search(r"(\d+)", slot)
+    n = int(m.group(1)) if m else 99
+    if slot.lower().startswith("core"):
+        group = 1
+    elif slot.lower().startswith("pitch"):
+        group = 2
+    elif slot.lower().startswith("power"):
+        group = 3
+    else:
+        group = 9
+    return (group, n, str(play.get("pick") or ""))
+
+
+def _load_locked_card_map() -> dict:
+    path = HISTORY_DIR / "final_card_by_date.json"
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_locked_card(target_date: str, rows: list[dict]):
+    card_map = _load_locked_card_map()
+    card_map[target_date] = rows
+    _write_json(HISTORY_DIR / "final_card_by_date.json", card_map)
+    _write_json(HISTORY_DIR / "final_card_by_date_latest.json", {
+        "target_date": target_date,
+        "rows": rows,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "note": "Locked same-day Final Card: keeps earlier picks and only appends new unique pregame picks."
+    })
+    # Helpful latest pick history snapshot for debugging/review.
+    _write_json(HISTORY_DIR / "pick_history_latest.json", {
+        "target_date": target_date,
+        "rows": rows,
+    })
+
+
+def merge_locked_final_card(data: dict, target_date: str) -> list[dict]:
+    """
+    Keep all previously shown picks for the same day and append only new unique picks.
+    This prevents late-day refreshes from deleting morning picks after games lock/start.
+    """
+    new_rows = ((data.get("final_card") or {}).get("plays") or [])
+    locked_map = _load_locked_card_map()
+    existing_rows = locked_map.get(target_date) or []
+
+    existing_real = [p for p in existing_rows if _is_real_play(p)]
+    new_real = [p for p in new_rows if _is_real_play(p)]
+
+    if existing_real:
+        merged = list(existing_real)
+        seen = {_play_key(p) for p in merged}
+        for p in new_real:
+            key = _play_key(p)
+            if key not in seen:
+                merged.append(p)
+                seen.add(key)
+        merged = sorted(merged, key=_slot_sort_key)
+    elif new_real:
+        merged = sorted(new_real, key=_slot_sort_key)
+    else:
+        # Only keep the current no-play row if there are no real locked plays.
+        merged = new_rows or [{
+            "slot": "Info",
+            "bet_type": "No Plays",
+            "pick": "No final card plays qualified",
+            "team": "",
+            "opponent": "",
+            "confidence": "Pass",
+            "why_it_made_the_card": "No eligible pregame plays qualified.",
+            "source_tab": "Final_Card",
+        }]
+
+    data["final_card"] = {"generated_section": "final_card", "plays": merged}
+    if isinstance(data.get("research"), dict):
+        data["research"]["final_card"] = merged
+
+    _save_locked_card(target_date, merged)
+    return merged
+
+
 def grade_results(data: dict, target_date: str):
     plays = ((data.get("final_card") or {}).get("plays") or [])
     plays = [
@@ -334,6 +444,9 @@ def main(season: int, target_date: str):
         data = json.load(f)
 
     data["date"] = target_date
+
+    locked_rows = merge_locked_final_card(data, target_date)
+    print(f"🔒 locked final card rows for {target_date}: {len([r for r in locked_rows if _is_real_play(r)])}")
 
     grade_info = grade_results(data, target_date)
     print(f"✅ results graded: {grade_info.get('graded_rows', 0)} completed pick(s)")
