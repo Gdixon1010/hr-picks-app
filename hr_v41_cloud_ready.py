@@ -56,20 +56,43 @@ def _write_v41_json(data: dict, season: int, target_date: str) -> Path:
     return out
 
 
-def _merge_final_cards(old_card: list, new_card: list) -> list:
-    seen = set()
-    merged = []
+def _norm(value):
+    if value is None:
+        return ""
+    return str(value).strip().lower()
 
-    for pick in old_card + new_card:
-        key = (
-            pick.get("playerName"),
-            pick.get("team"),
-            pick.get("opponent"),
-            pick.get("bet_type"),
-        )
+
+def _is_placeholder(row: dict) -> bool:
+    text = " ".join(str(v).lower() for v in row.values())
+    return (
+        "no final card plays qualified" in text
+        or "no qualified" in text
+        or "no plays" in text
+        or row.get("confidence") == "Pass"
+    )
+
+
+def _merge_rows(old_rows: list, new_rows: list, key_fields: list) -> list:
+    old_rows = old_rows if isinstance(old_rows, list) else []
+    new_rows = new_rows if isinstance(new_rows, list) else []
+
+    merged = []
+    seen = set()
+
+    for row in old_rows + new_rows:
+        if not isinstance(row, dict):
+            continue
+
+        key = tuple(_norm(row.get(field)) for field in key_fields)
+
         if key not in seen:
             seen.add(key)
-            merged.append(pick)
+            merged.append(row)
+
+    real_rows = [r for r in merged if not _is_placeholder(r)]
+
+    if real_rows:
+        return real_rows
 
     return merged
 
@@ -86,23 +109,41 @@ def main(season: int, target_date: str):
     with open(latest_v40, "r", encoding="utf-8") as f:
         new_data = json.load(f)
 
-    # 🔥 Load previous SAME-DAY card if exists
     prev_file = _latest_v41_today_json(target_date)
 
     if prev_file:
         with open(prev_file, "r", encoding="utf-8") as f:
             old_data = json.load(f)
 
-        old_card = old_data.get("final_card", [])
-        new_card = new_data.get("final_card", [])
+        # Lock Final Card
+        new_data["final_card"] = _merge_rows(
+            old_data.get("final_card", []),
+            new_data.get("final_card", []),
+            ["pick", "playerName", "team", "opponent", "bet_type"]
+        )
 
-        merged_card = _merge_final_cards(old_card, new_card)
+        # Lock Refined Picks
+        if "refined_picks" in old_data or "refined_picks" in new_data:
+            new_data["refined_picks"] = _merge_rows(
+                old_data.get("refined_picks", []),
+                new_data.get("refined_picks", []),
+                ["playerName", "teamName", "bet_type", "type", "opponent_pitcher"]
+            )
 
-        new_data["final_card"] = merged_card
+        # Lock Top Picks if present
+        if "top_picks" in old_data or "top_picks" in new_data:
+            new_data["top_picks"] = _merge_rows(
+                old_data.get("top_picks", []),
+                new_data.get("top_picks", []),
+                ["playerName", "teamName", "bet_type", "type", "category"]
+            )
 
-        # 🔥 KEEP previous graded results
+        # Keep previous graded results if present
         if "graded_results" in old_data:
             new_data["graded_results"] = old_data["graded_results"]
+
+        if "results" in old_data and "results" not in new_data:
+            new_data["results"] = old_data["results"]
 
     v41_path = _write_v41_json(new_data, season, target_date)
 
