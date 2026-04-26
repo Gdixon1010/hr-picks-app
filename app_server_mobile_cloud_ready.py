@@ -325,6 +325,32 @@ def _game_final_status_live(game_pk) -> bool:
         return False
 
 
+def _live_score_for_game(game_pk):
+    """Return live-feed final/status/score data. This is more reliable than schedule scores alone."""
+    if not game_pk:
+        return {"is_final": False, "away_score": None, "home_score": None, "away_name": "", "home_name": ""}
+    try:
+        live = _api_get(f"/game/{game_pk}/feed/live")
+        game_data = live.get("gameData") or {}
+        live_data = live.get("liveData") or {}
+        status = game_data.get("status") or {}
+        teams = game_data.get("teams") or {}
+        linescore = live_data.get("linescore") or {}
+        away_team = teams.get("away") or {}
+        home_team = teams.get("home") or {}
+        away_ls = linescore.get("teams", {}).get("away", {})
+        home_ls = linescore.get("teams", {}).get("home", {})
+        return {
+            "is_final": _game_final_status({"status": status}),
+            "away_score": away_ls.get("runs"),
+            "home_score": home_ls.get("runs"),
+            "away_name": away_team.get("name") or "",
+            "home_name": home_team.get("name") or "",
+        }
+    except Exception:
+        return {"is_final": False, "away_score": None, "home_score": None, "away_name": "", "home_name": ""}
+
+
 def _boxscore_for_game(game_pk) -> dict:
     try:
         return _api_get(f"/game/{game_pk}/boxscore")
@@ -348,16 +374,19 @@ def _iter_boxscore_players(game: dict, target_team: str | None = None):
 
 
 def _boxscore_player_stat_by_name(target_date: str, player_name: str, group: str, team_name: str | None = None) -> dict | None:
-    """Find a player's actual boxscore line by name. This avoids bad saved team/opponent mappings."""
+    """
+    Find a player's actual boxscore line by name.
+    Important: do NOT require schedule status to say Final. Some MLB schedule statuses lag,
+    but the boxscore/player stats can already be complete.
+    """
     target = _norm_name(player_name)
     if not target:
         return None
     games = _schedule_games_by_date(target_date)
 
+    # First try the saved team, then try the entire slate.
     for use_team in (True, False):
         for game in games:
-            if not (_is_final_game(game) or _game_final_status(game) or _game_final_status_live(game.get("gamePk"))):
-                continue
             for team, pdata, person in _iter_boxscore_players(game, team_name if use_team else None):
                 full = person.get("fullName") or ""
                 if _norm_name(full) == target:
@@ -383,17 +412,34 @@ def _grade_moneyline(row: dict, target_date: str) -> tuple[str, str]:
         if team_norm not in {_norm_name(away_name), _norm_name(home_name)}:
             continue
 
-        final_now = _is_final_game(game) or _game_final_status(game) or _game_final_status_live(game.get("gamePk"))
+        game_pk = game.get("gamePk")
+        live_score = _live_score_for_game(game_pk)
+
         away_score = away.get("score")
         home_score = home.get("score")
-        if not final_now and (away_score is None or home_score is None):
-            return "Pending", f"{away_name} @ {home_name} is not final yet"
-        if away_score is None or home_score is None:
-            return "Unable to Grade", "Final score not available"
 
-        winner = away_name if int(away_score) > int(home_score) else home_name
-        result = "Win" if _norm_name(winner) == team_norm else "Loss"
-        return result, f"{away_name} {away_score}, {home_name} {home_score}; winner={winner}"
+        # Prefer live feed score when schedule score is missing.
+        if away_score is None:
+            away_score = live_score.get("away_score")
+        if home_score is None:
+            home_score = live_score.get("home_score")
+
+        if not away_name:
+            away_name = live_score.get("away_name") or away_name
+        if not home_name:
+            home_name = live_score.get("home_name") or home_name
+
+        final_now = _is_final_game(game) or _game_final_status(game) or live_score.get("is_final")
+
+        # Key fix: if both scores exist, grade it even if the API status still says non-final.
+        if away_score is not None and home_score is not None:
+            winner = away_name if int(away_score) > int(home_score) else home_name
+            result = "Win" if _norm_name(winner) == team_norm else "Loss"
+            status_note = "final" if final_now else "score available; status lagged"
+            return result, f"{away_name} {away_score}, {home_name} {home_score}; winner={winner}; {status_note}"
+
+        return "Pending", f"{away_name} @ {home_name} score not available yet"
+
     return "Unable to Grade", f"Could not find game for {team} on {target_date}"
 
 def _grade_hitter(row: dict, target_date: str, season: int, mode: str) -> tuple[str, str]:
