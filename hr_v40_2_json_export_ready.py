@@ -297,6 +297,29 @@ def get_json(url: str, params=None):
 def nz(x, fallback=0.0):
     return fallback if x is None or pd.isna(x) else x
 
+
+def is_missing_value(x) -> bool:
+    """True for None, pandas/NumPy NaN, blank strings, or string placeholders."""
+    try:
+        if x is None or pd.isna(x):
+            return True
+    except Exception:
+        if x is None:
+            return True
+    s = str(x).strip().lower()
+    return s in ("", "nan", "none", "null", "tbd")
+
+
+def safe_int_value(x, default=None):
+    """Convert MLB IDs/order fields safely without crashing on NaN/TBD blanks."""
+    if is_missing_value(x):
+        return default
+    try:
+        return int(float(x))
+    except Exception:
+        return default
+
+
 def pct(h, ab):
     try:
         h = float(h)
@@ -751,10 +774,11 @@ def filter_pregame_schedule_rows(schedule_rows: pd.DataFrame, now_et=None, buffe
     return rows[mask].copy()
 
 def get_pitcher_hand(pid):
-    if not pid:
+    safe_pid = safe_int_value(pid)
+    if safe_pid is None:
         return None
     try:
-        p = get_json(f"https://statsapi.mlb.com/api/v1/people/{pid}")
+        p = get_json(f"https://statsapi.mlb.com/api/v1/people/{safe_pid}")
         ppl = p.get("people", [])
         if ppl:
             ph = ppl[0].get("pitchHand") or {}
@@ -906,11 +930,12 @@ def average_games_per_event(games_played, event_count):
 
 
 def get_pitcher_season_stats(pid: int, season: int) -> dict:
-    if not pid:
+    safe_pid = safe_int_value(pid)
+    if safe_pid is None:
         return {}
     try:
         data = get_json(
-            f"https://statsapi.mlb.com/api/v1/people/{int(float(pid))}/stats",
+            f"https://statsapi.mlb.com/api/v1/people/{safe_pid}/stats",
             params={"stats": "season", "group": "pitching", "season": season, "gameType": "R"},
         )
         stats = data.get("stats") or []
@@ -955,11 +980,15 @@ def build_pitcher_metrics(schedule_rows: pd.DataFrame, season: int) -> pd.DataFr
             (g.get("home_team"), g.get("away_team"), g.get("home_probable_pitcher"), g.get("home_probable_pitcher_id")),
         ]:
             counter += 1
-            if not team or not opp or not pitcher_name:
+            safe_pid = safe_int_value(pitcher_id)
+            if is_missing_value(team) or is_missing_value(opp):
+                continue
+            if is_missing_value(pitcher_name) or safe_pid is None:
+                print_step(f"⚠️ Skipping TBD/missing probable pitcher for {team} vs {opp}")
                 continue
             print_step(f"🎯 Pitcher {counter}/{total}: {pitcher_name} ({team})")
-            stat = get_pitcher_season_stats(pitcher_id, season)
-            logs = get_pitcher_game_logs(int(float(pitcher_id)), season) if pitcher_id else pd.DataFrame()
+            stat = get_pitcher_season_stats(safe_pid, season)
+            logs = get_pitcher_game_logs(safe_pid, season)
             recent = summarize_recent_pitcher_form(logs)
             ip = stat.get("inningsPitched")
             so = stat.get("strikeOuts")
@@ -1211,6 +1240,18 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
 
 
 def build_pitcher_line_value(pitcher_metrics):
+    cols = [
+        "pitcherName", "teamName", "opponentTeam", "pick_type", "sample_flag",
+        "innings_pitched", "strikeouts", "earned_runs", "hits_allowed", "walks",
+        "pitcher_score_adj", "avg_ip_per_start", "avg_k_per_start", "k_per_inning",
+        "last2_ip_avg", "last2_k_avg", "last2_pitch_avg", "short_leash_flag",
+        "opp_team_k_rate", "opp_team_k_tendency", "opp_k_matchup_bonus", "own_bullpen_grade",
+        "projected_k_floor", "projected_k_mid", "projected_k_ceiling", "max_playable_k_line",
+        "k_value_tier", "recommended_k_action", "safest_pitching_play", "notes",
+        "probable_starter_name", "starter_status",
+    ]
+    if pitcher_metrics is None or pitcher_metrics.empty:
+        return pd.DataFrame(columns=cols)
     rows = []
     for _, r in pitcher_metrics.iterrows():
         ip = nz(r.get("innings_pitched"))
@@ -1252,7 +1293,9 @@ def build_pitcher_line_value(pitcher_metrics):
             "notes":f"Starter locked; recent form + team K layer + bullpen support. oppK={r.get('opp_team_k_tendency')} pen={r.get('own_bullpen_grade')}",
             "probable_starter_name":r.get("probable_starter_name"),"starter_status":r.get("starter_status"),
         })
-    return pd.DataFrame(rows).sort_values(["projected_k_mid","pitcher_score_adj"], ascending=False).reset_index(drop=True)
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame(rows, columns=cols).sort_values(["projected_k_mid","pitcher_score_adj"], ascending=False).reset_index(drop=True)
 
 
 def build_daily_card(game_rankings, refined_picks, pitcher_line_value, hr_drought):
