@@ -299,6 +299,72 @@ def _is_final_game(game: dict) -> bool:
     return abstract == "final" or detailed in {"final", "game over", "completed early"}
 
 
+def _game_final_status(game: dict) -> bool:
+    """Robust final-game check. The schedule endpoint can lag, so also inspect status codes."""
+    status = game.get("status") or {}
+    values = " ".join(str(status.get(k) or "").lower() for k in [
+        "abstractGameState", "codedGameState", "detailedState", "statusCode", "reason"
+    ])
+    if any(x in values for x in ["final", "game over", "completed"]):
+        return True
+    if str(status.get("statusCode") or "").upper() in {"F", "O"}:
+        return True
+    if str(status.get("codedGameState") or "").upper() in {"F", "O"}:
+        return True
+    return False
+
+
+def _game_final_status_live(game_pk) -> bool:
+    if not game_pk:
+        return False
+    try:
+        live = _api_get(f"/game/{game_pk}/feed/live")
+        status = (live.get("gameData") or {}).get("status") or {}
+        return _game_final_status({"status": status})
+    except Exception:
+        return False
+
+
+def _boxscore_for_game(game_pk) -> dict:
+    try:
+        return _api_get(f"/game/{game_pk}/boxscore")
+    except Exception:
+        return {}
+
+
+def _iter_boxscore_players(game: dict, target_team: str | None = None):
+    game_pk = game.get("gamePk")
+    box = _boxscore_for_game(game_pk) if game_pk else {}
+    teams = box.get("teams") or {}
+    target_norm = _norm_name(target_team) if target_team else ""
+    for side in ("away", "home"):
+        block = teams.get(side) or {}
+        team_name = ((block.get("team") or {}).get("name")) or ""
+        if target_norm and _norm_name(team_name) != target_norm:
+            continue
+        for pdata in (block.get("players") or {}).values():
+            person = pdata.get("person") or {}
+            yield team_name, pdata, person
+
+
+def _boxscore_player_stat_by_name(target_date: str, player_name: str, group: str, team_name: str | None = None) -> dict | None:
+    """Find a player's actual boxscore line by name. This avoids bad saved team/opponent mappings."""
+    target = _norm_name(player_name)
+    if not target:
+        return None
+    games = _schedule_games_by_date(target_date)
+
+    for use_team in (True, False):
+        for game in games:
+            if not (_is_final_game(game) or _game_final_status(game) or _game_final_status_live(game.get("gamePk"))):
+                continue
+            for team, pdata, person in _iter_boxscore_players(game, team_name if use_team else None):
+                full = person.get("fullName") or ""
+                if _norm_name(full) == target:
+                    return pdata.get("stats", {}).get(group, {}) or {}
+    return None
+
+
 def _grade_moneyline(row: dict, target_date: str) -> tuple[str, str]:
     team = str(row.get("team") or row.get("teamName") or "").strip()
     if not team:
@@ -307,43 +373,49 @@ def _grade_moneyline(row: dict, target_date: str) -> tuple[str, str]:
     if not team:
         return "Unable to Grade", "Missing team name"
 
+    team_norm = _norm_name(team)
     for game in _schedule_games_by_date(target_date):
         teams = game.get("teams") or {}
         away = teams.get("away") or {}
         home = teams.get("home") or {}
-        away_name = ((away.get("team") or {}).get("name"))
-        home_name = ((home.get("team") or {}).get("name"))
-        if team not in {away_name, home_name}:
+        away_name = ((away.get("team") or {}).get("name")) or ""
+        home_name = ((home.get("team") or {}).get("name")) or ""
+        if team_norm not in {_norm_name(away_name), _norm_name(home_name)}:
             continue
-        if not _is_final_game(game):
-            return "Pending", f"{away_name} @ {home_name} is not final yet"
+
+        final_now = _is_final_game(game) or _game_final_status(game) or _game_final_status_live(game.get("gamePk"))
         away_score = away.get("score")
         home_score = home.get("score")
+        if not final_now and (away_score is None or home_score is None):
+            return "Pending", f"{away_name} @ {home_name} is not final yet"
         if away_score is None or home_score is None:
             return "Unable to Grade", "Final score not available"
+
         winner = away_name if int(away_score) > int(home_score) else home_name
-        result = "Win" if winner == team else "Loss"
+        result = "Win" if _norm_name(winner) == team_norm else "Loss"
         return result, f"{away_name} {away_score}, {home_name} {home_score}; winner={winner}"
     return "Unable to Grade", f"Could not find game for {team} on {target_date}"
-
 
 def _grade_hitter(row: dict, target_date: str, season: int, mode: str) -> tuple[str, str]:
     player = str(row.get("pick") or row.get("playerName") or "").strip()
     team = str(row.get("team") or row.get("teamName") or "").strip()
-    if not player or not team:
-        return "Unable to Grade", "Missing player/team"
-    pid = row.get("playerId") or _find_player_id_on_team(player, team, season)
-    if not pid:
-        return "Unable to Grade", f"Could not locate player id for {player} ({team})"
-    stat = _player_game_log_for_date(int(pid), "hitting", season, target_date)
+    if not player:
+        return "Unable to Grade", "Missing player"
+
+    stat = _boxscore_player_stat_by_name(target_date, player, "batting", team_name=team)
+    if stat is None:
+        pid = row.get("playerId") or (_find_player_id_on_team(player, team, season) if team else None)
+        if pid:
+            stat = _player_game_log_for_date(int(pid), "hitting", season, target_date)
+
     if not stat:
-        return "No Action", f"No hitting game log found for {player} on {target_date}"
+        return "No Action", f"No hitting boxscore/game log found for {player} on {target_date}"
+
     hits = int(stat.get("hits", 0) or 0)
     hrs = int(stat.get("homeRuns", 0) or 0)
     if mode == "hit":
         return ("Win" if hits >= 1 else "Loss"), f"{player}: {hits} hit(s), {hrs} HR"
     return ("Win" if hrs >= 1 else "Loss"), f"{player}: {hrs} HR, {hits} hit(s)"
-
 
 def _parse_k_line(row: dict) -> float | None:
     text = " ".join(str(row.get(k) or "") for k in ["why_it_made_the_card", "reason", "pick", "bet_type"])
@@ -366,21 +438,24 @@ def _parse_k_line(row: dict) -> float | None:
 def _grade_k_prop(row: dict, target_date: str, season: int) -> tuple[str, str]:
     player = str(row.get("pick") or row.get("pitcherName") or row.get("playerName") or "").strip()
     team = str(row.get("team") or row.get("teamName") or "").strip()
-    if not player or not team:
-        return "Unable to Grade", "Missing pitcher/team"
+    if not player:
+        return "Unable to Grade", "Missing pitcher"
     line = _parse_k_line(row)
     if line is None:
         return "Unable to Grade", "Could not determine K line from card text"
-    pid = row.get("playerId") or _find_player_id_on_team(player, team, season)
-    if not pid:
-        return "Unable to Grade", f"Could not locate pitcher id for {player} ({team})"
-    stat = _player_game_log_for_date(int(pid), "pitching", season, target_date)
+
+    stat = _boxscore_player_stat_by_name(target_date, player, "pitching", team_name=team)
+    if stat is None:
+        pid = row.get("playerId") or (_find_player_id_on_team(player, team, season) if team else None)
+        if pid:
+            stat = _player_game_log_for_date(int(pid), "pitching", season, target_date)
+
     if not stat:
-        return "No Action", f"No pitching game log found for {player} on {target_date}"
+        return "No Action", f"No pitching boxscore/game log found for {player} on {target_date}"
+
     ks = int(stat.get("strikeOuts", 0) or 0)
     result = "Win" if ks > line else "Loss"
     return result, f"{player}: {ks} Ks vs line {line}"
-
 
 def _grade_pick(row: dict, target_date: str, season: int = 2026) -> dict:
     bet_type = str(row.get("bet_type") or row.get("play_type") or "").strip()
