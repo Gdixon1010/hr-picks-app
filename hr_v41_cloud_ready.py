@@ -2,6 +2,7 @@ import os
 import json
 from pathlib import Path
 from datetime import datetime
+from typing import Any
 
 from hr_v40_2_json_export_ready import main as run_v40_main
 
@@ -24,6 +25,8 @@ def resolve_storage_dir() -> Path:
 
 
 OUTPUT_DIR = resolve_storage_dir()
+HISTORY_DIR = OUTPUT_DIR / "history"
+HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _latest_v40_json() -> Path:
@@ -56,6 +59,22 @@ def _write_v41_json(data: dict, season: int, target_date: str) -> Path:
     return out
 
 
+def _read_json(path: Path, default: Any):
+    try:
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return default
+
+
+def _write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
 def _norm(value):
     if value is None:
         return ""
@@ -77,9 +96,13 @@ def _is_placeholder(row: dict) -> bool:
     )
 
 
+def _rows(value) -> list:
+    return value if isinstance(value, list) else []
+
+
 def _merge_rows(old_rows: list, new_rows: list, key_fields: list) -> list:
-    old_rows = old_rows if isinstance(old_rows, list) else []
-    new_rows = new_rows if isinstance(new_rows, list) else []
+    old_rows = _rows(old_rows)
+    new_rows = _rows(new_rows)
 
     old_real = [r for r in old_rows if isinstance(r, dict) and not _is_placeholder(r)]
     new_real = [r for r in new_rows if isinstance(r, dict) and not _is_placeholder(r)]
@@ -95,11 +118,73 @@ def _merge_rows(old_rows: list, new_rows: list, key_fields: list) -> list:
     for row in rows_to_merge:
         key = tuple(_norm(row.get(field)) for field in key_fields)
 
+        # If all key fields are blank, fall back to the whole row so good rows do not collapse together.
+        if not any(key):
+            key = tuple(sorted((str(k), _norm(v)) for k, v in row.items()))
+
         if key not in seen:
             seen.add(key)
             merged.append(row)
 
     return merged
+
+
+def _get_final_card_plays(data: dict) -> list:
+    fc = data.get("final_card")
+    if isinstance(fc, dict):
+        return _rows(fc.get("plays"))
+    if isinstance(fc, list):
+        return _rows(fc)
+    research_fc = (data.get("research") or {}).get("final_card") if isinstance(data.get("research"), dict) else []
+    return _rows(research_fc)
+
+
+def _set_final_card_plays(data: dict, rows: list) -> None:
+    existing = data.get("final_card")
+    if isinstance(existing, dict):
+        existing["generated_section"] = existing.get("generated_section", "final_card")
+        existing["plays"] = rows
+        data["final_card"] = existing
+    else:
+        data["final_card"] = {"generated_section": "final_card", "plays": rows}
+
+    data.setdefault("research", {})
+    if isinstance(data["research"], dict):
+        data["research"]["final_card"] = rows
+
+
+def _get_research_rows(data: dict, key: str) -> list:
+    research = data.get("research") if isinstance(data.get("research"), dict) else {}
+    return _rows(research.get(key))
+
+
+def _set_research_rows(data: dict, key: str, rows: list) -> None:
+    data.setdefault("research", {})
+    if isinstance(data["research"], dict):
+        data["research"][key] = rows
+    # Also write top-level copy for older server/app code that may look there.
+    data[key] = rows
+
+
+def _update_final_card_history(target_date: str, rows: list) -> None:
+    """
+    Keep a same-day locked final-card file that the app server can overlay.
+    This prevents Reload App from wiping earlier final-card plays.
+    """
+    real_rows = [r for r in _rows(rows) if isinstance(r, dict) and not _is_placeholder(r)]
+    payload = {
+        "target_date": target_date,
+        "saved_at_et": datetime.now().strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " "),
+        "rows": real_rows,
+    }
+    _write_json(HISTORY_DIR / "final_card_by_date_latest.json", payload)
+
+    by_date_path = HISTORY_DIR / "final_card_by_date.json"
+    by_date = _read_json(by_date_path, {})
+    if not isinstance(by_date, dict):
+        by_date = {}
+    by_date[target_date] = payload
+    _write_json(by_date_path, by_date)
 
 
 def main(season: int, target_date: str):
@@ -121,25 +206,33 @@ def main(season: int, target_date: str):
         with open(prev_file, "r", encoding="utf-8") as f:
             old_data = json.load(f)
 
-        new_data["final_card"] = _merge_rows(
-            old_data.get("final_card", []),
-            new_data.get("final_card", []),
-            ["pick", "playerName", "team", "opponent", "bet_type"]
+        # IMPORTANT FIX:
+        # v40/v41 app JSON stores Final Card as final_card[\"plays\"], not as a top-level list.
+        # The old merge looked at old_data[\"final_card\"] directly, saw a dict, and treated it as empty.
+        # That allowed late refreshes to overwrite earlier picks. This locks same-day plays correctly.
+        merged_final_card = _merge_rows(
+            _get_final_card_plays(old_data),
+            _get_final_card_plays(new_data),
+            ["bet_type", "pick", "playerName", "team", "teamName", "opponent", "opponentTeam"]
         )
+        _set_final_card_plays(new_data, merged_final_card)
 
-        new_data["refined_picks"] = _merge_rows(
-            old_data.get("refined_picks", []),
-            new_data.get("refined_picks", []),
+        merged_refined = _merge_rows(
+            _get_research_rows(old_data, "refined_picks") or _rows(old_data.get("refined_picks")),
+            _get_research_rows(new_data, "refined_picks") or _rows(new_data.get("refined_picks")),
             ["category", "bet_type", "playerName", "teamName", "opponent_pitcher"]
         )
+        _set_research_rows(new_data, "refined_picks", merged_refined)
 
-        if "top_picks" in old_data or "top_picks" in new_data:
-            new_data["top_picks"] = _merge_rows(
-                old_data.get("top_picks", []),
-                new_data.get("top_picks", []),
-                ["category", "bet_type", "playerName", "teamName"]
-            )
+        merged_top = _merge_rows(
+            _get_research_rows(old_data, "top_picks") or _rows(old_data.get("top_picks")),
+            _get_research_rows(new_data, "top_picks") or _rows(new_data.get("top_picks")),
+            ["type", "category", "bet_type", "playerName", "teamName"]
+        )
+        if merged_top:
+            _set_research_rows(new_data, "top_picks", merged_top)
 
+        # Preserve grading/result snapshots if the current model run did not rebuild them.
         for key in [
             "graded_results",
             "results",
@@ -153,14 +246,23 @@ def main(season: int, target_date: str):
 
     else:
         print(f"⚠️ No previous v41 file found for {target_date}; starting fresh.")
+        _set_final_card_plays(new_data, _get_final_card_plays(new_data))
+        if _get_research_rows(new_data, "refined_picks"):
+            _set_research_rows(new_data, "refined_picks", _get_research_rows(new_data, "refined_picks"))
+        if _get_research_rows(new_data, "top_picks"):
+            _set_research_rows(new_data, "top_picks", _get_research_rows(new_data, "top_picks"))
+
+    _update_final_card_history(target_date, _get_final_card_plays(new_data))
 
     v41_path = _write_v41_json(new_data, season, target_date)
 
     print(f"✅ v41 JSON created: {v41_path}")
+    print(f"🔒 Same-day Final Card locked plays: {len(_get_final_card_plays(new_data))}")
+    print(f"🔒 Same-day Refined Picks locked rows: {len(_get_research_rows(new_data, 'refined_picks'))}")
 
     return {
         "status": "success",
-        "message": "v41 built successfully",
+        "message": "v41 built successfully with same-day Final Card / Refined Picks lock",
         "v41_output": str(v41_path),
     }
 
