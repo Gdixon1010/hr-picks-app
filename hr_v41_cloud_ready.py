@@ -38,11 +38,11 @@ def _latest_v40_json() -> Path:
 
 
 def _latest_v41_today_json(target_date: str) -> Path | None:
-    files = sorted(
-        OUTPUT_DIR.glob(f"HR_Hit_Drought_v41_appdata-*-{target_date}_*.json"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
+    files = [
+        p for p in OUTPUT_DIR.glob("HR_Hit_Drought_v41_appdata-*.json")
+        if target_date in p.name
+    ]
+    files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
     return files[0] if files else None
 
 
@@ -63,12 +63,17 @@ def _norm(value):
 
 
 def _is_placeholder(row: dict) -> bool:
+    if not isinstance(row, dict):
+        return True
+
     text = " ".join(str(v).lower() for v in row.values())
+
     return (
-        "no final card plays qualified" in text
+        "no plays" in text
         or "no qualified" in text
-        or "no plays" in text
-        or row.get("confidence") == "Pass"
+        or "no final card plays qualified" in text
+        or row.get("category") == "Info"
+        or row.get("bet_type") == "No Plays"
     )
 
 
@@ -76,23 +81,23 @@ def _merge_rows(old_rows: list, new_rows: list, key_fields: list) -> list:
     old_rows = old_rows if isinstance(old_rows, list) else []
     new_rows = new_rows if isinstance(new_rows, list) else []
 
+    old_real = [r for r in old_rows if isinstance(r, dict) and not _is_placeholder(r)]
+    new_real = [r for r in new_rows if isinstance(r, dict) and not _is_placeholder(r)]
+
+    rows_to_merge = old_real + new_real
+
+    if not rows_to_merge:
+        return old_rows if old_rows else new_rows
+
     merged = []
     seen = set()
 
-    for row in old_rows + new_rows:
-        if not isinstance(row, dict):
-            continue
-
+    for row in rows_to_merge:
         key = tuple(_norm(row.get(field)) for field in key_fields)
 
         if key not in seen:
             seen.add(key)
             merged.append(row)
-
-    real_rows = [r for r in merged if not _is_placeholder(r)]
-
-    if real_rows:
-        return real_rows
 
     return merged
 
@@ -101,7 +106,6 @@ def main(season: int, target_date: str):
 
     os.environ["HR_APP_DATA_DIR"] = str(OUTPUT_DIR)
 
-    # Run model
     run_v40_main(season, target_date)
 
     latest_v40 = _latest_v40_json()
@@ -112,38 +116,43 @@ def main(season: int, target_date: str):
     prev_file = _latest_v41_today_json(target_date)
 
     if prev_file:
+        print(f"🔒 Loading previous same-day v41 file: {prev_file}")
+
         with open(prev_file, "r", encoding="utf-8") as f:
             old_data = json.load(f)
 
-        # Lock Final Card
         new_data["final_card"] = _merge_rows(
             old_data.get("final_card", []),
             new_data.get("final_card", []),
             ["pick", "playerName", "team", "opponent", "bet_type"]
         )
 
-        # Lock Refined Picks
-        if "refined_picks" in old_data or "refined_picks" in new_data:
-            new_data["refined_picks"] = _merge_rows(
-                old_data.get("refined_picks", []),
-                new_data.get("refined_picks", []),
-                ["playerName", "teamName", "bet_type", "type", "opponent_pitcher"]
-            )
+        new_data["refined_picks"] = _merge_rows(
+            old_data.get("refined_picks", []),
+            new_data.get("refined_picks", []),
+            ["category", "bet_type", "playerName", "teamName", "opponent_pitcher"]
+        )
 
-        # Lock Top Picks if present
         if "top_picks" in old_data or "top_picks" in new_data:
             new_data["top_picks"] = _merge_rows(
                 old_data.get("top_picks", []),
                 new_data.get("top_picks", []),
-                ["playerName", "teamName", "bet_type", "type", "category"]
+                ["category", "bet_type", "playerName", "teamName"]
             )
 
-        # Keep previous graded results if present
-        if "graded_results" in old_data:
-            new_data["graded_results"] = old_data["graded_results"]
+        for key in [
+            "graded_results",
+            "results",
+            "performance_summary",
+            "performance_summary_latest",
+            "results_history",
+            "results_history_latest",
+        ]:
+            if key in old_data and key not in new_data:
+                new_data[key] = old_data[key]
 
-        if "results" in old_data and "results" not in new_data:
-            new_data["results"] = old_data["results"]
+    else:
+        print(f"⚠️ No previous v41 file found for {target_date}; starting fresh.")
 
     v41_path = _write_v41_json(new_data, season, target_date)
 
