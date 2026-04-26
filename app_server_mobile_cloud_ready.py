@@ -5,6 +5,8 @@ import json
 import datetime as dt
 import os
 import time
+import re
+import requests
 from threading import Lock
 from zoneinfo import ZoneInfo
 
@@ -148,9 +150,395 @@ def load_latest_data():
     return data
 
 
+# -----------------------------
+# Results grading helpers
+# -----------------------------
+MLB_API = "https://statsapi.mlb.com/api/v1"
+
+
+def _api_get(path: str, params=None, timeout: int = 30):
+    url = path if str(path).startswith("http") else f"{MLB_API}{path}"
+    r = requests.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def _norm_name(value) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
+
+
+def _safe_date(value) -> str:
+    return str(value or "").strip()[:10]
+
+
+def _history_dir() -> Path:
+    d = OUTPUT_DIR / "history"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _all_appdata_files_for_date(target_date: str):
+    patterns = [
+        f"HR_Hit_Drought_v41_appdata-*-{target_date}_*.json",
+        f"HR_Hit_Drought_v40_appdata-*-{target_date}_*.json",
+        f"HR_Hit_Drought_v41_appdata-*_{target_date}_*.json",
+        f"HR_Hit_Drought_v40_appdata-*_{target_date}_*.json",
+    ]
+    files = []
+    for pat in patterns:
+        files.extend(OUTPUT_DIR.glob(pat))
+    # extra safety: include any appdata file with the date anywhere in the name
+    files.extend([p for p in OUTPUT_DIR.glob("HR_Hit_Drought_v*_appdata-*.json") if target_date in p.name])
+    uniq = {str(p): p for p in files}
+    return sorted(uniq.values(), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _latest_appdata_for_date(target_date: str) -> Path | None:
+    files = _all_appdata_files_for_date(target_date)
+    return files[0] if files else None
+
+
+def _extract_final_card_rows(payload: dict) -> list:
+    fc = payload.get("final_card")
+    if isinstance(fc, dict):
+        rows = fc.get("plays") or []
+    elif isinstance(fc, list):
+        rows = fc
+    else:
+        rows = []
+    if not rows:
+        rows = (((payload.get("research") or {}).get("final_card")) or [])
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        text = " ".join(str(v).lower() for v in r.values())
+        if "no final card plays qualified" in text or r.get("bet_type") == "No Plays":
+            continue
+        out.append(r)
+    return out
+
+
+def _team_map() -> dict:
+    try:
+        data = _api_get("/teams", params={"sportId": 1})
+        return {t.get("name"): int(t.get("id")) for t in data.get("teams", []) if t.get("name") and t.get("id")}
+    except Exception:
+        return {}
+
+
+def _team_id_for_name(team_name: str) -> int | None:
+    teams = _team_map()
+    if team_name in teams:
+        return teams[team_name]
+    n = _norm_name(team_name)
+    for name, tid in teams.items():
+        if _norm_name(name) == n:
+            return tid
+    return None
+
+
+def _find_player_id_on_team(player_name: str, team_name: str, season: int = 2026) -> int | None:
+    team_id = _team_id_for_name(team_name)
+    if not team_id:
+        return None
+    try:
+        data = _api_get(f"/teams/{team_id}/roster", params={"rosterType": "fullSeason", "season": season})
+        target = _norm_name(player_name)
+        for item in data.get("roster", []) or []:
+            person = item.get("person") or {}
+            if _norm_name(person.get("fullName")) == target:
+                return int(person.get("id"))
+        # fuzzy fallback: last name + first initial style matching
+        for item in data.get("roster", []) or []:
+            person = item.get("person") or {}
+            full = str(person.get("fullName") or "")
+            if target and target in _norm_name(full):
+                return int(person.get("id"))
+    except Exception:
+        return None
+    return None
+
+
+def _player_game_log_for_date(player_id: int, group: str, season: int, target_date: str) -> dict | None:
+    try:
+        data = _api_get(
+            f"/people/{int(player_id)}/stats",
+            params={"stats": "gameLog", "group": group, "season": season, "gameType": "R"},
+        )
+        stats = data.get("stats") or []
+        splits = stats[0].get("splits", []) if stats else []
+        for split in splits:
+            if _safe_date(split.get("date")) == target_date:
+                return split.get("stat") or {}
+    except Exception:
+        return None
+    return None
+
+
+def _schedule_games_by_date(target_date: str) -> list:
+    try:
+        data = _api_get(
+            "/schedule",
+            params={"sportId": 1, "date": target_date, "hydrate": "team,linescore,probablePitcher"},
+        )
+        games = []
+        for d in data.get("dates", []) or []:
+            games.extend(d.get("games", []) or [])
+        return games
+    except Exception:
+        return []
+
+
+def _is_final_game(game: dict) -> bool:
+    status = game.get("status") or {}
+    detailed = str(status.get("detailedState") or "").lower()
+    abstract = str(status.get("abstractGameState") or "").lower()
+    return abstract == "final" or detailed in {"final", "game over", "completed early"}
+
+
+def _grade_moneyline(row: dict, target_date: str) -> tuple[str, str]:
+    team = str(row.get("team") or row.get("teamName") or "").strip()
+    if not team:
+        pick = str(row.get("pick") or "")
+        team = pick.replace(" ML", "").strip()
+    if not team:
+        return "Unable to Grade", "Missing team name"
+
+    for game in _schedule_games_by_date(target_date):
+        teams = game.get("teams") or {}
+        away = teams.get("away") or {}
+        home = teams.get("home") or {}
+        away_name = ((away.get("team") or {}).get("name"))
+        home_name = ((home.get("team") or {}).get("name"))
+        if team not in {away_name, home_name}:
+            continue
+        if not _is_final_game(game):
+            return "Pending", f"{away_name} @ {home_name} is not final yet"
+        away_score = away.get("score")
+        home_score = home.get("score")
+        if away_score is None or home_score is None:
+            return "Unable to Grade", "Final score not available"
+        winner = away_name if int(away_score) > int(home_score) else home_name
+        result = "Win" if winner == team else "Loss"
+        return result, f"{away_name} {away_score}, {home_name} {home_score}; winner={winner}"
+    return "Unable to Grade", f"Could not find game for {team} on {target_date}"
+
+
+def _grade_hitter(row: dict, target_date: str, season: int, mode: str) -> tuple[str, str]:
+    player = str(row.get("pick") or row.get("playerName") or "").strip()
+    team = str(row.get("team") or row.get("teamName") or "").strip()
+    if not player or not team:
+        return "Unable to Grade", "Missing player/team"
+    pid = row.get("playerId") or _find_player_id_on_team(player, team, season)
+    if not pid:
+        return "Unable to Grade", f"Could not locate player id for {player} ({team})"
+    stat = _player_game_log_for_date(int(pid), "hitting", season, target_date)
+    if not stat:
+        return "No Action", f"No hitting game log found for {player} on {target_date}"
+    hits = int(stat.get("hits", 0) or 0)
+    hrs = int(stat.get("homeRuns", 0) or 0)
+    if mode == "hit":
+        return ("Win" if hits >= 1 else "Loss"), f"{player}: {hits} hit(s), {hrs} HR"
+    return ("Win" if hrs >= 1 else "Loss"), f"{player}: {hrs} HR, {hits} hit(s)"
+
+
+def _parse_k_line(row: dict) -> float | None:
+    text = " ".join(str(row.get(k) or "") for k in ["why_it_made_the_card", "reason", "pick", "bet_type"])
+    patterns = [
+        r"over\s+up\s+to\s+(\d+(?:\.5)?)",
+        r"max\s+line\s+(\d+(?:\.5)?)",
+        r"line\s+(\d+(?:\.5)?)",
+        r"(\d+(?:\.5)?)\s*ks",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.I)
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                pass
+    return None
+
+
+def _grade_k_prop(row: dict, target_date: str, season: int) -> tuple[str, str]:
+    player = str(row.get("pick") or row.get("pitcherName") or row.get("playerName") or "").strip()
+    team = str(row.get("team") or row.get("teamName") or "").strip()
+    if not player or not team:
+        return "Unable to Grade", "Missing pitcher/team"
+    line = _parse_k_line(row)
+    if line is None:
+        return "Unable to Grade", "Could not determine K line from card text"
+    pid = row.get("playerId") or _find_player_id_on_team(player, team, season)
+    if not pid:
+        return "Unable to Grade", f"Could not locate pitcher id for {player} ({team})"
+    stat = _player_game_log_for_date(int(pid), "pitching", season, target_date)
+    if not stat:
+        return "No Action", f"No pitching game log found for {player} on {target_date}"
+    ks = int(stat.get("strikeOuts", 0) or 0)
+    result = "Win" if ks > line else "Loss"
+    return result, f"{player}: {ks} Ks vs line {line}"
+
+
+def _grade_pick(row: dict, target_date: str, season: int = 2026) -> dict:
+    bet_type = str(row.get("bet_type") or row.get("play_type") or "").strip()
+    lower = bet_type.lower()
+    if "moneyline" in lower or lower == "ml":
+        result, detail = _grade_moneyline(row, target_date)
+    elif "hit" in lower and "hr" not in lower and "home" not in lower:
+        result, detail = _grade_hitter(row, target_date, season, "hit")
+    elif lower == "hr" or "home run" in lower:
+        result, detail = _grade_hitter(row, target_date, season, "hr")
+    elif "k prop" in lower or "strikeout" in lower or lower in {"ks", "k"}:
+        result, detail = _grade_k_prop(row, target_date, season)
+    else:
+        result, detail = "Unable to Grade", f"Unsupported bet type: {bet_type}"
+
+    return {
+        "target_date": target_date,
+        "bet_type": bet_type,
+        "pick": row.get("pick") or row.get("playerName") or row.get("pitcherName"),
+        "team": row.get("team") or row.get("teamName"),
+        "opponent": row.get("opponent") or row.get("opponentTeam"),
+        "confidence": row.get("confidence"),
+        "slot": row.get("slot") or row.get("play_type") or row.get("section"),
+        "result_status": result,
+        "result_detail": detail,
+        "source_tab": row.get("source_tab"),
+        "graded_at_et": dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " "),
+    }
+
+
+def _dedupe_result_rows(rows: list) -> list:
+    seen = set()
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        key = (
+            r.get("target_date"),
+            str(r.get("bet_type") or "").lower(),
+            _norm_name(r.get("pick")),
+            _norm_name(r.get("team")),
+            _norm_name(r.get("opponent")),
+            str(r.get("confidence") or ""),
+        )
+        # keep the most recent occurrence by iterating reversed before calling this if needed
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
+def _build_performance_summary(rows: list) -> dict:
+    graded = [r for r in rows if r.get("result_status") in {"Win", "Loss"}]
+    wins = sum(1 for r in graded if r.get("result_status") == "Win")
+    losses = sum(1 for r in graded if r.get("result_status") == "Loss")
+    total = wins + losses
+
+    def group_summary(field):
+        groups = {}
+        for r in graded:
+            k = str(r.get(field) or "Unknown")
+            groups.setdefault(k, {"graded_picks": 0, "wins": 0, "losses": 0})
+            groups[k]["graded_picks"] += 1
+            if r.get("result_status") == "Win":
+                groups[k]["wins"] += 1
+            else:
+                groups[k]["losses"] += 1
+        out = []
+        for k, v in sorted(groups.items()):
+            denom = v["wins"] + v["losses"]
+            out.append({field: k, **v, "win_rate": round(v["wins"] / denom, 4) if denom else None})
+        return out
+
+    recent = sorted(rows, key=lambda r: (str(r.get("target_date") or ""), str(r.get("graded_at_et") or "")), reverse=True)[:50]
+    return {
+        "overall": {
+            "graded_picks": total,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(wins / total, 4) if total else None,
+        },
+        "by_bet_type": group_summary("bet_type"),
+        "by_confidence": group_summary("confidence"),
+        "recent_results": recent,
+    }
+
+
+def grade_date_results(target_date: str, season: int = 2026) -> dict:
+    hist = _history_dir()
+    app_file = _latest_appdata_for_date(target_date)
+    if not app_file:
+        return {"status": "no_file", "message": f"No appdata file found for {target_date}"}
+
+    with open(app_file, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    plays = _extract_final_card_rows(payload)
+
+    # Save/refresh the locked final card snapshot used by the app.
+    final_card_snapshot = {"target_date": target_date, "source_file": app_file.name, "rows": plays}
+    (hist / "final_card_by_date_latest.json").write_text(json.dumps(final_card_snapshot, indent=2), encoding="utf-8")
+
+    if not plays:
+        return {"status": "no_plays", "message": f"No gradeable final-card plays found in {app_file.name}", "source_file": app_file.name}
+
+    new_rows = [_grade_pick(play, target_date, season) for play in plays]
+
+    existing_rows = []
+    latest_path = hist / "results_history_latest.json"
+    if latest_path.exists():
+        try:
+            existing = json.loads(latest_path.read_text(encoding="utf-8"))
+            existing_rows = existing.get("rows") or []
+        except Exception:
+            existing_rows = []
+
+    # New rows first so same-date regrades replace older attempts.
+    all_rows = _dedupe_result_rows(new_rows + existing_rows)
+    summary = _build_performance_summary(all_rows)
+
+    latest_payload = {"graded_rows": len(all_rows), "rows": all_rows, "updated_at_et": dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ")}
+    latest_path.write_text(json.dumps(latest_payload, indent=2), encoding="utf-8")
+    (hist / "performance_summary_latest.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    # Also maintain append-readable jsonl files for troubleshooting.
+    (hist / "results_history.jsonl").write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in all_rows) + "\n", encoding="utf-8")
+
+    return {"status": "ok", "date": target_date, "source_file": app_file.name, "graded_new_rows": len(new_rows), "total_rows": len(all_rows), "summary": summary.get("overall")}
+
+
+def grade_recent_finished_cards(days_back: int = 4, season: int = 2026) -> dict:
+    today = dt.datetime.now(ZoneInfo("America/New_York")).date()
+    results = []
+    # Grade yesterday and a few recent prior dates. Do not grade today by default because games may still be pending.
+    for i in range(1, max(days_back, 1) + 1):
+        d = (today - dt.timedelta(days=i)).strftime("%Y-%m-%d")
+        try:
+            results.append(grade_date_results(d, season))
+        except Exception as e:
+            results.append({"status": "error", "date": d, "message": str(e)})
+    return {"status": "ok", "graded_dates_checked": results}
+
+
 @app.get("/latest")
 def latest():
     return JSONResponse(load_latest_data())
+
+
+@app.get("/grade-results")
+def grade_results(date: str | None = None):
+    try:
+        if date:
+            result = grade_date_results(date, 2026)
+        else:
+            result = grade_recent_finished_cards(days_back=4, season=2026)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
 
 @app.get("/refresh-data")
@@ -177,7 +565,12 @@ def refresh_data():
         today = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
         try:
+            # First grade any recently completed cards so the Results tab updates.
+            grade_recent_finished_cards(days_back=4, season=2026)
+
+            # Then build today's fresh card.
             run_model_main(2026, today)
+
             duration = round(time.time() - start_time, 2)
             return JSONResponse({
                 "status": "ok",
