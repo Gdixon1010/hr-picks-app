@@ -543,29 +543,36 @@ def grade_date_results(target_date: str, season: int = 2026, include_refined: bo
     return {"status": "ok", "date": target_date, "final_card_rows": len(final_rows), "refined_rows": len(refined_rows), "graded_new_rows": len(new_rows), "total_rows": len(all_rows), "summary": summary.get("overall")}
 
 
-def auto_grade_after_4am(season: int = 2026) -> dict:
-    hist = _history_dir()
+def grade_recent_slates_including_today(season: int = 2026, days_back: int = 4) -> dict:
+    """Grade today's slate plus recent previous slates every time Reload App runs.
+
+    This does NOT unlock/remove picks. The 4AM lock still protects the cards.
+    It only updates result files, and re-grades pending rows when final stats appear.
+    """
     now = dt.datetime.now(ZoneInfo("America/New_York"))
-    state_path = hist / "auto_grade_state.json"
-    state = read_json_file(state_path, {})
-    if now.hour < 4:
-        return {"status": "skipped", "reason": "before_4am_et", "now_et": now.isoformat()}
-    run_key = now.strftime("%Y-%m-%d")
-    if state.get("last_auto_grade_run_key") == run_key:
-        return {"status": "skipped", "reason": "already_ran_today", "run_key": run_key}
     results = []
-    # Grade the previous 4 slate dates; this catches late games and any missed deploys.
-    for i in range(1, 5):
+    # Include today (i=0) because some slates finish before midnight and the user wants results immediately.
+    for i in range(0, max(days_back, 0) + 1):
         d = (now.date() - dt.timedelta(days=i)).strftime("%Y-%m-%d")
         try:
             results.append(grade_date_results(d, season, include_refined=True))
         except Exception as e:
             results.append({"status": "error", "date": d, "message": str(e)})
-    state["last_auto_grade_run_key"] = run_key
-    state["last_auto_grade_at_et"] = now.strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ")
-    state["last_auto_grade_results"] = results
-    state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-    return {"status": "ok", "run_key": run_key, "results": results}
+    return {
+        "status": "ok",
+        "mode": "today_plus_recent",
+        "ran_at_et": now.strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " "),
+        "results": results,
+    }
+
+
+def auto_grade_after_4am(season: int = 2026) -> dict:
+    """Compatibility endpoint. Kept for older code, but now grades today + recent slates.
+
+    The app's card lock/reset remains governed by the V41 4AM slate lock.
+    Result grading is safe to run anytime because pending rows are replaced when final stats arrive.
+    """
+    return grade_recent_slates_including_today(season=season, days_back=4)
 
 
 @app.get("/latest")
@@ -612,12 +619,14 @@ def refresh_data():
         today = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
         try:
-            auto_grade_result = auto_grade_after_4am(season=2026)
+            # First build/lock today's latest cards.
+            # Then grade today + recent slates so completed games immediately appear in Results.
             run_model_main(2026, today)
+            auto_grade_result = grade_recent_slates_including_today(season=2026, days_back=4)
             duration = round(time.time() - start_time, 2)
             return JSONResponse({
                 "status": "ok",
-                "message": "Data refreshed",
+                "message": "Data refreshed and results checked",
                 "date": today,
                 "timezone": "America/New_York",
                 "duration_seconds": duration,
