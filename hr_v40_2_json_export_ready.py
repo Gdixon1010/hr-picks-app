@@ -1392,19 +1392,33 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
             if c not in gr_ml.columns:
                 gr_ml[c] = default
 
-        allowed_ml_labels = {"Moneyline Lean", "Stack Spot"}
-        strong_team_pitcher = {"Strong SP", "K Upside"}
-        vulnerable_opp_pitcher = {"Short Leash Risk", "Attack With Hitters", "Low Sample"}
+        # Conservative ML gate v42:
+        # Keep ML off the Final Card unless the edge is extremely clean.
+        # This intentionally blocks volatile spots like "good SP vs short leash" in hitter-friendly/slugfest contexts.
+        allowed_ml_labels = {"Moneyline Lean"}
+        strong_team_pitcher = {"Strong SP"}
+        vulnerable_opp_pitcher = {"Attack With Hitters", "Low Sample"}
+
+        for c in ["pitcher_score_adj", "opponent_pitcher_score_adj", "offense_score"]:
+            if c not in gr_ml.columns:
+                gr_ml[c] = 0
+
+        gr_ml["ml_pitching_edge"] = (
+            pd.to_numeric(gr_ml["pitcher_score_adj"], errors="coerce").fillna(0)
+            - pd.to_numeric(gr_ml["opponent_pitcher_score_adj"], errors="coerce").fillna(0)
+        )
 
         ml_pool = gr_ml[
-            (pd.to_numeric(gr_ml["edge_vs_opponent"], errors="coerce").fillna(0) >= 18) &
+            (pd.to_numeric(gr_ml["edge_vs_opponent"], errors="coerce").fillna(0) >= 20) &
+            (pd.to_numeric(gr_ml["ml_pitching_edge"], errors="coerce").fillna(0) >= 3.0) &
             (gr_ml["recommended_play"].astype(str).isin(allowed_ml_labels)) &
             (gr_ml["pitcher_pick_type"].astype(str).isin(strong_team_pitcher)) &
             (gr_ml["opponent_pitcher_pick_type"].astype(str).isin(vulnerable_opp_pitcher)) &
-            (pd.to_numeric(gr_ml["team_score"], errors="coerce").fillna(0) >= 8) &
-            (pd.to_numeric(gr_ml["volatility_penalty_ml"], errors="coerce").fillna(0) <= 0.30) &
-            (pd.to_numeric(gr_ml["public_penalty_ml"], errors="coerce").fillna(0) <= 0.30)
-        ].copy().sort_values(["edge_vs_opponent", "team_score"], ascending=[False, False])
+            (pd.to_numeric(gr_ml["team_score"], errors="coerce").fillna(0) >= 10) &
+            (pd.to_numeric(gr_ml["offense_score"], errors="coerce").fillna(0) >= 2.4) &
+            (pd.to_numeric(gr_ml["volatility_penalty_ml"], errors="coerce").fillna(0) <= 0.20) &
+            (pd.to_numeric(gr_ml["public_penalty_ml"], errors="coerce").fillna(0) <= 0.20)
+        ].copy().sort_values(["edge_vs_opponent", "ml_pitching_edge", "team_score"], ascending=[False, False, False])
         if not ml_pool.empty:
             best = ml_pool.iloc[0]
             rows.append({
@@ -1478,21 +1492,51 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
         )
         hr_added += 1
 
-    # K prop: one elite only
+    # K prop: one elite only, conservative v42 gate.
+    # Require a real cushion above the playable line and enough leash/recent K form.
     if pitcher_line_value is not None and not pitcher_line_value.empty:
-        k_pool = pitcher_line_value[
-            (pitcher_line_value["starter_status"] == "Confirmed") &
-            (~pitcher_line_value["short_leash_flag"].astype(str).str.startswith("Yes", na=False)) &
-            (pitcher_line_value["k_value_tier"].isin(["Hammer", "Strong"])) &
-            (pitcher_line_value["max_playable_k_line"].astype(str) != "")
-        ].copy().sort_values(["projected_k_mid","pitcher_score_adj"], ascending=[False, False])
+        kdf = pitcher_line_value.copy()
+        for c, default in [
+            ("starter_status", ""),
+            ("short_leash_flag", ""),
+            ("k_value_tier", ""),
+            ("max_playable_k_line", ""),
+            ("projected_k_mid", 0),
+            ("avg_ip_per_start", 0),
+            ("last2_ip_avg", 0),
+            ("last2_k_avg", 0),
+            ("last2_pitch_avg", 0),
+            ("opp_k_matchup_bonus", 0),
+            ("opp_team_k_tendency", "Unknown"),
+            ("pitcher_score_adj", 0),
+        ]:
+            if c not in kdf.columns:
+                kdf[c] = default
+
+        kdf["k_line_num"] = pd.to_numeric(kdf["max_playable_k_line"], errors="coerce")
+        kdf["k_buffer"] = pd.to_numeric(kdf["projected_k_mid"], errors="coerce").fillna(0) - kdf["k_line_num"].fillna(99)
+
+        k_pool = kdf[
+            (kdf["starter_status"] == "Confirmed") &
+            (~kdf["short_leash_flag"].astype(str).str.startswith("Yes", na=False)) &
+            (kdf["k_value_tier"].isin(["Hammer", "Strong"])) &
+            (kdf["k_line_num"].notna()) &
+            (pd.to_numeric(kdf["k_buffer"], errors="coerce").fillna(-99) >= 1.0) &
+            (pd.to_numeric(kdf["avg_ip_per_start"], errors="coerce").fillna(0) >= 5.2) &
+            (pd.to_numeric(kdf["last2_ip_avg"], errors="coerce").fillna(0) >= 5.0) &
+            (pd.to_numeric(kdf["last2_k_avg"], errors="coerce").fillna(0) >= 5.5) &
+            (pd.to_numeric(kdf["last2_pitch_avg"], errors="coerce").fillna(0) >= 85) &
+            (pd.to_numeric(kdf["opp_k_matchup_bonus"], errors="coerce").fillna(0) >= 0.35) &
+            (~kdf["opp_team_k_tendency"].astype(str).eq("Low K")) &
+            (pd.to_numeric(kdf["pitcher_score_adj"], errors="coerce").fillna(0) >= 6.0)
+        ].copy().sort_values(["k_buffer", "projected_k_mid", "pitcher_score_adj"], ascending=[False, False, False])
         for _, r in k_pool.iterrows():
             if not can_use_team(r["teamName"], 2):
                 continue
             add_row(
                 f"Pitch {1}", "K Prop", r["pitcherName"], r["teamName"], r["opponentTeam"],
                 "A" if r["k_value_tier"] == "Hammer" else "B",
-                f"{r['recommended_k_action']}; projected {r['projected_k_floor']}-{r['projected_k_ceiling']} Ks",
+                f"{r['recommended_k_action']}; projected {r['projected_k_floor']}-{r['projected_k_ceiling']} Ks; cushion {r['k_buffer']:.1f} over line",
                 "Pitcher_Line_Value"
             )
             break
