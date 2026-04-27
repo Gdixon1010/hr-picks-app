@@ -40,33 +40,6 @@ def resolve_storage_dir() -> Path:
 OUTPUT_DIR = resolve_storage_dir()
 
 
-def active_slate_date(now_et=None) -> str:
-    """Slate day runs from 4:00 AM ET to 3:59 AM ET the next calendar day.
-
-    Before 4 AM ET, the active slate is yesterday. This prevents midnight refreshes
-    from replacing late-night slate cards before the user's 4 AM lock expires.
-    """
-    if now_et is None:
-        now_et = dt.datetime.now(ZoneInfo("America/New_York"))
-    if now_et.tzinfo is None:
-        now_et = now_et.replace(tzinfo=ZoneInfo("America/New_York"))
-    if now_et.hour < 4:
-        return (now_et.date() - dt.timedelta(days=1)).strftime("%Y-%m-%d")
-    return now_et.date().strftime("%Y-%m-%d")
-
-
-def get_latest_json_file_for_date(target_date: str):
-    patterns = [
-        "HR_Hit_Drought_v41_appdata-*.json",
-        "HR_Hit_Drought_v40_appdata-*.json",
-    ]
-    files = []
-    for pat in patterns:
-        files.extend([p for p in OUTPUT_DIR.glob(pat) if target_date in p.name])
-    files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
-    return files[0] if files else None
-
-
 def get_latest_json_file():
     patterns = [
         "HR_Hit_Drought_v41_appdata-*.json",
@@ -93,8 +66,7 @@ def read_json_file(path: Path, default):
 
 def load_latest_data():
     history_dir = OUTPUT_DIR / "history"
-    active_date = active_slate_date()
-    latest = get_latest_json_file_for_date(active_date) or get_latest_json_file()
+    latest = get_latest_json_file()
 
     if latest and latest.exists():
         with open(latest, "r", encoding="utf-8") as f:
@@ -121,31 +93,15 @@ def load_latest_data():
         saved_label = snapshot.get("saved_at_et")
         display = saved_label
 
-    # Overlay locked Final Card / Refined Picks for the active slate.
-    # This is the key display guard: before 4 AM ET, active_date is yesterday,
-    # so the app keeps showing yesterday's locked slate even if a 12 AM run created today's file.
-    final_by_date = read_json_file(history_dir / "final_card_by_date.json", {})
-    refined_by_date = read_json_file(history_dir / "refined_picks_by_date.json", {})
+    frozen_latest = read_json_file(history_dir / "final_card_by_date_latest.json", {})
+    frozen_rows = frozen_latest.get("rows") or []
+    frozen_date = frozen_latest.get("target_date")
 
-    final_locked = final_by_date.get(active_date) if isinstance(final_by_date, dict) else None
-    refined_locked = refined_by_date.get(active_date) if isinstance(refined_by_date, dict) else None
-
-    final_rows = (final_locked or {}).get("rows") or []
-    refined_rows = (refined_locked or {}).get("rows") or []
-
-    if final_rows:
-        data["final_card"] = {"generated_section": "final_card", "plays": final_rows}
-        data.setdefault("research", {})
-        if isinstance(data["research"], dict):
-            data["research"]["final_card"] = final_rows
-        data["date"] = active_date
-
-    if refined_rows:
-        data.setdefault("research", {})
-        if isinstance(data["research"], dict):
-            data["research"]["refined_picks"] = refined_rows
-        data["refined_picks"] = refined_rows
-        data["date"] = active_date
+    data_date = str(data.get("date")) if data.get("date") else None
+    if frozen_rows and frozen_date and (data_date is None or frozen_date == data_date):
+        data["final_card"] = {"generated_section": "final_card", "plays": frozen_rows}
+        if not data.get("date"):
+            data["date"] = frozen_date
 
     data["results"] = read_json_file(history_dir / "performance_summary_latest.json", {"overall": {}, "by_bet_type": [], "by_confidence": [], "recent_results": []})
     data["results_latest"] = read_json_file(history_dir / "results_history_latest.json", {"graded_rows": 0, "rows": []})
@@ -189,8 +145,6 @@ def load_latest_data():
         "filename": filename,
         "path": path_str,
         "last_updated_display": display,
-        "active_slate_date": active_date,
-        "slate_lock_note": "Before 4 AM ET the app displays/protects the prior slate.",
         "eastern_now": eastern_now.strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ") if eastern_now else None,
     }
     return data
@@ -297,7 +251,7 @@ def _card_rows_for_date(target_date: str, card_type: str) -> list:
 
 def _schedule_games_by_date(target_date: str) -> list:
     try:
-        data = _api_get("/schedule", params={"sportId": 1, "date": target_date, "hydrate": "team,linescore"})
+        data = _api_get("/schedule", params={"sportId": 1, "date": target_date, "hydrate": "team,linescore,status"})
         games = []
         for d in data.get("dates", []) or []:
             games.extend(d.get("games", []) or [])
@@ -338,6 +292,63 @@ def _boxscore_for_game(game_pk) -> dict:
         return _api_get(f"/game/{game_pk}/boxscore")
     except Exception:
         return {}
+
+
+def _game_status_values(game: dict) -> str:
+    status = game.get("status") or {}
+    return " ".join(str(status.get(k) or "").lower() for k in ["abstractGameState", "codedGameState", "detailedState", "statusCode", "reason"])
+
+def _game_is_final(game: dict) -> bool:
+    values = _game_status_values(game)
+    if "final" in values or "game over" in values or "completed" in values:
+        return True
+    status = game.get("status") or {}
+    if str(status.get("statusCode") or "").upper() in {"F", "O"}:
+        return True
+    if str(status.get("codedGameState") or "").upper() in {"F", "O"}:
+        return True
+    live = _live_score_for_game(game.get("gamePk"))
+    return bool(live.get("is_final"))
+
+def _team_names_from_game(game: dict) -> tuple[str, str]:
+    teams = game.get("teams") or {}
+    away_name = (((teams.get("away") or {}).get("team") or {}).get("name")) or ""
+    home_name = (((teams.get("home") or {}).get("team") or {}).get("name")) or ""
+    if not away_name or not home_name:
+        live = _live_score_for_game(game.get("gamePk"))
+        away_name = away_name or live.get("away_name") or ""
+        home_name = home_name or live.get("home_name") or ""
+    return away_name, home_name
+
+def _game_label(game: dict) -> str:
+    away_name, home_name = _team_names_from_game(game)
+    return f"{away_name} @ {home_name}"
+
+def _find_game_for_pick(row: dict, target_date: str) -> dict | None:
+    team = str(row.get("team") or row.get("teamName") or "").strip()
+    opponent = str(row.get("opponent") or row.get("opponentTeam") or "").strip()
+    pick_text = str(row.get("pick") or "")
+    if not team and pick_text.endswith(" ML"):
+        team = pick_text.replace(" ML", "").strip()
+    team_norm = _norm_name(team)
+    opp_norm = _norm_name(opponent)
+    exact, loose = [], []
+    for game in _schedule_games_by_date(target_date):
+        away_name, home_name = _team_names_from_game(game)
+        names = {_norm_name(away_name), _norm_name(home_name)}
+        if team_norm and team_norm in names:
+            loose.append(game)
+            if opp_norm and opp_norm in names:
+                exact.append(game)
+    return exact[0] if exact else (loose[0] if loose else None)
+
+def _pending_if_game_not_final(row: dict, target_date: str) -> tuple[bool, str]:
+    game = _find_game_for_pick(row, target_date)
+    if not game:
+        return True, "Game not found yet; pending until matchup can be verified."
+    if not _game_is_final(game):
+        return True, f"{_game_label(game)} not final yet."
+    return False, ""
 
 
 def _iter_boxscore_players(game: dict, target_team: str | None = None):
@@ -444,6 +455,8 @@ def _grade_moneyline(row: dict, target_date: str) -> tuple[str, str]:
         home_name = ((home.get("team") or {}).get("name")) or ""
         if team_norm not in {_norm_name(away_name), _norm_name(home_name)}:
             continue
+        if not _game_is_final(game):
+            return "Pending", f"{away_name} @ {home_name} not final yet"
         live_score = _live_score_for_game(game.get("gamePk"))
         away_score = away.get("score") if away.get("score") is not None else live_score.get("away_score")
         home_score = home.get("score") if home.get("score") is not None else live_score.get("home_score")
@@ -462,6 +475,9 @@ def _grade_hitter(row: dict, target_date: str, season: int, mode: str) -> tuple[
     team = str(row.get("team") or row.get("teamName") or "").strip()
     if not player:
         return "Unable to Grade", "Missing player"
+    pending, reason = _pending_if_game_not_final(row, target_date)
+    if pending:
+        return "Pending", reason
     stat = _boxscore_player_stat_by_name(target_date, player, "batting", team_name=team)
     if stat is None:
         pid = row.get("playerId") or (_find_player_id_on_team(player, team, season) if team else None)
@@ -484,6 +500,9 @@ def _grade_k_prop(row: dict, target_date: str, season: int) -> tuple[str, str]:
     line = _parse_k_line(row)
     if line is None:
         return "Unable to Grade", "Could not determine K line from card text"
+    pending, reason = _pending_if_game_not_final(row, target_date)
+    if pending:
+        return "Pending", reason
     stat = _boxscore_player_stat_by_name(target_date, player, "pitching", team_name=team)
     if stat is None:
         pid = row.get("playerId") or (_find_player_id_on_team(player, team, season) if team else None)
@@ -621,6 +640,38 @@ def auto_grade_after_4am(season: int = 2026) -> dict:
     return grade_recent_slates_including_today(season=season, days_back=4)
 
 
+@app.get("/reset-results")
+def reset_results(start_date: str | None = None):
+    hist = _history_dir()
+    backup_dir = hist / "backup_results"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d_%H%M%S")
+    for name in ["performance_summary_latest.json", "results_history_latest.json", "results_history.jsonl"]:
+        src = hist / name
+        if src.exists():
+            try:
+                (backup_dir / f"{stamp}_{name}").write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+            except Exception:
+                pass
+            try:
+                src.unlink()
+            except Exception:
+                pass
+    if start_date:
+        start = dt.datetime.strptime(start_date, "%Y-%m-%d").date()
+        today = dt.datetime.now(ZoneInfo("America/New_York")).date()
+        results = []
+        d = start
+        while d <= today:
+            results.append(grade_date_results(d.strftime("%Y-%m-%d"), season=2026))
+            d += dt.timedelta(days=1)
+        return JSONResponse({"status": "ok", "message": "Results reset and regraded. Pregame/in-progress picks stay Pending and do not count as losses.", "start_date": start_date, "results": results})
+    empty_summary = _build_performance_summary([])
+    (hist / "performance_summary_latest.json").write_text(json.dumps(empty_summary, indent=2), encoding="utf-8")
+    (hist / "results_history_latest.json").write_text(json.dumps({"graded_rows": 0, "rows": []}, indent=2), encoding="utf-8")
+    return JSONResponse({"status": "ok", "message": "Results reset. No dates regraded."})
+
+
 @app.get("/latest")
 def latest():
     return JSONResponse(load_latest_data())
@@ -662,27 +713,18 @@ def refresh_data():
 
         is_refreshing = True
         start_time = time.time()
-        now_et = dt.datetime.now(ZoneInfo("America/New_York"))
-        today = now_et.strftime("%Y-%m-%d")
-        slate_date = active_slate_date(now_et)
+        today = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
         try:
-            # Before 4 AM ET, do NOT build the new calendar day's card.
-            # Only grade recent completed slates and keep displaying the prior active slate.
-            if now_et.hour >= 4:
-                run_model_main(2026, slate_date)
-                model_message = "model built for active slate"
-            else:
-                model_message = "before 4 AM ET: skipped model rebuild to protect prior slate"
-
+            # First build/lock today's latest cards.
+            # Then grade today + recent slates so completed games immediately appear in Results.
+            run_model_main(2026, today)
             auto_grade_result = grade_recent_slates_including_today(season=2026, days_back=4)
             duration = round(time.time() - start_time, 2)
             return JSONResponse({
                 "status": "ok",
                 "message": "Data refreshed and results checked",
-                "date": slate_date,
-                "calendar_date": today,
-                "model_message": model_message,
+                "date": today,
                 "timezone": "America/New_York",
                 "duration_seconds": duration,
                 "auto_grade": auto_grade_result,
