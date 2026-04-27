@@ -1298,6 +1298,152 @@ def build_pitcher_line_value(pitcher_metrics):
     return pd.DataFrame(rows, columns=cols).sort_values(["projected_k_mid","pitcher_score_adj"], ascending=False).reset_index(drop=True)
 
 
+
+def _first_existing_column(df: pd.DataFrame, candidates: list[str]):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _norm_merge_text(v) -> str:
+    if v is None:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", str(v).strip().lower())
+
+
+def load_posted_k_lines(target_date: str) -> pd.DataFrame:
+    """
+    Optional sportsbook K-line input.
+
+    To allow K props on the Final Card, add one of these CSVs to the output folder:
+      - k_lines_YYYY-MM-DD.csv
+      - posted_k_lines_YYYY-MM-DD.csv
+      - k_lines.csv
+      - posted_k_lines.csv
+
+    Accepted columns include:
+      pitcherName / pitcher / player / playerName
+      teamName / team
+      opponentTeam / opponent
+      posted_k_line / k_line / line / strikeout_line
+      book / sportsbook / source
+
+    If no verified posted line is supplied, K props stay in Research but are blocked
+    from the official Final Card. This prevents fake edges like model 5.5 vs real 7.5.
+    """
+    configured = os.getenv("HR_K_LINES_CSV")
+    candidates = []
+    if configured:
+        candidates.append(Path(configured))
+    candidates.extend([
+        OUTPUT_DIR / f"k_lines_{target_date}.csv",
+        OUTPUT_DIR / f"posted_k_lines_{target_date}.csv",
+        OUTPUT_DIR / "k_lines.csv",
+        OUTPUT_DIR / "posted_k_lines.csv",
+    ])
+
+    path = next((p for p in candidates if p and p.exists()), None)
+    empty_cols = ["pitcherName", "teamName", "opponentTeam", "posted_k_line", "posted_k_book", "posted_k_source", "_pitcher_key", "_team_key"]
+    if path is None:
+        print_step("⚠️ No posted K-line CSV found. K props will be blocked from Final Card unless verified lines are added.")
+        return pd.DataFrame(columns=empty_cols)
+
+    try:
+        raw = pd.read_csv(path)
+    except Exception as e:
+        print_step(f"⚠️ Could not read K-line CSV {path}: {e}. K props will be blocked from Final Card.")
+        return pd.DataFrame(columns=empty_cols)
+
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    pitcher_col = _first_existing_column(raw, ["pitcherName", "pitcher", "player", "playerName", "name"])
+    team_col = _first_existing_column(raw, ["teamName", "team", "pitcherTeam"])
+    opp_col = _first_existing_column(raw, ["opponentTeam", "opponent", "opp", "opponentName"])
+    line_col = _first_existing_column(raw, ["posted_k_line", "k_line", "line", "strikeout_line", "strikeouts_line", "so_line"])
+    book_col = _first_existing_column(raw, ["book", "sportsbook", "source"])
+
+    if pitcher_col is None or line_col is None:
+        print_step(f"⚠️ K-line CSV {path} is missing pitcher/line columns. K props will be blocked from Final Card.")
+        return pd.DataFrame(columns=empty_cols)
+
+    out = pd.DataFrame()
+    out["pitcherName"] = raw[pitcher_col].astype(str)
+    out["teamName"] = raw[team_col].astype(str) if team_col else ""
+    out["opponentTeam"] = raw[opp_col].astype(str) if opp_col else ""
+    out["posted_k_line"] = pd.to_numeric(raw[line_col], errors="coerce")
+    out["posted_k_book"] = raw[book_col].astype(str) if book_col else "manual_csv"
+    out["posted_k_source"] = str(path)
+    out = out[out["posted_k_line"].notna()].copy()
+    out["_pitcher_key"] = out["pitcherName"].apply(_norm_merge_text)
+    out["_team_key"] = out["teamName"].apply(_norm_merge_text)
+    out = out.drop_duplicates(subset=["_pitcher_key", "_team_key"], keep="last")
+    print_step(f"✅ Loaded posted K lines from {path}: {len(out)} verified lines")
+    return out
+
+
+def apply_posted_k_line_gate(pitcher_line_value: pd.DataFrame, target_date: str) -> pd.DataFrame:
+    """
+    Add real posted-line verification to pitcher_line_value.
+    K props can still appear in Research, but Final Card requires k_final_card_ok == True.
+    """
+    if pitcher_line_value is None:
+        return pitcher_line_value
+    df = pitcher_line_value.copy()
+    if df.empty:
+        for c in ["posted_k_line", "posted_k_book", "posted_k_source", "posted_line_status", "k_final_card_ok"]:
+            df[c] = []
+        return df
+
+    df["_pitcher_key"] = df["pitcherName"].apply(_norm_merge_text) if "pitcherName" in df.columns else ""
+    df["_team_key"] = df["teamName"].apply(_norm_merge_text) if "teamName" in df.columns else ""
+
+    lines = load_posted_k_lines(target_date)
+    if lines.empty:
+        df["posted_k_line"] = None
+        df["posted_k_book"] = ""
+        df["posted_k_source"] = ""
+        df["posted_line_status"] = "Missing posted K line - blocked from Final Card"
+        df["k_final_card_ok"] = False
+    else:
+        df = df.merge(
+            lines[["_pitcher_key", "_team_key", "posted_k_line", "posted_k_book", "posted_k_source"]],
+            on=["_pitcher_key", "_team_key"],
+            how="left",
+        )
+
+        missing = df["posted_k_line"].isna()
+        if missing.any():
+            pitcher_only = lines.drop_duplicates(subset=["_pitcher_key"], keep="last")[["_pitcher_key", "posted_k_line", "posted_k_book", "posted_k_source"]]
+            fallback = df.loc[missing, ["_pitcher_key"]].merge(pitcher_only, on="_pitcher_key", how="left")
+            for col in ["posted_k_line", "posted_k_book", "posted_k_source"]:
+                df.loc[missing, col] = fallback[col].values
+
+        model_max = pd.to_numeric(df.get("max_playable_k_line"), errors="coerce")
+        posted = pd.to_numeric(df.get("posted_k_line"), errors="coerce")
+        df["k_final_card_ok"] = posted.notna() & model_max.notna() & (posted <= model_max)
+
+        def _status(row):
+            p = row.get("posted_k_line")
+            m = row.get("max_playable_k_line")
+            try:
+                p_num = float(p)
+            except Exception:
+                return "Missing posted K line - blocked from Final Card"
+            try:
+                m_num = float(m)
+            except Exception:
+                return f"Posted line {p_num:g}; no model max line - blocked from Final Card"
+            if p_num <= m_num:
+                return f"Verified posted line {p_num:g} <= model max {m_num:g} - eligible"
+            return f"Posted line {p_num:g} > model max {m_num:g} - blocked from Final Card"
+
+        df["posted_line_status"] = df.apply(_status, axis=1)
+
+    df = df.drop(columns=[c for c in ["_pitcher_key", "_team_key"] if c in df.columns], errors="ignore")
+    return df
+
 def build_daily_card(game_rankings, refined_picks, pitcher_line_value, hr_drought):
     rows = []
     used_teams = set()
@@ -1509,6 +1655,10 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
             ("opp_k_matchup_bonus", 0),
             ("opp_team_k_tendency", "Unknown"),
             ("pitcher_score_adj", 0),
+            ("posted_k_line", None),
+            ("posted_line_status", "Missing posted K line - blocked from Final Card"),
+            ("posted_k_book", ""),
+            ("k_final_card_ok", False),
         ]:
             if c not in kdf.columns:
                 kdf[c] = default
@@ -1520,6 +1670,8 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
             (kdf["starter_status"] == "Confirmed") &
             (~kdf["short_leash_flag"].astype(str).str.startswith("Yes", na=False)) &
             (kdf["k_value_tier"].isin(["Hammer", "Strong"])) &
+            (kdf["k_final_card_ok"].fillna(False) == True) &
+            (kdf["posted_k_line"].notna()) &
             (kdf["k_line_num"].notna()) &
             (pd.to_numeric(kdf["k_buffer"], errors="coerce").fillna(-99) >= 1.0) &
             (pd.to_numeric(kdf["avg_ip_per_start"], errors="coerce").fillna(0) >= 5.2) &
@@ -1536,7 +1688,7 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
             add_row(
                 f"Pitch {1}", "K Prop", r["pitcherName"], r["teamName"], r["opponentTeam"],
                 "A" if r["k_value_tier"] == "Hammer" else "B",
-                f"{r['recommended_k_action']}; projected {r['projected_k_floor']}-{r['projected_k_ceiling']} Ks; cushion {r['k_buffer']:.1f} over line",
+                f"Posted line {float(r.get('posted_k_line')):g} verified ({r.get('posted_k_book') or 'source'}); model max {r['max_playable_k_line']}; projected {r['projected_k_floor']}-{r['projected_k_ceiling']} Ks; cushion {r['k_buffer']:.1f}",
                 "Pitcher_Line_Value"
             )
             break
@@ -1602,6 +1754,7 @@ def main(season: int, target_date: str):
     player_rows = enrich_player_rows_with_team_context(player_rows, pitcher_metrics, team_context_df)
     pitcher_metrics = enrich_pitcher_metrics_with_team_context(pitcher_metrics, team_context_df)
     pitcher_line_value = build_pitcher_line_value(pitcher_metrics)
+    pitcher_line_value = apply_posted_k_line_gate(pitcher_line_value, target_date)
     game_rankings = build_game_rankings(schedule_rows, player_rows, player_rows, pitcher_metrics)
 
     # Final Card protection: only generate actionable picks from games that have NOT started.
