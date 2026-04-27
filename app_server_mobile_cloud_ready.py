@@ -40,6 +40,33 @@ def resolve_storage_dir() -> Path:
 OUTPUT_DIR = resolve_storage_dir()
 
 
+def active_slate_date(now_et=None) -> str:
+    """Slate day runs from 4:00 AM ET to 3:59 AM ET the next calendar day.
+
+    Before 4 AM ET, the active slate is yesterday. This prevents midnight refreshes
+    from replacing late-night slate cards before the user's 4 AM lock expires.
+    """
+    if now_et is None:
+        now_et = dt.datetime.now(ZoneInfo("America/New_York"))
+    if now_et.tzinfo is None:
+        now_et = now_et.replace(tzinfo=ZoneInfo("America/New_York"))
+    if now_et.hour < 4:
+        return (now_et.date() - dt.timedelta(days=1)).strftime("%Y-%m-%d")
+    return now_et.date().strftime("%Y-%m-%d")
+
+
+def get_latest_json_file_for_date(target_date: str):
+    patterns = [
+        "HR_Hit_Drought_v41_appdata-*.json",
+        "HR_Hit_Drought_v40_appdata-*.json",
+    ]
+    files = []
+    for pat in patterns:
+        files.extend([p for p in OUTPUT_DIR.glob(pat) if target_date in p.name])
+    files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0] if files else None
+
+
 def get_latest_json_file():
     patterns = [
         "HR_Hit_Drought_v41_appdata-*.json",
@@ -66,7 +93,8 @@ def read_json_file(path: Path, default):
 
 def load_latest_data():
     history_dir = OUTPUT_DIR / "history"
-    latest = get_latest_json_file()
+    active_date = active_slate_date()
+    latest = get_latest_json_file_for_date(active_date) or get_latest_json_file()
 
     if latest and latest.exists():
         with open(latest, "r", encoding="utf-8") as f:
@@ -93,15 +121,31 @@ def load_latest_data():
         saved_label = snapshot.get("saved_at_et")
         display = saved_label
 
-    frozen_latest = read_json_file(history_dir / "final_card_by_date_latest.json", {})
-    frozen_rows = frozen_latest.get("rows") or []
-    frozen_date = frozen_latest.get("target_date")
+    # Overlay locked Final Card / Refined Picks for the active slate.
+    # This is the key display guard: before 4 AM ET, active_date is yesterday,
+    # so the app keeps showing yesterday's locked slate even if a 12 AM run created today's file.
+    final_by_date = read_json_file(history_dir / "final_card_by_date.json", {})
+    refined_by_date = read_json_file(history_dir / "refined_picks_by_date.json", {})
 
-    data_date = str(data.get("date")) if data.get("date") else None
-    if frozen_rows and frozen_date and (data_date is None or frozen_date == data_date):
-        data["final_card"] = {"generated_section": "final_card", "plays": frozen_rows}
-        if not data.get("date"):
-            data["date"] = frozen_date
+    final_locked = final_by_date.get(active_date) if isinstance(final_by_date, dict) else None
+    refined_locked = refined_by_date.get(active_date) if isinstance(refined_by_date, dict) else None
+
+    final_rows = (final_locked or {}).get("rows") or []
+    refined_rows = (refined_locked or {}).get("rows") or []
+
+    if final_rows:
+        data["final_card"] = {"generated_section": "final_card", "plays": final_rows}
+        data.setdefault("research", {})
+        if isinstance(data["research"], dict):
+            data["research"]["final_card"] = final_rows
+        data["date"] = active_date
+
+    if refined_rows:
+        data.setdefault("research", {})
+        if isinstance(data["research"], dict):
+            data["research"]["refined_picks"] = refined_rows
+        data["refined_picks"] = refined_rows
+        data["date"] = active_date
 
     data["results"] = read_json_file(history_dir / "performance_summary_latest.json", {"overall": {}, "by_bet_type": [], "by_confidence": [], "recent_results": []})
     data["results_latest"] = read_json_file(history_dir / "results_history_latest.json", {"graded_rows": 0, "rows": []})
@@ -145,6 +189,8 @@ def load_latest_data():
         "filename": filename,
         "path": path_str,
         "last_updated_display": display,
+        "active_slate_date": active_date,
+        "slate_lock_note": "Before 4 AM ET the app displays/protects the prior slate.",
         "eastern_now": eastern_now.strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ") if eastern_now else None,
     }
     return data
@@ -616,18 +662,27 @@ def refresh_data():
 
         is_refreshing = True
         start_time = time.time()
-        today = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+        now_et = dt.datetime.now(ZoneInfo("America/New_York"))
+        today = now_et.strftime("%Y-%m-%d")
+        slate_date = active_slate_date(now_et)
 
         try:
-            # First build/lock today's latest cards.
-            # Then grade today + recent slates so completed games immediately appear in Results.
-            run_model_main(2026, today)
+            # Before 4 AM ET, do NOT build the new calendar day's card.
+            # Only grade recent completed slates and keep displaying the prior active slate.
+            if now_et.hour >= 4:
+                run_model_main(2026, slate_date)
+                model_message = "model built for active slate"
+            else:
+                model_message = "before 4 AM ET: skipped model rebuild to protect prior slate"
+
             auto_grade_result = grade_recent_slates_including_today(season=2026, days_back=4)
             duration = round(time.time() - start_time, 2)
             return JSONResponse({
                 "status": "ok",
                 "message": "Data refreshed and results checked",
-                "date": today,
+                "date": slate_date,
+                "calendar_date": today,
+                "model_message": model_message,
                 "timezone": "America/New_York",
                 "duration_seconds": duration,
                 "auto_grade": auto_grade_result,
