@@ -1446,7 +1446,49 @@ function renderResults() {
   const overall = results.overall || {};
   const byType = Array.isArray(results.by_bet_type) ? results.by_bet_type : [];
   const byConf = Array.isArray(results.by_confidence) ? results.by_confidence : [];
+  const byCardType = Array.isArray(results.by_card_type) ? results.by_card_type : [];
   const recent = Array.isArray(results.recent_results) ? results.recent_results : [];
+
+  function pctText(v) {
+    return v !== undefined && v !== null ? esc((Number(v) * 100).toFixed(1) + '%') : '—';
+  }
+
+  function cardSummary(cardType) {
+    const rows = recent.filter(r => String(r.card_type || '') === cardType && ['Win', 'Loss'].includes(String(r.result_status || '')));
+    const wins = rows.filter(r => r.result_status === 'Win').length;
+    const losses = rows.filter(r => r.result_status === 'Loss').length;
+    const total = wins + losses;
+    return { total, wins, losses, winRate: total ? wins / total : null };
+  }
+
+  function summaryCard(title, cardType, note) {
+    const s = cardSummary(cardType);
+    return `<div class="card">
+      <h2>${esc(title)}</h2>
+      <div class="line"><span class="label">Graded Picks:</span> ${esc(fmt(s.total))}</div>
+      <div class="line"><span class="label">Wins:</span> ${esc(fmt(s.wins))}</div>
+      <div class="line"><span class="label">Losses:</span> ${esc(fmt(s.losses))}</div>
+      <div class="line"><span class="label">Win Rate:</span> ${s.winRate !== null ? esc((s.winRate * 100).toFixed(1) + '%') : '—'}</div>
+      <div class="muted">${esc(note)}</div>
+    </div>`;
+  }
+
+  function tableRowsFor(cardType) {
+    return recent.filter(r => String(r.card_type || '') === cardType);
+  }
+
+  function resultsTable(title, rows) {
+    return `<div class="table-shell" style="margin-top:18px;">
+      <h2 style="margin-top:0;">${esc(title)}</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Date</th><th>Card</th><th>Bet Type</th><th>Pick</th><th>Team</th><th>Opponent</th><th>Confidence</th><th>Result</th><th class="wrap">Detail</th></tr></thead>
+        <tbody>
+        ${rows.map(r => `<tr><td>${esc(fmt(r.target_date))}</td><td>${esc(fmt(r.card_type || 'Unknown'))}</td><td>${esc(fmt(r.bet_type))}</td><td>${esc(fmt(r.pick))}</td><td>${esc(fmt(r.team))}</td><td>${esc(fmt(r.opponent))}</td><td>${esc(fmt(r.confidence))}</td><td>${esc(fmt(r.result_status))}</td><td class="wrap">${esc(fmt(r.result_detail))}</td></tr>`).join("") || '<tr><td colspan="9">No graded picks yet.</td></tr>'}
+        </tbody>
+      </table></div>
+    </div>`;
+  }
+
   mount.innerHTML = `
     <div class="cards">
       <div class="card"><h2>Overall Performance</h2>
@@ -1456,29 +1498,39 @@ function renderResults() {
         <div class="line"><span class="label">Win Rate:</span> ${overall.win_rate !== undefined && overall.win_rate !== null ? esc((overall.win_rate * 100).toFixed(1) + '%') : '—'}</div>
       </div>
       <div class="card"><h2>What This Is For</h2>
-        <div class="line">This tab tracks how saved picks perform over time so you can see what the model does well and where it needs tightening.</div>
+        <div class="line">Final Card = official top-card plays. Refined Picks = broader model/research plays. They are now tracked separately.</div>
       </div>
     </div>
+
     <div class="cards" style="margin-top:18px;">
+      ${summaryCard('Final Card Results', 'Final Card', 'Official card picks only.')}
+      ${summaryCard('Refined Picks Results', 'Refined Picks', 'Broader research/model picks only.')}
+    </div>
+
+    <div class="cards" style="margin-top:18px;">
+      <div class="table-shell">
+        <h2 style="margin-top:0;">By Card Type</h2>
+        <div class="table-wrap"><table><thead><tr><th>Card Type</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
+        ${byCardType.map(r => `<tr><td>${esc(fmt(r.card_type))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${pctText(r.win_rate)}</td></tr>`).join("") || '<tr><td colspan="5">No card-type results yet.</td></tr>'}
+        </tbody></table></div>
+      </div>
       <div class="table-shell">
         <h2 style="margin-top:0;">By Bet Type</h2>
         <div class="table-wrap"><table><thead><tr><th>Bet Type</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
-        ${byType.map(r => `<tr><td>${esc(fmt(r.bet_type))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${r.win_rate !== undefined && r.win_rate !== null ? esc((Number(r.win_rate) * 100).toFixed(1) + '%') : '—'}</td></tr>`).join("") || '<tr><td colspan="5">No graded results yet.</td></tr>'}
+        ${byType.map(r => `<tr><td>${esc(fmt(r.bet_type))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${pctText(r.win_rate)}</td></tr>`).join("") || '<tr><td colspan="5">No graded results yet.</td></tr>'}
         </tbody></table></div>
       </div>
       <div class="table-shell">
         <h2 style="margin-top:0;">By Confidence</h2>
         <div class="table-wrap"><table><thead><tr><th>Confidence</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
-        ${byConf.map(r => `<tr><td>${esc(fmt(r.confidence))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${r.win_rate !== undefined && r.win_rate !== null ? esc((Number(r.win_rate) * 100).toFixed(1) + '%') : '—'}</td></tr>`).join("") || '<tr><td colspan="5">No confidence-level results yet.</td></tr>'}
+        ${byConf.map(r => `<tr><td>${esc(fmt(r.confidence))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${pctText(r.win_rate)}</td></tr>`).join("") || '<tr><td colspan="5">No confidence-level results yet.</td></tr>'}
         </tbody></table></div>
       </div>
     </div>
-    <div class="table-shell" style="margin-top:18px;">
-      <h2 style="margin-top:0;">Recent Graded Picks</h2>
-      <div class="table-wrap"><table><thead><tr><th>Date</th><th>Bet Type</th><th>Pick</th><th>Team</th><th>Opponent</th><th>Confidence</th><th>Result</th><th class="wrap">Detail</th></tr></thead><tbody>
-      ${recent.map(r => `<tr><td>${esc(fmt(r.target_date))}</td><td>${esc(fmt(r.bet_type))}</td><td>${esc(fmt(r.pick))}</td><td>${esc(fmt(r.team))}</td><td>${esc(fmt(r.opponent))}</td><td>${esc(fmt(r.confidence))}</td><td>${esc(fmt(r.result_status))}</td><td class="wrap">${esc(fmt(r.result_detail))}</td></tr>`).join("") || '<tr><td colspan="8">No graded picks yet.</td></tr>'}
-      </tbody></table></div>
-    </div>
+
+    ${resultsTable('Final Card Graded Picks', tableRowsFor('Final Card'))}
+    ${resultsTable('Refined Picks Graded Picks', tableRowsFor('Refined Picks'))}
+    ${resultsTable('All Recent Graded Picks', recent)}
   `;
 }
 
