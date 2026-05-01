@@ -1163,6 +1163,14 @@ def build_game_rankings(schedule_rows, hr_rows, hit_rows, pitcher_metrics):
         return df
     gm = df.groupby("game")["team_score"].transform("mean")
     df["edge_vs_opponent"] = (df["team_score"] - (gm * 2 - df["team_score"])).round(3)
+
+    # Added for Final Card ML quality control:
+    # compare the team offense and total team score directly against the opponent.
+    # This helps prevent ML plays where the pitcher edge is good but the opponent offense/game environment is too dangerous.
+    df["opponent_offense_score"] = (df.groupby("game")["offense_score"].transform("sum") - df["offense_score"]).round(3)
+    df["offense_advantage"] = (df["offense_score"] - df["opponent_offense_score"]).round(3)
+    df["opponent_team_score"] = (df.groupby("game")["team_score"].transform("sum") - df["team_score"]).round(3)
+
     def classify(row):
         edge = nz(row.get("edge_vs_opponent"))
         offense = nz(row.get("offense_score"))
@@ -1581,30 +1589,45 @@ def build_daily_card(game_rankings, refined_picks, pitcher_line_value, hr_drough
 
 def build_final_card(player_rows, game_rankings, pitcher_line_value):
     """
-    Smart Gates Final Card.
+    Final Card Tightening Patch.
 
-    ML and K Props stay eligible, but only when they pass stricter validity gates.
-    Hits keep the reliability filters. HRs are allowed only as a strict small Power play.
+    Goal: Final Card = official top-card plays only.
+    - ML stays eligible, but only as a true A-grade spot.
+    - K props stay eligible, but only with posted-line verification and a real cushion.
+    - Hit picks stay eligible, but only with confirmed lineup + high-floor signals.
+    - HR stays eligible only as a rare strict Power play.
     """
     cols = ["slot","bet_type","pick","team","opponent","confidence","why_it_made_the_card","source_tab"]
     rows = []
     used_players = set()
     team_counts = {}
 
-    def can_use_team(team, limit=2):
+    def can_use_team(team, limit=1):
+        # Final Card should avoid overexposure. Default = 1 official play per team.
         return team_counts.get(team, 0) < limit
 
     def add_row(slot, bet_type, pick, team, opponent, confidence, why, source_tab):
-        rows.append({"slot": slot, "bet_type": bet_type, "pick": pick, "team": team, "opponent": opponent,
-                     "confidence": confidence, "why_it_made_the_card": why, "source_tab": source_tab})
+        rows.append({
+            "slot": slot,
+            "bet_type": bet_type,
+            "pick": pick,
+            "team": team,
+            "opponent": opponent,
+            "confidence": confidence,
+            "why_it_made_the_card": why,
+            "source_tab": source_tab,
+        })
         team_counts[team] = team_counts.get(team, 0) + 1
         used_players.add((team, pick))
 
-    # Moneyline: allowed, but only with real edge + pitcher advantage + low volatility.
+    # -----------------------------
+    # 1) MONEYLINE: A-grade only
+    # -----------------------------
     if game_rankings is not None and not game_rankings.empty:
         gr = game_rankings.copy()
         for c, default in [
-            ("edge_vs_opponent", 0), ("team_score", 0), ("offense_score", 0),
+            ("edge_vs_opponent", 0), ("team_score", 0), ("opponent_team_score", 0),
+            ("offense_score", 0), ("opponent_offense_score", 0), ("offense_advantage", 0),
             ("pitcher_score_adj", 0), ("opponent_pitcher_score_adj", 0),
             ("volatility_penalty_ml", 0), ("public_penalty_ml", 0),
             ("team_volatility", 1.0), ("public_bias", 1.0),
@@ -1614,40 +1637,63 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
         ]:
             if c not in gr.columns:
                 gr[c] = default
-        for c in ["edge_vs_opponent", "team_score", "offense_score", "pitcher_score_adj", "opponent_pitcher_score_adj",
-                  "volatility_penalty_ml", "public_penalty_ml", "team_volatility", "public_bias"]:
+
+        numeric_cols = [
+            "edge_vs_opponent", "team_score", "opponent_team_score",
+            "offense_score", "opponent_offense_score", "offense_advantage",
+            "pitcher_score_adj", "opponent_pitcher_score_adj",
+            "volatility_penalty_ml", "public_penalty_ml", "team_volatility", "public_bias",
+        ]
+        for c in numeric_cols:
             gr[c] = pd.to_numeric(gr[c], errors="coerce").fillna(0 if c not in ("team_volatility", "public_bias") else 1.0)
+
         gr["pitcher_advantage"] = gr["pitcher_score_adj"] - gr["opponent_pitcher_score_adj"]
         gr["venue_text"] = gr["venue"].astype(str).str.lower()
 
-        allowed_labels = {"Moneyline Lean", "Stack Spot"}
-        own_pitcher_ok = {"Strong SP", "K Upside"}
-        opponent_ok = {"Attack With Hitters", "Short Leash Risk", "Low Sample", "Neutral"}
         dangerous_venues = ["mexico", "coors"]
+
+        # Very strict ML rule. This removes pitcher-only leans and keeps only dominant all-around spots.
         ml_pool = gr[
-            (gr["recommended_play"].astype(str).isin(allowed_labels)) &
-            (gr["pitcher_pick_type"].astype(str).isin(own_pitcher_ok)) &
-            (gr["opponent_pitcher_pick_type"].astype(str).isin(opponent_ok)) &
+            (gr["recommended_play"].astype(str).isin(["Moneyline Lean", "Stack Spot"])) &
+            (gr["pitcher_pick_type"].astype(str).eq("Strong SP")) &
+            (gr["opponent_pitcher_pick_type"].astype(str).isin(["Short Leash Risk", "Attack With Hitters", "Low Sample"])) &
             (~gr["short_leash_flag"].astype(str).str.startswith("Yes", na=False)) &
-            (gr["edge_vs_opponent"] >= 3.0) &
-            (gr["team_score"] >= 3.0) &
-            (gr["offense_score"] >= 2.0) &
-            (gr["pitcher_advantage"] >= 1.25) &
-            (gr["volatility_penalty_ml"] <= 0.35) &
-            (gr["public_penalty_ml"] <= 0.35) &
-            (gr["team_volatility"] <= 1.15) &
+            (gr["edge_vs_opponent"] >= 5.0) &
+            (gr["team_score"] >= 4.0) &
+            (gr["team_score"] > gr["opponent_team_score"]) &
+            (gr["offense_score"] >= 2.3) &
+            (gr["offense_advantage"] >= -0.25) &
+            (gr["pitcher_advantage"] >= 2.5) &
+            (gr["volatility_penalty_ml"] <= 0.25) &
+            (gr["public_penalty_ml"] <= 0.25) &
+            (gr["team_volatility"] <= 1.12) &
             (~gr["venue_text"].apply(lambda v: any(x in v for x in dangerous_venues)))
         ].copy()
-        ml_pool = ml_pool[(ml_pool["opponent_pitcher_pick_type"].astype(str) != "Neutral") |
-                          ((ml_pool["edge_vs_opponent"] >= 4.0) & (ml_pool["pitcher_advantage"] >= 2.0))].copy()
-        if not ml_pool.empty:
-            best = ml_pool.sort_values(["edge_vs_opponent", "pitcher_advantage", "team_score"], ascending=[False, False, False]).iloc[0]
-            add_row("Core 1", "Moneyline", f"{best['teamName']} ML", best["teamName"], best["opponentTeam"],
-                    "A" if best["edge_vs_opponent"] >= 4.0 and best["pitcher_advantage"] >= 2.0 else "B",
-                    f"ML smart gate passed; edge {best['edge_vs_opponent']}; pitcher advantage {best['pitcher_advantage']:.2f}; {best['pitcher_pick_type']} vs {best['opponent_pitcher_pick_type']}; vol pen {best['volatility_penalty_ml']}; public pen {best['public_penalty_ml']}",
-                    "Game_Rankings")
 
-    # 1+ Hit: stricter reliability filter, but still allowed to produce a clean Final Card.
+        if not ml_pool.empty:
+            best = ml_pool.sort_values(
+                ["edge_vs_opponent", "pitcher_advantage", "offense_advantage", "team_score"],
+                ascending=[False, False, False, False],
+            ).iloc[0]
+            add_row(
+                "Core 1",
+                "Moneyline",
+                f"{best['teamName']} ML",
+                best["teamName"],
+                best["opponentTeam"],
+                "A",
+                (
+                    f"A-only ML gate passed; edge {best['edge_vs_opponent']}; "
+                    f"pitcher advantage {best['pitcher_advantage']:.2f}; offense adv {best['offense_advantage']:.2f}; "
+                    f"{best['pitcher_pick_type']} vs {best['opponent_pitcher_pick_type']}; "
+                    f"vol pen {best['volatility_penalty_ml']}; public pen {best['public_penalty_ml']}"
+                ),
+                "Game_Rankings",
+            )
+
+    # -----------------------------
+    # 2) 1+ HIT: A-grade only for Final Card
+    # -----------------------------
     if player_rows is not None and not player_rows.empty:
         base = player_rows.copy()
         base = base[base["auto_pitcher_name"].notna()].copy() if "auto_pitcher_name" in base.columns else base
@@ -1655,97 +1701,153 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
             base["opponent_pitcher_pick_type"] = "Neutral"
         else:
             base["opponent_pitcher_pick_type"] = base["opponent_pitcher_pick_type"].fillna("Neutral")
-        for c, default in [("Hit_score", 0), ("HR_score", 0), ("batting_order_slot", 99), ("season_hit_pct", 0),
-                           ("hit_pct_last_10", 0), ("team_volatility", 1.0), ("homeRuns", 0), ("avg_games_between_hrs", 99)]:
+
+        for c, default in [
+            ("Hit_score", 0), ("HR_score", 0), ("batting_order_slot", 99),
+            ("season_hit_pct", 0), ("hit_pct_last_10", 0), ("team_volatility", 1.0),
+            ("homeRuns", 0), ("avg_games_between_hrs", 99),
+        ]:
             if c not in base.columns:
                 base[c] = default
             base[c] = pd.to_numeric(base[c], errors="coerce").fillna(default)
-        for c, default in [("starter_only_flag", False), ("opp_bullpen_grade", "Unknown"),
-                           ("team_k_tendency", "Unknown"), ("park_favorability", "Neutral")]:
+
+        for c, default in [
+            ("starter_only_flag", False), ("opp_bullpen_grade", "Unknown"),
+            ("team_k_tendency", "Unknown"), ("park_favorability", "Neutral"),
+        ]:
             if c not in base.columns:
                 base[c] = default
+
         base["lineup_ok"] = base["starter_only_flag"].fillna(False)
         base["slot_num"] = pd.to_numeric(base.get("batting_order_slot"), errors="coerce").fillna(99)
 
         hit_pool = base[
-            (base["lineup_ok"] == True) & (base["Hit_score"] >= 4.55) & (base["slot_num"] <= 5) &
-            (base["season_hit_pct"] >= 22.5) & (base["hit_pct_last_10"] >= 50.0) &
-            (~base["opponent_pitcher_pick_type"].astype(str).isin(["Strong SP"])) &
-            (~base["opp_bullpen_grade"].astype(str).isin(["Strong"])) & (base["team_volatility"] <= 1.25)
+            (base["lineup_ok"] == True) &
+            (base["Hit_score"] >= 4.80) &
+            (base["slot_num"] <= 3) &
+            (base["season_hit_pct"] >= 23.5) &
+            (base["hit_pct_last_10"] >= 60.0) &
+            (~base["opponent_pitcher_pick_type"].astype(str).isin(["Strong SP", "K Upside"])) &
+            (~base["opp_bullpen_grade"].astype(str).isin(["Strong"])) &
+            (base["team_volatility"] <= 1.15)
         ].copy().sort_values(["Hit_score", "slot_num", "season_hit_pct"], ascending=[False, True, False])
+
         hit_added = 0
         for _, r in hit_pool.iterrows():
-            if hit_added >= 3:
+            if hit_added >= 2:
                 break
-            if (r["teamName"], r["playerName"]) in used_players or not can_use_team(r["teamName"], 2):
+            if (r["teamName"], r["playerName"]) in used_players or not can_use_team(r["teamName"], 1):
                 continue
-            if team_counts.get(r["teamName"], 0) >= 1 and r.get("Hit_score", 0) < 4.85:
-                continue
-            conf = "A" if (r.get("Hit_score", 0) >= 4.75 and r.get("slot_num", 99) <= 3) else "B"
-            add_row(f"Core {len(rows)+1}", "1+ Hit", r["playerName"], r["teamName"], r.get("opponentTeam"), conf,
-                    f"Hit_score {r['Hit_score']:.3f}; slot {int(r['slot_num'])}; season hit% {r.get('season_hit_pct')}; last10 hit% {r.get('hit_pct_last_10')}; opp {r.get('opponent_pitcher_pick_type')}; park {r.get('park_favorability')}",
-                    "Refined_Picks")
+            add_row(
+                f"Core {len(rows)+1}",
+                "1+ Hit",
+                r["playerName"],
+                r["teamName"],
+                r.get("opponentTeam"),
+                "A",
+                (
+                    f"A-only hit gate; Hit_score {r['Hit_score']:.3f}; slot {int(r['slot_num'])}; "
+                    f"season hit% {r.get('season_hit_pct')}; last10 hit% {r.get('hit_pct_last_10')}; "
+                    f"opp {r.get('opponent_pitcher_pick_type')}; park {r.get('park_favorability')}"
+                ),
+                "Refined_Picks",
+            )
             hit_added += 1
 
-        # HR remains eligible, but only as a strict small Power play.
+        # HR remains eligible but only rare/strict. Confidence B, small-stake only.
         hr_pool = base[
-            (base["lineup_ok"] == True) & (base["HR_score"] >= 6.75) & (base["slot_num"] <= 4) &
+            (base["lineup_ok"] == True) &
+            (base["HR_score"] >= 7.00) &
+            (base["slot_num"] <= 4) &
             (base["park_favorability"].astype(str) == "Favorable") &
             (base["opponent_pitcher_pick_type"].astype(str).isin(["Short Leash Risk", "Attack With Hitters", "Low Sample"])) &
-            ((base["homeRuns"] >= 5) | (base["avg_games_between_hrs"] <= 3.0))
+            ((base["homeRuns"] >= 6) | (base["avg_games_between_hrs"] <= 2.75))
         ].copy().sort_values(["HR_score", "slot_num", "homeRuns"], ascending=[False, True, False])
+
         for _, r in hr_pool.iterrows():
-            if not can_use_team(r["teamName"], 2) or (r["teamName"], r["playerName"]) in used_players:
+            if not can_use_team(r["teamName"], 1) or (r["teamName"], r["playerName"]) in used_players:
                 continue
-            add_row("Power 1", "HR", r["playerName"], r["teamName"], r.get("opponentTeam"), "B",
-                    f"Strict HR gate; HR_score {r['HR_score']:.3f}; slot {int(r['slot_num'])}; opp {r.get('opponent_pitcher_pick_type')}; park Favorable",
-                    "Refined_Picks")
+            add_row(
+                "Power 1",
+                "HR",
+                r["playerName"],
+                r["teamName"],
+                r.get("opponentTeam"),
+                "B",
+                f"Strict HR gate; HR_score {r['HR_score']:.3f}; slot {int(r['slot_num'])}; opp {r.get('opponent_pitcher_pick_type')}; park Favorable",
+                "Refined_Picks",
+            )
             break
 
-    # K Prop: allowed when real posted line is verified and still playable.
+    # -----------------------------
+    # 3) K PROP: posted-line verified only, A-grade only
+    # -----------------------------
     if pitcher_line_value is not None and not pitcher_line_value.empty:
         kdf = pitcher_line_value.copy()
-        for c, default in [("starter_status", ""), ("short_leash_flag", ""), ("k_value_tier", ""),
-                           ("max_playable_k_line", None), ("projected_k_mid", 0), ("projected_k_floor", 0),
-                           ("projected_k_ceiling", 0), ("avg_ip_per_start", 0), ("last2_ip_avg", 0),
-                           ("last2_k_avg", 0), ("last2_pitch_avg", 0), ("opp_k_matchup_bonus", 0),
-                           ("opp_team_k_tendency", "Unknown"), ("pitcher_score_adj", 0),
-                           ("posted_k_line", None), ("posted_line_status", "Missing posted K line - not eligible for Final Card"),
-                           ("posted_k_book", ""), ("k_final_card_ok", False)]:
+        for c, default in [
+            ("starter_status", ""), ("short_leash_flag", ""), ("k_value_tier", ""),
+            ("max_playable_k_line", None), ("projected_k_mid", 0), ("projected_k_floor", 0),
+            ("projected_k_ceiling", 0), ("avg_ip_per_start", 0), ("last2_ip_avg", 0),
+            ("last2_k_avg", 0), ("last2_pitch_avg", 0), ("opp_k_matchup_bonus", 0),
+            ("opp_team_k_tendency", "Unknown"), ("pitcher_score_adj", 0),
+            ("posted_k_line", None), ("posted_line_status", "Missing posted K line - not eligible for Final Card"),
+            ("posted_k_book", ""), ("k_final_card_ok", False),
+        ]:
             if c not in kdf.columns:
                 kdf[c] = default
+
         kdf["posted_k_line_num"] = pd.to_numeric(kdf["posted_k_line"], errors="coerce")
         kdf["model_max_line_num"] = pd.to_numeric(kdf["max_playable_k_line"], errors="coerce")
         kdf["projected_mid_num"] = pd.to_numeric(kdf["projected_k_mid"], errors="coerce").fillna(0)
         kdf["k_buffer_vs_posted"] = kdf["projected_mid_num"] - kdf["posted_k_line_num"].fillna(99)
+
         k_pool = kdf[
             (kdf["starter_status"] == "Confirmed") &
             (~kdf["short_leash_flag"].astype(str).str.startswith("Yes", na=False)) &
-            (kdf["k_value_tier"].isin(["Hammer", "Strong"])) &
-            (kdf["posted_k_line_num"].notna()) & (kdf["model_max_line_num"].notna()) &
+            (kdf["k_value_tier"].isin(["Hammer"])) &
+            (kdf["posted_k_line_num"].notna()) &
+            (kdf["model_max_line_num"].notna()) &
             (kdf["posted_k_line_num"] <= kdf["model_max_line_num"]) &
-            (pd.to_numeric(kdf["k_buffer_vs_posted"], errors="coerce").fillna(-99) >= 0.75) &
-            (pd.to_numeric(kdf["avg_ip_per_start"], errors="coerce").fillna(0) >= 5.2) &
-            (pd.to_numeric(kdf["last2_ip_avg"], errors="coerce").fillna(0) >= 5.0) &
-            (pd.to_numeric(kdf["last2_k_avg"], errors="coerce").fillna(0) >= 5.5) &
-            (pd.to_numeric(kdf["last2_pitch_avg"], errors="coerce").fillna(0) >= 86) &
-            (pd.to_numeric(kdf["opp_k_matchup_bonus"], errors="coerce").fillna(0) >= 0.20) &
+            (pd.to_numeric(kdf["k_buffer_vs_posted"], errors="coerce").fillna(-99) >= 1.25) &
+            (pd.to_numeric(kdf["avg_ip_per_start"], errors="coerce").fillna(0) >= 5.5) &
+            (pd.to_numeric(kdf["last2_ip_avg"], errors="coerce").fillna(0) >= 5.3) &
+            (pd.to_numeric(kdf["last2_k_avg"], errors="coerce").fillna(0) >= 6.0) &
+            (pd.to_numeric(kdf["last2_pitch_avg"], errors="coerce").fillna(0) >= 90) &
+            (pd.to_numeric(kdf["opp_k_matchup_bonus"], errors="coerce").fillna(0) >= 0.35) &
             (~kdf["opp_team_k_tendency"].astype(str).eq("Low K")) &
-            (pd.to_numeric(kdf["pitcher_score_adj"], errors="coerce").fillna(0) >= 5.8)
+            (pd.to_numeric(kdf["pitcher_score_adj"], errors="coerce").fillna(0) >= 6.25)
         ].copy().sort_values(["k_buffer_vs_posted", "projected_k_mid", "pitcher_score_adj"], ascending=[False, False, False])
+
         for _, r in k_pool.iterrows():
-            if not can_use_team(r["teamName"], 2):
+            if not can_use_team(r["teamName"], 1):
                 continue
-            conf = "A" if (r["k_value_tier"] == "Hammer" and r["k_buffer_vs_posted"] >= 1.25) else "B"
-            add_row("Pitch 1", "K Prop", r["pitcherName"], r["teamName"], r["opponentTeam"], conf,
-                    f"Posted line {float(r.get('posted_k_line_num')):g} verified ({r.get('posted_k_book') or 'source'}); model max {r['max_playable_k_line']}; projected {r['projected_k_floor']}-{r['projected_k_ceiling']} Ks; cushion vs posted {r['k_buffer_vs_posted']:.1f}; {r.get('posted_line_status')}",
-                    "Pitcher_Line_Value")
+            add_row(
+                "Pitch 1",
+                "K Prop",
+                r["pitcherName"],
+                r["teamName"],
+                r["opponentTeam"],
+                "A",
+                (
+                    f"A-only K gate; posted line {float(r.get('posted_k_line_num')):g} verified ({r.get('posted_k_book') or 'source'}); "
+                    f"model max {r['max_playable_k_line']}; projected {r['projected_k_floor']}-{r['projected_k_ceiling']} Ks; "
+                    f"cushion vs posted {r['k_buffer_vs_posted']:.1f}; {r.get('posted_line_status')}"
+                ),
+                "Pitcher_Line_Value",
+            )
             break
 
     if not rows:
-        return pd.DataFrame([{"slot":"Info", "bet_type":"No Plays", "pick":"No final card plays qualified", "team":"", "opponent":"",
-                              "confidence":"Pass", "why_it_made_the_card":"Smart gates removed all official plays. Check Games and Research for leans.",
-                              "source_tab":"Final_Card"}], columns=cols)
+        return pd.DataFrame([{
+            "slot":"Info",
+            "bet_type":"No Plays",
+            "pick":"No final card plays qualified",
+            "team":"",
+            "opponent":"",
+            "confidence":"Pass",
+            "why_it_made_the_card":"Final Card tightening removed all official plays. Check Games and Research for leans.",
+            "source_tab":"Final_Card",
+        }], columns=cols)
     return pd.DataFrame(rows, columns=cols)
 
 def header_map(ws):
@@ -1874,9 +1976,9 @@ def main(season: int, target_date: str):
         top_hr = pd.DataFrame()
         top_hit = pd.DataFrame()
         if not player_rows.empty:
-            top_hr = player_rows.nlargest(6, "HR_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","HR_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
+            top_hr = player_rows.nlargest(10, "HR_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","HR_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
             top_hr.insert(0, "type", "HR")
-            top_hit = player_rows.nlargest(6, "Hit_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","Hit_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
+            top_hit = player_rows.nlargest(10, "Hit_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","Hit_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
             top_hit.insert(0, "type", "HIT")
         top_picks = pd.concat([top_hr, top_hit], ignore_index=True)
         top_picks.to_excel(writer, sheet_name="Top_Picks", index=False)
