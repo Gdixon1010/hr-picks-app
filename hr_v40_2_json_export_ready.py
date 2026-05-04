@@ -1194,10 +1194,13 @@ def build_game_rankings(schedule_rows, hr_rows, hit_rows, pitcher_metrics):
 
 def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
     """
-    Conservative/refined hitter selection v43.
+    Balanced Refined Picks v44.
 
-    Goal: keep Refined Picks useful as a research layer, but stop adding loose spray picks.
-    This does NOT touch the broader Research tables; it only tightens the Refined_Picks card.
+    Goal:
+    - Final Card stays strict elsewhere.
+    - Refined Picks should still produce useful research volume.
+    - Only confirmed starters are eligible.
+    - HR picks are kept OUT of Refined Picks for now because early tracking is too noisy.
     """
     cols = [
         "category","bet_type","playerName","teamName","game","opponent_pitcher",
@@ -1208,7 +1211,7 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
     if player_rows is None or player_rows.empty or pitcher_metrics is None or pitcher_metrics.empty:
         return pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No refined picks met today's filters"}], columns=cols)
 
-    pm = pitcher_metrics[["teamName","opponentTeam","pitcherName","pick_type","sample_flag","short_leash_flag"]].rename(columns={
+    pm = pitcher_metrics[["teamName","opponentTeam","pitcherName","pick_type","sample_flag","short_leash_flag"]].drop_duplicates().rename(columns={
         "teamName":"opponent_pitcher_team",
         "opponentTeam":"teamName",
         "pitcherName":"opponent_pitcher",
@@ -1241,25 +1244,34 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
 
     picks = []
 
-    # 1+ Hit refined picks: tighter than before.
-    # Keep only confirmed top/mid-order hitters with stronger hit score and recent/season hit support.
+    # Balanced 1+ Hit refined picks.
+    # This relaxes the over-tightened version that produced too many No Plays,
+    # but still blocks unconfirmed hitters and Strong SP matchups.
     hit_pool = rows[
         (rows["starter_only_flag"] == True) &
-        (rows["Hit_score"] >= 4.50) &
-        (rows["batting_order_slot"] <= 5) &
-        (rows["season_hit_pct"] >= 22.0) &
-        (rows["hit_pct_last_10"].fillna(0) >= 50.0) &
+        (rows["lineup_status"].astype(str).eq("Confirmed Starter")) &
+        (rows["Hit_score"] >= 4.15) &
+        (rows["batting_order_slot"] <= 6) &
+        (rows["season_hit_pct"] >= 20.0) &
+        (rows["hit_pct_last_10"].fillna(0) >= 40.0) &
         (~rows["opponent_pitcher_pick_type"].astype(str).isin(["Strong SP"])) &
         (~rows["opp_bullpen_grade"].astype(str).isin(["Strong"])) &
-        (rows["team_volatility"] <= 1.25) &
-        ((rows["offense_score"] >= 2.5) | (rows["edge_vs_opponent"] > 0))
-    ].copy().sort_values(["Hit_score","batting_order_slot","season_hit_pct"], ascending=[False, True, False])
+        (rows["team_volatility"] <= 1.25)
+    ].copy()
+
+    # Prefer teams with some game-level support, but do not require it; lineup + hitter floor matters most for Refined.
+    hit_pool["context_bonus"] = (
+        (hit_pool["offense_score"].fillna(0) >= 2.3).astype(int) +
+        (hit_pool["edge_vs_opponent"].fillna(0) > 0).astype(int) +
+        (hit_pool["opponent_pitcher_pick_type"].astype(str).isin(["Short Leash Risk", "Attack With Hitters", "Low Sample"])).astype(int)
+    )
+    hit_pool = hit_pool.sort_values(["Hit_score","context_bonus","batting_order_slot","season_hit_pct"], ascending=[False, False, True, False])
 
     # Avoid too much exposure to one offense.
     hit_pool = apply_team_pick_caps(hit_pool, max_per_team=2)
 
-    for _, r in hit_pool.head(8).iterrows():
-        conf = "A" if (r.get("Hit_score", 0) >= 4.80 and r.get("batting_order_slot", 99) <= 3) else "B"
+    for _, r in hit_pool.head(10).iterrows():
+        conf = "A" if (r.get("Hit_score", 0) >= 4.70 and r.get("batting_order_slot", 99) <= 3 and r.get("hit_pct_last_10", 0) >= 60) else "B"
         picks.append({
             "category":"Hit Pick",
             "bet_type":"1+ Hit",
@@ -1279,47 +1291,18 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
             "confidence":conf,
             "stack_tag":"",
             "reason":(
-                f"Tier {conf}; Hit_score {r.get('Hit_score'):.3f}; slot {int(r.get('batting_order_slot'))}; "
+                f"Tier {conf}; refined balanced gate; Hit_score {r.get('Hit_score'):.3f}; slot {int(r.get('batting_order_slot'))}; "
                 f"season hit% {r.get('season_hit_pct')}; last10 hit% {r.get('hit_pct_last_10')}; "
-                f"opp {r.get('opponent_pitcher_pick_type')}; opp pen {r.get('opp_bullpen_grade')}"
+                f"opp {r.get('opponent_pitcher_pick_type')}; opp pen {r.get('opp_bullpen_grade')}; context bonus {int(r.get('context_bonus', 0))}"
             ),
         })
 
-    # HR refined picks: keep, but make them research-only/high variance.
-    hr_pool = rows[
-        (rows["starter_only_flag"] == True) &
-        (rows["HR_score"] >= 6.8) &
-        (rows["batting_order_slot"] <= 5) &
-        (rows["park_favorability"] == "Favorable") &
-        (rows["opponent_pitcher_pick_type"].astype(str).isin(["Short Leash Risk", "Attack With Hitters", "Low Sample"]))
-    ].copy().sort_values(["HR_score","batting_order_slot"], ascending=[False, True])
-    hr_pool = apply_team_pick_caps(hr_pool, max_per_team=1)
-
-    for _, r in hr_pool.head(3).iterrows():
-        picks.append({
-            "category":"HR Pick",
-            "bet_type":"HR",
-            "playerName":r["playerName"],
-            "teamName":r["teamName"],
-            "game":r.get("game"),
-            "opponent_pitcher":r.get("opponent_pitcher"),
-            "opponent_pitcher_team":r.get("opponent_pitcher_team"),
-            "opponent_pitcher_pick_type":r.get("opponent_pitcher_pick_type"),
-            "opponent_pitcher_sample":r.get("opponent_pitcher_sample"),
-            "lineup_status":r.get("lineup_status"),
-            "batting_order_slot":r.get("batting_order_slot"),
-            "starter_only_flag":r.get("starter_only_flag"),
-            "HR_score":r.get("HR_score"),
-            "Hit_score":r.get("Hit_score"),
-            "park_favorability":r.get("park_favorability"),
-            "confidence":"C",
-            "stack_tag":"RESEARCH HR ONLY",
-            "reason":f"High-variance HR research only; HR_score {r.get('HR_score'):.3f}; opp {r.get('opponent_pitcher_pick_type')}; park Favorable",
-        })
+    # HR picks intentionally removed from Refined Picks for now.
+    # Keep HR candidates visible in Top Picks only until HR results justify adding them back.
 
     out = pd.DataFrame(picks, columns=cols)
     if out.empty:
-        out = pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No refined picks met today's stricter filters"}], columns=cols)
+        out = pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No refined picks met today's balanced filters"}], columns=cols)
     return out
 
 def build_pitcher_line_value(pitcher_metrics):
@@ -1754,30 +1737,8 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
             )
             hit_added += 1
 
-        # HR remains eligible but only rare/strict. Confidence B, small-stake only.
-        hr_pool = base[
-            (base["lineup_ok"] == True) &
-            (base["HR_score"] >= 7.00) &
-            (base["slot_num"] <= 4) &
-            (base["park_favorability"].astype(str) == "Favorable") &
-            (base["opponent_pitcher_pick_type"].astype(str).isin(["Short Leash Risk", "Attack With Hitters", "Low Sample"])) &
-            ((base["homeRuns"] >= 6) | (base["avg_games_between_hrs"] <= 2.75))
-        ].copy().sort_values(["HR_score", "slot_num", "homeRuns"], ascending=[False, True, False])
-
-        for _, r in hr_pool.iterrows():
-            if not can_use_team(r["teamName"], 1) or (r["teamName"], r["playerName"]) in used_players:
-                continue
-            add_row(
-                "Power 1",
-                "HR",
-                r["playerName"],
-                r["teamName"],
-                r.get("opponentTeam"),
-                "B",
-                f"Strict HR gate; HR_score {r['HR_score']:.3f}; slot {int(r['slot_num'])}; opp {r.get('opponent_pitcher_pick_type')}; park Favorable",
-                "Refined_Picks",
-            )
-            break
+        # HR is intentionally NOT allowed on the official Final Card for now.
+        # Keep HR candidates in Top Picks only until HR tracking proves profitable.
 
     # -----------------------------
     # 3) K PROP: posted-line verified only, A-grade only
