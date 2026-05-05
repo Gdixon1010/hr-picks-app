@@ -1074,6 +1074,171 @@ def build_locked_player_pool(all_players: pd.DataFrame, lineup_map: dict, slot_m
     out = out[out["batting_order_slot"].notna()].copy()
     return out
 
+
+# ------------------------------
+# HR SCORING UPGRADE SYSTEM
+# ------------------------------
+# Purpose: improve HR candidate ranking without making BvP a hard filter.
+# BvP HR history is noisy, so it is used as a small boost only when the sample is meaningful.
+_BVP_CACHE = {}
+_PITCHER_HR_RISK_CACHE = {}
+
+
+def _parse_ip_to_float(ip_value):
+    """MLB innings can be represented like 12.1 = 12 + 1/3, 12.2 = 12 + 2/3."""
+    try:
+        if ip_value is None or ip_value == "":
+            return 0.0
+        s = str(ip_value)
+        if "." in s:
+            whole, frac = s.split(".", 1)
+            whole = int(whole or 0)
+            frac = frac[:1]
+            if frac == "1":
+                return whole + (1.0 / 3.0)
+            if frac == "2":
+                return whole + (2.0 / 3.0)
+            return float(s)
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def get_bvp_hr_context(batter_id, pitcher_id):
+    """Return batter-vs-pitcher context. Safe fallback: zeros if MLB endpoint lacks data."""
+    b = safe_int_value(batter_id)
+    p = safe_int_value(pitcher_id)
+    key = (b, p)
+    if not b or not p:
+        return {"bvp_ab": 0, "bvp_hits": 0, "bvp_hr": 0, "bvp_hr_rate": 0.0, "bvp_boost": 0.0, "bvp_note": "no_bvp_ids"}
+    if key in _BVP_CACHE:
+        return _BVP_CACHE[key]
+
+    ctx = {"bvp_ab": 0, "bvp_hits": 0, "bvp_hr": 0, "bvp_hr_rate": 0.0, "bvp_boost": 0.0, "bvp_note": "no_bvp_data"}
+    try:
+        # MLB StatsAPI commonly supports stats=vsPlayer with opposingPlayerId.
+        data = get_json(
+            f"https://statsapi.mlb.com/api/v1/people/{b}/stats",
+            params={"stats": "vsPlayer", "group": "hitting", "opposingPlayerId": p},
+        )
+        splits = []
+        for block in data.get("stats", []) or []:
+            splits.extend(block.get("splits", []) or [])
+        stat = (splits[0].get("stat") if splits else {}) or {}
+        ab = int(float(stat.get("atBats", 0) or 0))
+        hits = int(float(stat.get("hits", 0) or 0))
+        hr = int(float(stat.get("homeRuns", 0) or 0))
+        hr_rate = (hr / ab) if ab else 0.0
+
+        # Small, controlled boost only. Never make BvP a standalone qualifier.
+        boost = 0.0
+        note = "no_bvp_boost"
+        if ab >= 12 and hr >= 2 and hr_rate >= 0.12:
+            boost = 0.55
+            note = "strong_bvp_hr_history"
+        elif ab >= 8 and hr >= 2:
+            boost = 0.35
+            note = "moderate_bvp_hr_history"
+        elif ab >= 10 and hr >= 1 and hr_rate >= 0.08:
+            boost = 0.20
+            note = "mild_bvp_hr_history"
+        elif ab >= 12 and hr == 0:
+            boost = -0.10
+            note = "bvp_no_hr_in_sample"
+
+        ctx = {
+            "bvp_ab": ab,
+            "bvp_hits": hits,
+            "bvp_hr": hr,
+            "bvp_hr_rate": round(hr_rate, 3),
+            "bvp_boost": round(boost, 3),
+            "bvp_note": note,
+        }
+    except Exception:
+        ctx = {"bvp_ab": 0, "bvp_hits": 0, "bvp_hr": 0, "bvp_hr_rate": 0.0, "bvp_boost": 0.0, "bvp_note": "bvp_fetch_failed"}
+
+    _BVP_CACHE[key] = ctx
+    return ctx
+
+
+def get_pitcher_hr_risk_context(pitcher_id, season):
+    """Pitcher HR risk from season pitching stats. Used as a boost/penalty for HR_score."""
+    pid = safe_int_value(pitcher_id)
+    key = (pid, season)
+    if not pid:
+        return {"pitcher_hr9": None, "pitcher_hr_allowed": None, "pitcher_hr_risk_boost": 0.0, "pitcher_hr_risk_label": "unknown"}
+    if key in _PITCHER_HR_RISK_CACHE:
+        return _PITCHER_HR_RISK_CACHE[key]
+
+    ctx = {"pitcher_hr9": None, "pitcher_hr_allowed": None, "pitcher_hr_risk_boost": 0.0, "pitcher_hr_risk_label": "unknown"}
+    try:
+        data = get_json(
+            f"https://statsapi.mlb.com/api/v1/people/{pid}/stats",
+            params={"stats": "season", "group": "pitching", "season": season, "gameType": "R"},
+        )
+        splits = []
+        for block in data.get("stats", []) or []:
+            splits.extend(block.get("splits", []) or [])
+        stat = (splits[0].get("stat") if splits else {}) or {}
+        hr_allowed = float(stat.get("homeRuns", 0) or 0)
+        ip = _parse_ip_to_float(stat.get("inningsPitched"))
+        hr9 = (hr_allowed * 9.0 / ip) if ip > 0 else None
+
+        boost = 0.0
+        label = "unknown"
+        if hr9 is not None:
+            if hr9 >= 1.65:
+                boost, label = 0.45, "high_hr_risk"
+            elif hr9 >= 1.25:
+                boost, label = 0.25, "elevated_hr_risk"
+            elif hr9 <= 0.65 and ip >= 20:
+                boost, label = -0.15, "low_hr_risk"
+            else:
+                boost, label = 0.0, "neutral_hr_risk"
+        ctx = {
+            "pitcher_hr9": round(hr9, 3) if hr9 is not None else None,
+            "pitcher_hr_allowed": int(hr_allowed),
+            "pitcher_hr_risk_boost": round(boost, 3),
+            "pitcher_hr_risk_label": label,
+        }
+    except Exception:
+        ctx = {"pitcher_hr9": None, "pitcher_hr_allowed": None, "pitcher_hr_risk_boost": 0.0, "pitcher_hr_risk_label": "fetch_failed"}
+
+    _PITCHER_HR_RISK_CACHE[key] = ctx
+    return ctx
+
+
+def recent_hr_boost_from_logs(logs):
+    try:
+        last10 = logs.tail(10)
+        if len(last10) == 0 or "homeRuns" not in last10.columns:
+            return 0.0, 0, "no_recent_hr_data"
+        recent_hrs = int(pd.to_numeric(last10["homeRuns"], errors="coerce").fillna(0).sum())
+        if recent_hrs >= 4:
+            return 0.35, recent_hrs, "very_hot_recent_power"
+        if recent_hrs >= 2:
+            return 0.20, recent_hrs, "hot_recent_power"
+        return 0.0, recent_hrs, "neutral_recent_power"
+    except Exception:
+        return 0.0, 0, "recent_hr_calc_failed"
+
+
+def season_power_boost(home_runs, games_played):
+    rate = safe_div(home_runs, max(games_played, 1), 0.0) or 0.0
+    if rate >= 0.24:
+        return 0.35, round(rate, 3), "elite_season_power"
+    if rate >= 0.17:
+        return 0.20, round(rate, 3), "strong_season_power"
+    if rate <= 0.06:
+        return -0.10, round(rate, 3), "low_season_power"
+    return 0.0, round(rate, 3), "neutral_season_power"
+
+
+def combine_hr_upgrade_boosts(*boosts):
+    """Clamp upgrade so HR_score is improved but not hijacked by one noisy stat."""
+    total = sum(nz(b) for b in boosts)
+    return round(max(-0.35, min(1.20, total)), 3)
+
 def build_hit_hr_rows(pool_df: pd.DataFrame, season: int, sched_ctx: dict) -> pd.DataFrame:
     rows = []
     total = max(len(pool_df), 1)
@@ -1089,6 +1254,7 @@ def build_hit_hr_rows(pool_df: pd.DataFrame, season: int, sched_ctx: dict) -> pd
         last10 = logs.tail(10)
         hit_pct_last_10 = round((len(last10[last10["hits"] > 0]) / 10) * 100, 1) if len(last10) == 10 else None
         ctx = sched_ctx.get(row["teamName"], {})
+        opp_pitcher_id = ctx.get("opp_pitcher_id")
         season_hit_pct = pct(row["hits"], row.get("atBats", 0))
         slot_raw = row.get("batting_order_slot")
         slot = 9 if pd.isna(slot_raw) else int(slot_raw)
@@ -1100,7 +1266,27 @@ def build_hit_hr_rows(pool_df: pd.DataFrame, season: int, sched_ctx: dict) -> pd
         hr_public_penalty = get_public_bias_penalty(row["teamName"], "hr")
         hr_score_raw = (row["homeRuns"] / max(row["gamesPlayed"], 1) * 10 * 0.40) + (overdue_value(hr_status) * 0.25) + (park_value(ctx.get("park_favorability")) * 0.20) + lineup_bonus
         hit_score_raw = (nz(season_hit_pct) / 10.0 * 0.40) + (nz(hit_pct_last_10) / 10.0 * 0.20) + (park_value(ctx.get("park_favorability")) * 0.05) + lineup_bonus
-        hr_score = round(hr_score_raw - hr_vol_penalty - hr_public_penalty, 3)
+
+        # HR scoring upgrade: BvP HR history + pitcher HR risk + season/recent power.
+        # These are controlled boosts, not hard filters.
+        power_boost, season_hr_rate, season_power_label = season_power_boost(row.get("homeRuns"), row.get("gamesPlayed"))
+        recent_power_boost, recent_hr_last10, recent_power_label = recent_hr_boost_from_logs(logs)
+        pitcher_hr_ctx = get_pitcher_hr_risk_context(opp_pitcher_id, season)
+
+        # Limit BvP calls to plausible HR candidates to keep refresh fast and avoid noisy low-power boosts.
+        preliminary_hr_score = hr_score_raw - hr_vol_penalty - hr_public_penalty + power_boost + recent_power_boost + nz(pitcher_hr_ctx.get("pitcher_hr_risk_boost"))
+        if preliminary_hr_score >= 3.75 or nz(row.get("homeRuns")) >= 5:
+            bvp_ctx = get_bvp_hr_context(row.get("playerId"), opp_pitcher_id)
+        else:
+            bvp_ctx = {"bvp_ab": 0, "bvp_hits": 0, "bvp_hr": 0, "bvp_hr_rate": 0.0, "bvp_boost": 0.0, "bvp_note": "skipped_low_hr_profile"}
+
+        hr_upgrade_boost = combine_hr_upgrade_boosts(
+            bvp_ctx.get("bvp_boost"),
+            pitcher_hr_ctx.get("pitcher_hr_risk_boost"),
+            power_boost,
+            recent_power_boost,
+        )
+        hr_score = round(hr_score_raw - hr_vol_penalty - hr_public_penalty + hr_upgrade_boost, 3)
         hit_score = round(hit_score_raw - hit_vol_penalty, 3)
         rows.append({
             "season": season, "teamName": row["teamName"], "playerName": row["playerName"], "playerId": row["playerId"],
@@ -1110,11 +1296,18 @@ def build_hit_hr_rows(pool_df: pd.DataFrame, season: int, sched_ctx: dict) -> pd
             "hr_status": hr_status, "avg_games_between_hits": avg_games_between_hits,
             "current_games_without_hit": hit_d["current_gap"], "longestHitDrought": hit_d["longest_drought"],
             "hit_status": hit_status, "hit_pct_last_10": hit_pct_last_10, "season_hit_pct": season_hit_pct,
-            "auto_pitcher_name": ctx.get("opp_pitcher_name"), "auto_pitcher_hand": ctx.get("opp_pitcher_hand"),
+            "auto_pitcher_name": ctx.get("opp_pitcher_name"), "auto_pitcher_id": opp_pitcher_id, "auto_pitcher_hand": ctx.get("opp_pitcher_hand"),
             "park_favorability": ctx.get("park_favorability"), "game_park_team": ctx.get("game_park_team"),
             "game_park_name": ctx.get("game_park_name"),
             "HR_score_raw": round(hr_score_raw, 3), "Hit_score_raw": round(hit_score_raw, 3),
             "HR_score": hr_score, "Hit_score": hit_score,
+            "hr_upgrade_boost": hr_upgrade_boost,
+            "bvp_ab": bvp_ctx.get("bvp_ab"), "bvp_hits": bvp_ctx.get("bvp_hits"), "bvp_hr": bvp_ctx.get("bvp_hr"),
+            "bvp_hr_rate": bvp_ctx.get("bvp_hr_rate"), "bvp_boost": bvp_ctx.get("bvp_boost"), "bvp_note": bvp_ctx.get("bvp_note"),
+            "pitcher_hr9": pitcher_hr_ctx.get("pitcher_hr9"), "pitcher_hr_allowed": pitcher_hr_ctx.get("pitcher_hr_allowed"),
+            "pitcher_hr_risk_boost": pitcher_hr_ctx.get("pitcher_hr_risk_boost"), "pitcher_hr_risk_label": pitcher_hr_ctx.get("pitcher_hr_risk_label"),
+            "season_hr_rate": season_hr_rate, "season_power_boost": power_boost, "season_power_label": season_power_label,
+            "recent_hr_last10": recent_hr_last10, "recent_power_boost": recent_power_boost, "recent_power_label": recent_power_label,
             "team_volatility": team_volatility, "public_bias": public_bias,
             "volatility_penalty_hit": hit_vol_penalty, "volatility_penalty_hr": hr_vol_penalty, "public_bias_penalty_hr": hr_public_penalty,
             "lineup_status": row.get("lineup_status"), "batting_order_slot": row.get("batting_order_slot"),
@@ -2043,7 +2236,7 @@ def main(season: int, target_date: str):
     top_hr = pd.DataFrame()
     top_hit = pd.DataFrame()
     if not player_rows.empty:
-        top_hr = player_rows.nlargest(10, "HR_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","HR_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
+        top_hr = player_rows.nlargest(10, "HR_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","HR_score","HR_score_raw","hr_upgrade_boost","bvp_ab","bvp_hr","bvp_boost","pitcher_hr9","pitcher_hr_risk_label","season_hr_rate","recent_hr_last10","batting_order_slot","lineup_status","starter_only_flag"]].copy()
         top_hr.insert(0, "type", "HR")
         top_hit = player_rows.nlargest(10, "Hit_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","Hit_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
         top_hit.insert(0, "type", "HIT")
@@ -2092,7 +2285,7 @@ def main(season: int, target_date: str):
         top_hr = pd.DataFrame()
         top_hit = pd.DataFrame()
         if not player_rows.empty:
-            top_hr = player_rows.nlargest(10, "HR_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","HR_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
+            top_hr = player_rows.nlargest(10, "HR_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","HR_score","HR_score_raw","hr_upgrade_boost","bvp_ab","bvp_hr","bvp_boost","pitcher_hr9","pitcher_hr_risk_label","season_hr_rate","recent_hr_last10","batting_order_slot","lineup_status","starter_only_flag"]].copy()
             top_hr.insert(0, "type", "HR")
             top_hit = player_rows.nlargest(10, "Hit_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","Hit_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
             top_hit.insert(0, "type", "HIT")
