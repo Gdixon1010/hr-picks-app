@@ -1194,12 +1194,13 @@ def build_game_rankings(schedule_rows, hr_rows, hit_rows, pitcher_metrics):
 
 def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
     """
-    Balanced Refined Picks v44.
+    Balanced Refined Picks v45 — Dynamic Lineup Gate.
 
     Goal:
     - Final Card stays strict elsewhere.
-    - Refined Picks should still produce useful research volume.
-    - Only confirmed starters are eligible.
+    - Refined Picks should produce useful research volume before lineups post.
+    - If lineups are available, require Confirmed Starter.
+    - If lineups are not available yet, allow high-quality Unknown lineup hitters using projected/profile signals.
     - HR picks are kept OUT of Refined Picks for now because early tracking is too noisy.
     """
     cols = [
@@ -1244,28 +1245,43 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
 
     picks = []
 
-    # Balanced 1+ Hit refined picks.
-    # This relaxes the over-tightened version that produced too many No Plays,
-    # but still blocks unconfirmed hitters and Strong SP matchups.
+    # Dynamic lineup gate:
+    # - Before lineups post, almost every hitter is "Unknown". Do NOT wipe Refined Picks in that state.
+    # - Once a meaningful number of hitters are confirmed, switch to confirmed-starter-only.
+    confirmed_count = int(rows["lineup_status"].astype(str).eq("Confirmed Starter").sum()) if "lineup_status" in rows.columns else 0
+    use_confirmed_only = confirmed_count >= 5
+
+    rows["slot_num"] = pd.to_numeric(rows.get("batting_order_slot"), errors="coerce").fillna(99)
+    rows["lineup_confirmed"] = rows["lineup_status"].astype(str).eq("Confirmed Starter")
+
+    if use_confirmed_only:
+        lineup_mask = rows["lineup_confirmed"] & (rows["slot_num"] <= 6)
+        hit_score_cutoff = 4.15
+        last10_cutoff = 40.0
+    else:
+        # Pregame/projected mode: allow Unknown lineup, but require better hitter profile/context.
+        lineup_mask = rows["lineup_status"].astype(str).isin(["Unknown", "Confirmed Starter"])
+        hit_score_cutoff = 3.75
+        last10_cutoff = 35.0
+
     hit_pool = rows[
-        (rows["starter_only_flag"] == True) &
-        (rows["lineup_status"].astype(str).eq("Confirmed Starter")) &
-        (rows["Hit_score"] >= 4.15) &
-        (rows["batting_order_slot"] <= 6) &
+        lineup_mask &
+        (rows["Hit_score"] >= hit_score_cutoff) &
         (rows["season_hit_pct"] >= 20.0) &
-        (rows["hit_pct_last_10"].fillna(0) >= 40.0) &
-        (~rows["opponent_pitcher_pick_type"].astype(str).isin(["Strong SP"])) &
+        (rows["hit_pct_last_10"].fillna(0) >= last10_cutoff) &
+        (~rows["opponent_pitcher_pick_type"].astype(str).isin(["Strong SP", "K Upside"])) &
         (~rows["opp_bullpen_grade"].astype(str).isin(["Strong"])) &
-        (rows["team_volatility"] <= 1.25)
+        (rows["team_volatility"] <= 1.30)
     ].copy()
 
-    # Prefer teams with some game-level support, but do not require it; lineup + hitter floor matters most for Refined.
+    # Prefer teams with some game-level support, but do not require it; hitter floor matters most for Refined.
     hit_pool["context_bonus"] = (
         (hit_pool["offense_score"].fillna(0) >= 2.3).astype(int) +
         (hit_pool["edge_vs_opponent"].fillna(0) > 0).astype(int) +
-        (hit_pool["opponent_pitcher_pick_type"].astype(str).isin(["Short Leash Risk", "Attack With Hitters", "Low Sample"])).astype(int)
+        (hit_pool["opponent_pitcher_pick_type"].astype(str).isin(["Short Leash Risk", "Attack With Hitters", "Low Sample"])).astype(int) +
+        (hit_pool["lineup_confirmed"].astype(bool)).astype(int)
     )
-    hit_pool = hit_pool.sort_values(["Hit_score","context_bonus","batting_order_slot","season_hit_pct"], ascending=[False, False, True, False])
+    hit_pool = hit_pool.sort_values(["Hit_score","context_bonus","slot_num","season_hit_pct"], ascending=[False, False, True, False])
 
     # Avoid too much exposure to one offense.
     hit_pool = apply_team_pick_caps(hit_pool, max_per_team=2)
@@ -1291,7 +1307,8 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
             "confidence":conf,
             "stack_tag":"",
             "reason":(
-                f"Tier {conf}; refined balanced gate; Hit_score {r.get('Hit_score'):.3f}; slot {int(r.get('batting_order_slot'))}; "
+                f"Tier {conf}; dynamic lineup gate ({'confirmed-only' if use_confirmed_only else 'pregame-projected'}); "
+                f"Hit_score {r.get('Hit_score'):.3f}; slot {r.get('batting_order_slot')}; "
                 f"season hit% {r.get('season_hit_pct')}; last10 hit% {r.get('hit_pct_last_10')}; "
                 f"opp {r.get('opponent_pitcher_pick_type')}; opp pen {r.get('opp_bullpen_grade')}; context bonus {int(r.get('context_bonus', 0))}"
             ),
@@ -1701,18 +1718,29 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
             if c not in base.columns:
                 base[c] = default
 
-        base["lineup_ok"] = base["starter_only_flag"].fillna(False)
         base["slot_num"] = pd.to_numeric(base.get("batting_order_slot"), errors="coerce").fillna(99)
+        base["lineup_confirmed"] = base.get("lineup_status", "Unknown").astype(str).eq("Confirmed Starter") if "lineup_status" in base.columns else base["starter_only_flag"].fillna(False)
+        confirmed_count = int(base["lineup_confirmed"].sum())
+        use_confirmed_only = confirmed_count >= 5
+
+        if use_confirmed_only:
+            final_lineup_mask = base["lineup_confirmed"] & (base["slot_num"] <= 3)
+            final_hit_cutoff = 4.80
+            final_last10_cutoff = 60.0
+        else:
+            # Pregame/projected mode: allow Unknown lineup only with a stronger profile.
+            final_lineup_mask = base.get("lineup_status", "Unknown").astype(str).isin(["Unknown", "Confirmed Starter"])
+            final_hit_cutoff = 4.65
+            final_last10_cutoff = 60.0
 
         hit_pool = base[
-            (base["lineup_ok"] == True) &
-            (base["Hit_score"] >= 4.80) &
-            (base["slot_num"] <= 3) &
+            final_lineup_mask &
+            (base["Hit_score"] >= final_hit_cutoff) &
             (base["season_hit_pct"] >= 23.5) &
-            (base["hit_pct_last_10"] >= 60.0) &
+            (base["hit_pct_last_10"] >= final_last10_cutoff) &
             (~base["opponent_pitcher_pick_type"].astype(str).isin(["Strong SP", "K Upside"])) &
             (~base["opp_bullpen_grade"].astype(str).isin(["Strong"])) &
-            (base["team_volatility"] <= 1.15)
+            (base["team_volatility"] <= 1.18)
         ].copy().sort_values(["Hit_score", "slot_num", "season_hit_pct"], ascending=[False, True, False])
 
         hit_added = 0
@@ -1729,7 +1757,8 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
                 r.get("opponentTeam"),
                 "A",
                 (
-                    f"A-only hit gate; Hit_score {r['Hit_score']:.3f}; slot {int(r['slot_num'])}; "
+                    f"A-only dynamic hit gate ({'confirmed-only' if use_confirmed_only else 'pregame-projected'}); "
+                    f"Hit_score {r['Hit_score']:.3f}; slot {r.get('batting_order_slot')}; "
                     f"season hit% {r.get('season_hit_pct')}; last10 hit% {r.get('hit_pct_last_10')}; "
                     f"opp {r.get('opponent_pitcher_pick_type')}; park {r.get('park_favorability')}"
                 ),
