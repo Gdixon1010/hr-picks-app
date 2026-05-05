@@ -1239,6 +1239,97 @@ def combine_hr_upgrade_boosts(*boosts):
     total = sum(nz(b) for b in boosts)
     return round(max(-0.35, min(1.20, total)), 3)
 
+
+# ------------------------------
+# HR MODEL TIER SYSTEM
+# ------------------------------
+def classify_hr_tier(row_like):
+    """
+    Classify HR candidates into readable betting/research tiers.
+
+    Important: this does NOT force HRs onto the Final Card. It only labels Top Picks so
+    you can track whether true high-upside HR profiles are separating from longshots.
+    """
+    score = nz(row_like.get("HR_score"), 0.0)
+    raw = nz(row_like.get("HR_score_raw"), 0.0)
+    boost = nz(row_like.get("hr_upgrade_boost"), 0.0)
+    bvp_hr = safe_int_value(row_like.get("bvp_hr"), 0)
+    bvp_ab = safe_int_value(row_like.get("bvp_ab"), 0)
+    bvp_boost = nz(row_like.get("bvp_boost"), 0.0)
+    pitcher_hr9 = row_like.get("pitcher_hr9")
+    pitcher_hr9 = None if pd.isna(pitcher_hr9) else pitcher_hr9
+    pitcher_label = str(row_like.get("pitcher_hr_risk_label") or "unknown")
+    season_hr_rate = nz(row_like.get("season_hr_rate"), 0.0)
+    recent_hr = safe_int_value(row_like.get("recent_hr_last10"), 0)
+    lineup_status = str(row_like.get("lineup_status") or "Unknown")
+    slot = row_like.get("batting_order_slot")
+    slot_num = 99 if pd.isna(slot) or slot is None else safe_int_value(slot, 99)
+
+    reasons = []
+    if score >= 6.5:
+        reasons.append(f"elite HR_score {score:.2f}")
+    elif score >= 5.75:
+        reasons.append(f"strong HR_score {score:.2f}")
+    else:
+        reasons.append(f"HR_score {score:.2f}")
+
+    if pitcher_hr9 is not None:
+        if pitcher_hr9 >= 1.50:
+            reasons.append(f"pitcher HR/9 high {pitcher_hr9}")
+        elif pitcher_hr9 >= 1.20:
+            reasons.append(f"pitcher HR/9 elevated {pitcher_hr9}")
+        elif pitcher_hr9 <= 0.75:
+            reasons.append(f"pitcher HR/9 suppressing {pitcher_hr9}")
+
+    if bvp_hr >= 2 and bvp_ab >= 8:
+        reasons.append(f"BvP power {bvp_hr} HR/{bvp_ab} AB")
+    elif bvp_hr >= 1 and bvp_ab >= 10:
+        reasons.append(f"some BvP HR history {bvp_hr} HR/{bvp_ab} AB")
+
+    if season_hr_rate >= 0.20:
+        reasons.append(f"elite season HR rate {season_hr_rate}")
+    elif season_hr_rate >= 0.15:
+        reasons.append(f"strong season HR rate {season_hr_rate}")
+
+    if recent_hr >= 2:
+        reasons.append(f"recent power {recent_hr} HR last10")
+
+    if lineup_status == "Confirmed Starter" and slot_num <= 5:
+        reasons.append(f"confirmed lineup slot {slot_num}")
+    elif lineup_status != "Confirmed Starter":
+        reasons.append("lineup unconfirmed")
+
+    # Tier logic: require more than just a high score for Hammer tier.
+    pitcher_risk_ok = (pitcher_hr9 is not None and pitcher_hr9 >= 1.20) or pitcher_label in {"high_hr_risk", "elevated_hr_risk"}
+    bvp_power_ok = bvp_hr >= 2 and bvp_ab >= 8 and bvp_boost > 0
+    power_profile_ok = season_hr_rate >= 0.15 or recent_hr >= 2
+    confirmed_or_big_score = lineup_status == "Confirmed Starter" or score >= 6.75
+
+    if score >= 6.50 and confirmed_or_big_score and (pitcher_risk_ok or bvp_power_ok or power_profile_ok):
+        tier = "Tier 1 - Hammer HR"
+        tier_rank = 1
+        action = "Small official HR shot only if odds are fair"
+    elif score >= 5.50 and (pitcher_risk_ok or bvp_power_ok or power_profile_ok or boost >= 0.45):
+        tier = "Tier 2 - Strong HR Lean"
+        tier_rank = 2
+        action = "Research/lean; consider only at good odds"
+    elif score >= 4.50:
+        tier = "Tier 3 - Longshot HR"
+        tier_rank = 3
+        action = "Longshot only; smallest stake if played"
+    else:
+        tier = "Watchlist Only"
+        tier_rank = 4
+        action = "Do not bet from model alone"
+
+    return {
+        "HR_tier": tier,
+        "HR_tier_rank": tier_rank,
+        "HR_action": action,
+        "HR_tier_reason": "; ".join(reasons[:6]),
+        "HR_model_version": "HR_TIER_V1",
+    }
+
 def build_hit_hr_rows(pool_df: pd.DataFrame, season: int, sched_ctx: dict) -> pd.DataFrame:
     rows = []
     total = max(len(pool_df), 1)
@@ -1288,6 +1379,22 @@ def build_hit_hr_rows(pool_df: pd.DataFrame, season: int, sched_ctx: dict) -> pd
         )
         hr_score = round(hr_score_raw - hr_vol_penalty - hr_public_penalty + hr_upgrade_boost, 3)
         hit_score = round(hit_score_raw - hit_vol_penalty, 3)
+
+        hr_tier_ctx = classify_hr_tier({
+            "HR_score": hr_score,
+            "HR_score_raw": round(hr_score_raw, 3),
+            "hr_upgrade_boost": hr_upgrade_boost,
+            "bvp_ab": bvp_ctx.get("bvp_ab"),
+            "bvp_hr": bvp_ctx.get("bvp_hr"),
+            "bvp_boost": bvp_ctx.get("bvp_boost"),
+            "pitcher_hr9": pitcher_hr_ctx.get("pitcher_hr9"),
+            "pitcher_hr_risk_label": pitcher_hr_ctx.get("pitcher_hr_risk_label"),
+            "season_hr_rate": season_hr_rate,
+            "recent_hr_last10": recent_hr_last10,
+            "lineup_status": row.get("lineup_status"),
+            "batting_order_slot": row.get("batting_order_slot"),
+        })
+
         rows.append({
             "season": season, "teamName": row["teamName"], "playerName": row["playerName"], "playerId": row["playerId"],
             "homeRuns": row["homeRuns"], "gamesPlayed": row["gamesPlayed"], "totalHits": row["hits"],
@@ -1308,6 +1415,9 @@ def build_hit_hr_rows(pool_df: pd.DataFrame, season: int, sched_ctx: dict) -> pd
             "pitcher_hr_risk_boost": pitcher_hr_ctx.get("pitcher_hr_risk_boost"), "pitcher_hr_risk_label": pitcher_hr_ctx.get("pitcher_hr_risk_label"),
             "season_hr_rate": season_hr_rate, "season_power_boost": power_boost, "season_power_label": season_power_label,
             "recent_hr_last10": recent_hr_last10, "recent_power_boost": recent_power_boost, "recent_power_label": recent_power_label,
+            "HR_tier": hr_tier_ctx.get("HR_tier"), "HR_tier_rank": hr_tier_ctx.get("HR_tier_rank"),
+            "HR_action": hr_tier_ctx.get("HR_action"), "HR_tier_reason": hr_tier_ctx.get("HR_tier_reason"),
+            "HR_model_version": hr_tier_ctx.get("HR_model_version"),
             "team_volatility": team_volatility, "public_bias": public_bias,
             "volatility_penalty_hit": hit_vol_penalty, "volatility_penalty_hr": hr_vol_penalty, "public_bias_penalty_hr": hr_public_penalty,
             "lineup_status": row.get("lineup_status"), "batting_order_slot": row.get("batting_order_slot"),
@@ -2236,7 +2346,7 @@ def main(season: int, target_date: str):
     top_hr = pd.DataFrame()
     top_hit = pd.DataFrame()
     if not player_rows.empty:
-        top_hr = player_rows.nlargest(10, "HR_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","HR_score","HR_score_raw","hr_upgrade_boost","bvp_ab","bvp_hr","bvp_boost","pitcher_hr9","pitcher_hr_risk_label","season_hr_rate","recent_hr_last10","batting_order_slot","lineup_status","starter_only_flag"]].copy()
+        top_hr = player_rows.nlargest(10, "HR_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","HR_score","HR_tier","HR_tier_rank","HR_action","HR_tier_reason","HR_score_raw","hr_upgrade_boost","bvp_ab","bvp_hr","bvp_boost","pitcher_hr9","pitcher_hr_risk_label","season_hr_rate","recent_hr_last10","batting_order_slot","lineup_status","starter_only_flag"]].copy()
         top_hr.insert(0, "type", "HR")
         top_hit = player_rows.nlargest(10, "Hit_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","Hit_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
         top_hit.insert(0, "type", "HIT")
@@ -2285,7 +2395,7 @@ def main(season: int, target_date: str):
         top_hr = pd.DataFrame()
         top_hit = pd.DataFrame()
         if not player_rows.empty:
-            top_hr = player_rows.nlargest(10, "HR_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","HR_score","HR_score_raw","hr_upgrade_boost","bvp_ab","bvp_hr","bvp_boost","pitcher_hr9","pitcher_hr_risk_label","season_hr_rate","recent_hr_last10","batting_order_slot","lineup_status","starter_only_flag"]].copy()
+            top_hr = player_rows.nlargest(10, "HR_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","HR_score","HR_tier","HR_tier_rank","HR_action","HR_tier_reason","HR_score_raw","hr_upgrade_boost","bvp_ab","bvp_hr","bvp_boost","pitcher_hr9","pitcher_hr_risk_label","season_hr_rate","recent_hr_last10","batting_order_slot","lineup_status","starter_only_flag"]].copy()
             top_hr.insert(0, "type", "HR")
             top_hit = player_rows.nlargest(10, "Hit_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","Hit_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
             top_hit.insert(0, "type", "HIT")
