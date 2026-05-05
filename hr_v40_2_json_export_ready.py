@@ -1255,24 +1255,27 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
     rows["lineup_confirmed"] = rows["lineup_status"].astype(str).eq("Confirmed Starter")
 
     if use_confirmed_only:
+        # Once lineups are actually available, use the tighter confirmed-starter research filter.
         lineup_mask = rows["lineup_confirmed"] & (rows["slot_num"] <= 6)
-        hit_score_cutoff = 4.15
-        last10_cutoff = 40.0
+        hit_pool = rows[
+            lineup_mask &
+            (rows["Hit_score"] >= 4.15) &
+            (rows["season_hit_pct"] >= 20.0) &
+            (rows["hit_pct_last_10"].fillna(0) >= 40.0) &
+            (~rows["opponent_pitcher_pick_type"].astype(str).isin(["Strong SP", "K Upside"])) &
+            (~rows["opp_bullpen_grade"].astype(str).isin(["Strong"])) &
+            (rows["team_volatility"] <= 1.30)
+        ].copy()
     else:
-        # Pregame/projected mode: allow Unknown lineup, but require better hitter profile/context.
+        # Pregame/projected mode: lineups and recent split fields are often missing/Unknown.
+        # Do NOT let missing season_hit_pct / last10_hit_pct / bullpen fields wipe the whole slate.
+        # Use only stable fields that exist this early: Hit_score + opponent pitcher risk.
         lineup_mask = rows["lineup_status"].astype(str).isin(["Unknown", "Confirmed Starter"])
-        hit_score_cutoff = 3.75
-        last10_cutoff = 35.0
-
-    hit_pool = rows[
-        lineup_mask &
-        (rows["Hit_score"] >= hit_score_cutoff) &
-        (rows["season_hit_pct"] >= 20.0) &
-        (rows["hit_pct_last_10"].fillna(0) >= last10_cutoff) &
-        (~rows["opponent_pitcher_pick_type"].astype(str).isin(["Strong SP", "K Upside"])) &
-        (~rows["opp_bullpen_grade"].astype(str).isin(["Strong"])) &
-        (rows["team_volatility"] <= 1.30)
-    ].copy()
+        hit_pool = rows[
+            lineup_mask &
+            (rows["Hit_score"] >= 3.75) &
+            (~rows["opponent_pitcher_pick_type"].astype(str).isin(["Strong SP", "K Upside"]))
+        ].copy()
 
     # Prefer teams with some game-level support, but do not require it; hitter floor matters most for Refined.
     hit_pool["context_bonus"] = (
