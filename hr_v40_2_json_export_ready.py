@@ -1325,6 +1325,107 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
         out = pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No refined picks met today's balanced filters"}], columns=cols)
     return out
 
+
+def build_refined_from_top_hits(top_picks, pitcher_metrics=None, game_rankings=None):
+    """
+    Pregame fallback for Refined Picks.
+    If the normal Refined_Picks filter returns No Plays before lineups are posted,
+    use the already-ranked Top_Picks HIT rows so valid pre-lineup hit candidates
+    do not disappear because deeper fields are missing/defaulting to zero.
+    """
+    cols = [
+        "category","bet_type","playerName","teamName","game","opponent_pitcher",
+        "opponent_pitcher_team","opponent_pitcher_pick_type","opponent_pitcher_sample",
+        "lineup_status","batting_order_slot","starter_only_flag","HR_score","Hit_score",
+        "park_favorability","confidence","stack_tag","reason"
+    ]
+    if top_picks is None or top_picks.empty:
+        return pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No refined fallback candidates available"}], columns=cols)
+
+    rows = top_picks.copy()
+    rows = rows[rows.get("type", "").astype(str).str.upper().eq("HIT")].copy() if "type" in rows.columns else pd.DataFrame()
+    if rows.empty:
+        return pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No Top Picks HIT rows available for refined fallback"}], columns=cols)
+
+    if "Hit_score" not in rows.columns:
+        rows["Hit_score"] = 0
+    rows["Hit_score"] = pd.to_numeric(rows["Hit_score"], errors="coerce").fillna(0)
+    rows["slot_num"] = pd.to_numeric(rows.get("batting_order_slot"), errors="coerce").fillna(99)
+    if "lineup_status" not in rows.columns:
+        rows["lineup_status"] = "Unknown"
+    if "starter_only_flag" not in rows.columns:
+        rows["starter_only_flag"] = False
+
+    # Add opponent pitcher context when available. Do not require it pre-lineup.
+    if pitcher_metrics is not None and not pitcher_metrics.empty:
+        opp_map = pitcher_metrics[["opponentTeam","teamName","pitcherName","pick_type","sample_flag"]].drop_duplicates().rename(columns={
+            "opponentTeam":"teamName",
+            "teamName":"opponent_pitcher_team",
+            "pitcherName":"opponent_pitcher",
+            "pick_type":"opponent_pitcher_pick_type",
+            "sample_flag":"opponent_pitcher_sample",
+        })
+        rows = rows.merge(opp_map, on="teamName", how="left")
+    else:
+        rows["opponent_pitcher"] = rows.get("auto_pitcher_name")
+        rows["opponent_pitcher_team"] = None
+        rows["opponent_pitcher_pick_type"] = "Unknown"
+        rows["opponent_pitcher_sample"] = "Unknown"
+
+    if game_rankings is not None and not game_rankings.empty:
+        ctx = game_rankings[["teamName","game","park_favorability"]].drop_duplicates() if "park_favorability" in game_rankings.columns else game_rankings[["teamName","game"]].drop_duplicates()
+        rows = rows.merge(ctx, on="teamName", how="left")
+    if "game" not in rows.columns:
+        rows["game"] = None
+    if "park_favorability" not in rows.columns:
+        rows["park_favorability"] = "Unknown"
+    if "opponent_pitcher_pick_type" not in rows.columns:
+        rows["opponent_pitcher_pick_type"] = "Unknown"
+    if "opponent_pitcher_sample" not in rows.columns:
+        rows["opponent_pitcher_sample"] = "Unknown"
+    if "opponent_pitcher_team" not in rows.columns:
+        rows["opponent_pitcher_team"] = None
+    if "opponent_pitcher" not in rows.columns:
+        rows["opponent_pitcher"] = rows.get("auto_pitcher_name")
+
+    # Pregame fallback rule: simple, transparent, and intentionally not dependent on missing split fields.
+    # Keep Strong SP out, but allow Neutral/Short Leash/Low Sample/K Upside so Research has volume.
+    rows = rows[
+        (rows["Hit_score"] >= 3.75) &
+        (~rows["opponent_pitcher_pick_type"].astype(str).eq("Strong SP"))
+    ].copy()
+    if rows.empty:
+        return pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No Top Picks HIT rows passed refined fallback filter"}], columns=cols)
+
+    rows = rows.sort_values(["Hit_score","slot_num"], ascending=[False, True])
+    rows = apply_team_pick_caps(rows, max_per_team=2)
+
+    picks=[]
+    for _, r in rows.head(10).iterrows():
+        score = nz(r.get("Hit_score"))
+        conf = "A" if score >= 4.40 else "B"
+        picks.append({
+            "category":"Hit Pick",
+            "bet_type":"1+ Hit",
+            "playerName":r.get("playerName"),
+            "teamName":r.get("teamName"),
+            "game":r.get("game"),
+            "opponent_pitcher":r.get("opponent_pitcher") or r.get("auto_pitcher_name"),
+            "opponent_pitcher_team":r.get("opponent_pitcher_team"),
+            "opponent_pitcher_pick_type":r.get("opponent_pitcher_pick_type"),
+            "opponent_pitcher_sample":r.get("opponent_pitcher_sample"),
+            "lineup_status":r.get("lineup_status"),
+            "batting_order_slot":r.get("batting_order_slot"),
+            "starter_only_flag":r.get("starter_only_flag"),
+            "HR_score":r.get("HR_score"),
+            "Hit_score":score,
+            "park_favorability":r.get("park_favorability"),
+            "confidence":conf,
+            "stack_tag":"Pregame fallback",
+            "reason":f"Pregame Top Picks fallback; Hit_score {score:.3f}; lineup {r.get('lineup_status')}; opp {r.get('opponent_pitcher_pick_type')}",
+        })
+    return pd.DataFrame(picks, columns=cols)
+
 def build_pitcher_line_value(pitcher_metrics):
     cols = [
         "pitcherName", "teamName", "opponentTeam", "pick_type", "sample_flag",
@@ -1937,6 +2038,28 @@ def main(season: int, target_date: str):
 
     hr_drought = player_rows[["season","teamName","playerName","avg_games_between_hrs","current_games_without_hr","longest_games_without_hr","hr_status","homeRuns","last_hr_date","gamesPlayed","park_favorability","lineup_status","batting_order_slot","starter_only_flag"]].rename(columns={"hr_status":"status"}).merge(opp_map, on="teamName", how="left")
     hit_drought = player_rows[["season","teamName","playerName","avg_games_between_hits","current_games_without_hit","longestHitDrought","hit_status","totalHits","gamesPlayed","park_favorability","lineup_status","batting_order_slot","starter_only_flag"]].rename(columns={"hit_status":"status"}).merge(opp_map, on="teamName", how="left")
+
+    # Build Top Picks before Daily Card so Refined Picks can use it as a pre-lineup fallback.
+    top_hr = pd.DataFrame()
+    top_hit = pd.DataFrame()
+    if not player_rows.empty:
+        top_hr = player_rows.nlargest(10, "HR_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","HR_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
+        top_hr.insert(0, "type", "HR")
+        top_hit = player_rows.nlargest(10, "Hit_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","Hit_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
+        top_hit.insert(0, "type", "HIT")
+    top_picks = pd.concat([top_hr, top_hit], ignore_index=True)
+
+    # If normal refined logic returns only the No Plays info row, fall back to Top Picks HIT rows.
+    try:
+        only_info_no_plays = (
+            len(refined_picks) == 1
+            and str(refined_picks.iloc[0].get("category", "")).lower() == "info"
+            and str(refined_picks.iloc[0].get("bet_type", "")).lower() == "no plays"
+        )
+    except Exception:
+        only_info_no_plays = False
+    if only_info_no_plays:
+        refined_picks = build_refined_from_top_hits(top_picks, pitcher_metrics, pregame_game_rankings)
 
     daily_card = build_daily_card(pregame_game_rankings, refined_picks, pregame_pitcher_line_value, hr_drought)
     final_card = build_final_card(pregame_player_rows, pregame_game_rankings, pregame_pitcher_line_value)
