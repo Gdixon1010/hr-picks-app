@@ -1497,7 +1497,7 @@ def build_game_rankings(schedule_rows, hr_rows, hit_rows, pitcher_metrics):
 
 def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
     """
-    Balanced Refined Picks v45 — Dynamic Lineup Gate.
+    Balanced Refined Picks v46 — Dynamic Lineup Gate + Top-6 cap.
 
     Goal:
     - Final Card stays strict elsewhere.
@@ -1562,10 +1562,10 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
         lineup_mask = rows["lineup_confirmed"] & (rows["slot_num"] <= 6)
         hit_pool = rows[
             lineup_mask &
-            (rows["Hit_score"] >= 4.15) &
+            (rows["Hit_score"] >= 4.25) &
             (rows["season_hit_pct"] >= 20.0) &
             (rows["hit_pct_last_10"].fillna(0) >= 40.0) &
-            (~rows["opponent_pitcher_pick_type"].astype(str).isin(["Strong SP", "K Upside"])) &
+            (~rows["opponent_pitcher_pick_type"].astype(str).isin(["Strong SP"])) &
             (~rows["opp_bullpen_grade"].astype(str).isin(["Strong"])) &
             (rows["team_volatility"] <= 1.30)
         ].copy()
@@ -1576,8 +1576,11 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
         lineup_mask = rows["lineup_status"].astype(str).isin(["Unknown", "Confirmed Starter"])
         hit_pool = rows[
             lineup_mask &
-            (rows["Hit_score"] >= 3.75) &
-            (~rows["opponent_pitcher_pick_type"].astype(str).isin(["Strong SP", "K Upside"]))
+            (
+                ((rows["lineup_status"].astype(str).eq("Confirmed Starter")) & (rows["Hit_score"] >= 4.25)) |
+                ((~rows["lineup_status"].astype(str).eq("Confirmed Starter")) & (rows["Hit_score"] >= 4.75))
+            ) &
+            (~rows["opponent_pitcher_pick_type"].astype(str).isin(["Strong SP"]))
         ].copy()
 
     # Prefer teams with some game-level support, but do not require it; hitter floor matters most for Refined.
@@ -1592,7 +1595,7 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
     # Avoid too much exposure to one offense.
     hit_pool = apply_team_pick_caps(hit_pool, max_per_team=2)
 
-    for _, r in hit_pool.head(10).iterrows():
+    for _, r in hit_pool.head(6).iterrows():
         conf = "A" if (r.get("Hit_score", 0) >= 4.70 and r.get("batting_order_slot", 99) <= 3 and r.get("hit_pct_last_10", 0) >= 60) else "B"
         picks.append({
             "category":"Hit Pick",
@@ -1625,7 +1628,7 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
 
     out = pd.DataFrame(picks, columns=cols)
     if out.empty:
-        out = pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No refined picks met today's balanced filters"}], columns=cols)
+        out = pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No refined picks met today's Top-6 filters"}], columns=cols)
     return out
 
 
@@ -1691,20 +1694,32 @@ def build_refined_from_top_hits(top_picks, pitcher_metrics=None, game_rankings=N
     if "opponent_pitcher" not in rows.columns:
         rows["opponent_pitcher"] = rows.get("auto_pitcher_name")
 
-    # Pregame fallback rule: simple, transparent, and intentionally not dependent on missing split fields.
-    # Keep Strong SP out, but allow Neutral/Short Leash/Low Sample/K Upside so Research has volume.
+    # Refined Top-6 fallback rule: keep only the top of the top.
+    # Require a valid game mapping, remove duplicate player/game rows, cap team exposure,
+    # and only allow Unknown lineups when the score is strong enough to justify pre-lineup research.
+    rows["game_str"] = rows.get("game").astype(str) if "game" in rows.columns else ""
+    valid_game_mask = rows["game_str"].notna() & (~rows["game_str"].str.strip().isin(["", "—", "-", "None", "nan"]))
+    confirmed_mask = rows["lineup_status"].astype(str).eq("Confirmed Starter")
+    unknown_mask = ~confirmed_mask
+
     rows = rows[
-        (rows["Hit_score"] >= 3.75) &
+        valid_game_mask &
+        (
+            (confirmed_mask & (rows["Hit_score"] >= 4.25)) |
+            (unknown_mask & (rows["Hit_score"] >= 4.75))
+        ) &
         (~rows["opponent_pitcher_pick_type"].astype(str).eq("Strong SP"))
     ].copy()
     if rows.empty:
-        return pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No Top Picks HIT rows passed refined fallback filter"}], columns=cols)
+        return pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No Top Picks HIT rows passed refined Top-6 fallback filter"}], columns=cols)
 
-    rows = rows.sort_values(["Hit_score","slot_num"], ascending=[False, True])
+    rows = rows.sort_values(["lineup_status","Hit_score","slot_num"], ascending=[True, False, True])
+    # No duplicate player within the same slate/game context.
+    rows = rows.drop_duplicates(subset=["playerName", "teamName", "game"], keep="first")
     rows = apply_team_pick_caps(rows, max_per_team=2)
 
     picks=[]
-    for _, r in rows.head(10).iterrows():
+    for _, r in rows.head(6).iterrows():
         score = nz(r.get("Hit_score"))
         conf = "A" if score >= 4.40 else "B"
         picks.append({
@@ -1725,7 +1740,7 @@ def build_refined_from_top_hits(top_picks, pitcher_metrics=None, game_rankings=N
             "park_favorability":r.get("park_favorability"),
             "confidence":conf,
             "stack_tag":"Pregame fallback",
-            "reason":f"Pregame Top Picks fallback; Hit_score {score:.3f}; lineup {r.get('lineup_status')}; opp {r.get('opponent_pitcher_pick_type')}",
+            "reason":f"Refined Top-6 fallback; Hit_score {score:.3f}; lineup {r.get('lineup_status')}; opp {r.get('opponent_pitcher_pick_type')}",
         })
     return pd.DataFrame(picks, columns=cols)
 
