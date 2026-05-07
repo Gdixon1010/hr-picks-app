@@ -67,28 +67,16 @@ def read_json_file(path: Path, default):
 
 
 def _cap_top_picks_for_display(data: dict, max_hits: int = 10, max_hrs: int = 10) -> dict:
-    """Hard-cap Top Picks for the app UI.
-
-    The model may write top_picks in two places:
-    - data["top_picks"]
-    - data["research"]["top_picks"]
-
-    This function forces both to the same capped list so the Research > Top Picks
-    table can never display more than 10 HIT rows and 10 HR rows.
-    """
+    """Hard-cap Top Picks for the app UI to 10 HIT + 10 HR and preserve HR tier fields."""
     if not isinstance(data, dict):
         return data
-
     research = data.get("research") if isinstance(data.get("research"), dict) else {}
     rows = data.get("top_picks")
     if not isinstance(rows, list) or not rows:
         rows = research.get("top_picks") if isinstance(research.get("top_picks"), list) else []
 
-    hits = []
-    hrs = []
-    other = []
+    hits, hrs = [], []
     seen = set()
-
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -102,13 +90,10 @@ def _cap_top_picks_for_display(data: dict, max_hits: int = 10, max_hrs: int = 10
         if key in seen:
             continue
         seen.add(key)
-
         if typ == "HIT" and len(hits) < max_hits:
             hits.append(row)
         elif typ == "HR" and len(hrs) < max_hrs:
             hrs.append(row)
-        elif typ not in {"HIT", "HR"}:
-            other.append(row)
 
     capped = hits + hrs
     data["top_picks"] = capped
@@ -208,9 +193,15 @@ def load_latest_data():
 
 
 # -----------------------------
-# Results grading helpers
+# Auto Results Grading (runs first refresh after 4 AM ET)
 # -----------------------------
 MLB_API = "https://statsapi.mlb.com/api/v1"
+
+
+def _history_dir() -> Path:
+    d = OUTPUT_DIR / "history"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def _api_get(path: str, params=None, timeout: int = 30):
@@ -230,26 +221,38 @@ def _safe_date(value) -> str:
     return str(value or "").strip()[:10]
 
 
-def _history_dir() -> Path:
-    d = OUTPUT_DIR / "history"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+def _is_placeholder_pick(row: dict) -> bool:
+    if not isinstance(row, dict):
+        return True
+    text = " ".join(str(v).lower() for v in row.values())
+    return (
+        "no plays" in text
+        or "no qualified" in text
+        or "no final card plays qualified" in text
+        or row.get("category") == "Info"
+        or row.get("bet_type") == "No Plays"
+    )
+
+
+def _get_card_history(card_type: str) -> dict:
+    """card_type = final_card or refined_picks"""
+    filename = "final_card_by_date.json" if card_type == "final_card" else "refined_picks_by_date.json"
+    return read_json_file(_history_dir() / filename, {})
+
+
+def _card_rows_for_date_from_history(target_date: str, card_type: str) -> list:
+    hist = _get_card_history(card_type)
+    if isinstance(hist, dict):
+        payload = hist.get(target_date) or {}
+        rows = payload.get("rows") if isinstance(payload, dict) else []
+        if isinstance(rows, list) and rows:
+            return [r for r in rows if isinstance(r, dict) and not _is_placeholder_pick(r)]
+    return []
 
 
 def _all_appdata_files_for_date(target_date: str):
-    patterns = [
-        f"HR_Hit_Drought_v41_appdata-*-{target_date}_*.json",
-        f"HR_Hit_Drought_v40_appdata-*-{target_date}_*.json",
-        f"HR_Hit_Drought_v41_appdata-*_{target_date}_*.json",
-        f"HR_Hit_Drought_v40_appdata-*_{target_date}_*.json",
-    ]
-    files = []
-    for pat in patterns:
-        files.extend(OUTPUT_DIR.glob(pat))
-    # extra safety: include any appdata file with the date anywhere in the name
-    files.extend([p for p in OUTPUT_DIR.glob("HR_Hit_Drought_v*_appdata-*.json") if target_date in p.name])
-    uniq = {str(p): p for p in files}
-    return sorted(uniq.values(), key=lambda p: p.stat().st_mtime, reverse=True)
+    files = [p for p in OUTPUT_DIR.glob("HR_Hit_Drought_v*_appdata-*.json") if target_date in p.name]
+    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
 def _latest_appdata_for_date(target_date: str) -> Path | None:
@@ -257,25 +260,166 @@ def _latest_appdata_for_date(target_date: str) -> Path | None:
     return files[0] if files else None
 
 
-def _extract_final_card_rows(payload: dict) -> list:
-    fc = payload.get("final_card")
-    if isinstance(fc, dict):
-        rows = fc.get("plays") or []
-    elif isinstance(fc, list):
-        rows = fc
+def _extract_rows_from_appdata(payload: dict, card_type: str) -> list:
+    if card_type == "final_card":
+        fc = payload.get("final_card")
+        if isinstance(fc, dict):
+            rows = fc.get("plays") or []
+        elif isinstance(fc, list):
+            rows = fc
+        else:
+            rows = []
+        if not rows:
+            rows = (((payload.get("research") or {}).get("final_card")) or [])
     else:
-        rows = []
-    if not rows:
-        rows = (((payload.get("research") or {}).get("final_card")) or [])
-    out = []
-    for r in rows:
-        if not isinstance(r, dict):
+        rows = (((payload.get("research") or {}).get("refined_picks")) or payload.get("refined_picks") or [])
+    return [r for r in rows if isinstance(r, dict) and not _is_placeholder_pick(r)]
+
+
+def _card_rows_for_date(target_date: str, card_type: str) -> list:
+    # Prefer locked history because that is the true "never remove until 4 AM" source.
+    rows = _card_rows_for_date_from_history(target_date, card_type)
+    if rows:
+        return rows
+    app_file = _latest_appdata_for_date(target_date)
+    if not app_file:
+        return []
+    try:
+        payload = json.loads(app_file.read_text(encoding="utf-8"))
+        return _extract_rows_from_appdata(payload, card_type)
+    except Exception:
+        return []
+
+
+def _schedule_games_by_date(target_date: str) -> list:
+    try:
+        data = _api_get("/schedule", params={"sportId": 1, "date": target_date, "hydrate": "team,linescore,status"})
+        games = []
+        for d in data.get("dates", []) or []:
+            games.extend(d.get("games", []) or [])
+        return games
+    except Exception:
+        return []
+
+
+def _live_score_for_game(game_pk):
+    if not game_pk:
+        return {"is_final": False, "away_score": None, "home_score": None, "away_name": "", "home_name": ""}
+    try:
+        live = _api_get(f"/game/{game_pk}/feed/live")
+        game_data = live.get("gameData") or {}
+        live_data = live.get("liveData") or {}
+        status = game_data.get("status") or {}
+        teams = game_data.get("teams") or {}
+        linescore = live_data.get("linescore") or {}
+        away_team = teams.get("away") or {}
+        home_team = teams.get("home") or {}
+        away_ls = (linescore.get("teams") or {}).get("away", {})
+        home_ls = (linescore.get("teams") or {}).get("home", {})
+        status_values = " ".join(str(status.get(k) or "").lower() for k in ["abstractGameState", "codedGameState", "detailedState", "statusCode"])
+        is_final = "final" in status_values or "game over" in status_values or str(status.get("statusCode") or "").upper() in {"F", "O"}
+        return {
+            "is_final": is_final,
+            "away_score": away_ls.get("runs"),
+            "home_score": home_ls.get("runs"),
+            "away_name": away_team.get("name") or "",
+            "home_name": home_team.get("name") or "",
+        }
+    except Exception:
+        return {"is_final": False, "away_score": None, "home_score": None, "away_name": "", "home_name": ""}
+
+
+def _boxscore_for_game(game_pk) -> dict:
+    try:
+        return _api_get(f"/game/{game_pk}/boxscore")
+    except Exception:
+        return {}
+
+
+def _game_status_values(game: dict) -> str:
+    status = game.get("status") or {}
+    return " ".join(str(status.get(k) or "").lower() for k in ["abstractGameState", "codedGameState", "detailedState", "statusCode", "reason"])
+
+def _game_is_final(game: dict) -> bool:
+    values = _game_status_values(game)
+    if "final" in values or "game over" in values or "completed" in values:
+        return True
+    status = game.get("status") or {}
+    if str(status.get("statusCode") or "").upper() in {"F", "O"}:
+        return True
+    if str(status.get("codedGameState") or "").upper() in {"F", "O"}:
+        return True
+    live = _live_score_for_game(game.get("gamePk"))
+    return bool(live.get("is_final"))
+
+def _team_names_from_game(game: dict) -> tuple[str, str]:
+    teams = game.get("teams") or {}
+    away_name = (((teams.get("away") or {}).get("team") or {}).get("name")) or ""
+    home_name = (((teams.get("home") or {}).get("team") or {}).get("name")) or ""
+    if not away_name or not home_name:
+        live = _live_score_for_game(game.get("gamePk"))
+        away_name = away_name or live.get("away_name") or ""
+        home_name = home_name or live.get("home_name") or ""
+    return away_name, home_name
+
+def _game_label(game: dict) -> str:
+    away_name, home_name = _team_names_from_game(game)
+    return f"{away_name} @ {home_name}"
+
+def _find_game_for_pick(row: dict, target_date: str) -> dict | None:
+    team = str(row.get("team") or row.get("teamName") or "").strip()
+    opponent = str(row.get("opponent") or row.get("opponentTeam") or "").strip()
+    pick_text = str(row.get("pick") or "")
+    if not team and pick_text.endswith(" ML"):
+        team = pick_text.replace(" ML", "").strip()
+    team_norm = _norm_name(team)
+    opp_norm = _norm_name(opponent)
+    exact, loose = [], []
+    for game in _schedule_games_by_date(target_date):
+        away_name, home_name = _team_names_from_game(game)
+        names = {_norm_name(away_name), _norm_name(home_name)}
+        if team_norm and team_norm in names:
+            loose.append(game)
+            if opp_norm and opp_norm in names:
+                exact.append(game)
+    return exact[0] if exact else (loose[0] if loose else None)
+
+def _pending_if_game_not_final(row: dict, target_date: str) -> tuple[bool, str]:
+    game = _find_game_for_pick(row, target_date)
+    if not game:
+        return True, "Game not found yet; pending until matchup can be verified."
+    if not _game_is_final(game):
+        return True, f"{_game_label(game)} not final yet."
+    return False, ""
+
+
+def _iter_boxscore_players(game: dict, target_team: str | None = None):
+    box = _boxscore_for_game(game.get("gamePk")) if game.get("gamePk") else {}
+    teams = box.get("teams") or {}
+    target_norm = _norm_name(target_team) if target_team else ""
+    for side in ("away", "home"):
+        block = teams.get(side) or {}
+        team_name = ((block.get("team") or {}).get("name")) or ""
+        if target_norm and _norm_name(team_name) != target_norm:
             continue
-        text = " ".join(str(v).lower() for v in r.values())
-        if "no final card plays qualified" in text or r.get("bet_type") == "No Plays":
-            continue
-        out.append(r)
-    return out
+        for pdata in (block.get("players") or {}).values():
+            person = pdata.get("person") or {}
+            yield team_name, pdata, person
+
+
+def _boxscore_player_stat_by_name(target_date: str, player_name: str, group: str, team_name: str | None = None) -> dict | None:
+    target = _norm_name(player_name)
+    if not target:
+        return None
+    games = _schedule_games_by_date(target_date)
+    # Try exact team first, then all teams. This avoids wrong saved team fields breaking grading.
+    for use_team in (True, False):
+        for game in games:
+            for team, pdata, person in _iter_boxscore_players(game, team_name if use_team else None):
+                full = person.get("fullName") or ""
+                if _norm_name(full) == target:
+                    return (pdata.get("stats") or {}).get(group, {}) or {}
+    return None
 
 
 def _team_map() -> dict:
@@ -308,12 +452,6 @@ def _find_player_id_on_team(player_name: str, team_name: str, season: int = 2026
             person = item.get("person") or {}
             if _norm_name(person.get("fullName")) == target:
                 return int(person.get("id"))
-        # fuzzy fallback: last name + first initial style matching
-        for item in data.get("roster", []) or []:
-            person = item.get("person") or {}
-            full = str(person.get("fullName") or "")
-            if target and target in _norm_name(full):
-                return int(person.get("id"))
     except Exception:
         return None
     return None
@@ -321,10 +459,7 @@ def _find_player_id_on_team(player_name: str, team_name: str, season: int = 2026
 
 def _player_game_log_for_date(player_id: int, group: str, season: int, target_date: str) -> dict | None:
     try:
-        data = _api_get(
-            f"/people/{int(player_id)}/stats",
-            params={"stats": "gameLog", "group": group, "season": season, "gameType": "R"},
-        )
+        data = _api_get(f"/people/{int(player_id)}/stats", params={"stats": "gameLog", "group": group, "season": season, "gameType": "R"})
         stats = data.get("stats") or []
         splits = stats[0].get("splits", []) if stats else []
         for split in splits:
@@ -335,130 +470,24 @@ def _player_game_log_for_date(player_id: int, group: str, season: int, target_da
     return None
 
 
-def _schedule_games_by_date(target_date: str) -> list:
-    try:
-        data = _api_get(
-            "/schedule",
-            params={"sportId": 1, "date": target_date, "hydrate": "team,linescore,probablePitcher"},
-        )
-        games = []
-        for d in data.get("dates", []) or []:
-            games.extend(d.get("games", []) or [])
-        return games
-    except Exception:
-        return []
-
-
-def _is_final_game(game: dict) -> bool:
-    status = game.get("status") or {}
-    detailed = str(status.get("detailedState") or "").lower()
-    abstract = str(status.get("abstractGameState") or "").lower()
-    return abstract == "final" or detailed in {"final", "game over", "completed early"}
-
-
-def _game_final_status(game: dict) -> bool:
-    """Robust final-game check. The schedule endpoint can lag, so also inspect status codes."""
-    status = game.get("status") or {}
-    values = " ".join(str(status.get(k) or "").lower() for k in [
-        "abstractGameState", "codedGameState", "detailedState", "statusCode", "reason"
-    ])
-    if any(x in values for x in ["final", "game over", "completed"]):
-        return True
-    if str(status.get("statusCode") or "").upper() in {"F", "O"}:
-        return True
-    if str(status.get("codedGameState") or "").upper() in {"F", "O"}:
-        return True
-    return False
-
-
-def _game_final_status_live(game_pk) -> bool:
-    if not game_pk:
-        return False
-    try:
-        live = _api_get(f"/game/{game_pk}/feed/live")
-        status = (live.get("gameData") or {}).get("status") or {}
-        return _game_final_status({"status": status})
-    except Exception:
-        return False
-
-
-def _live_score_for_game(game_pk):
-    """Return live-feed final/status/score data. This is more reliable than schedule scores alone."""
-    if not game_pk:
-        return {"is_final": False, "away_score": None, "home_score": None, "away_name": "", "home_name": ""}
-    try:
-        live = _api_get(f"/game/{game_pk}/feed/live")
-        game_data = live.get("gameData") or {}
-        live_data = live.get("liveData") or {}
-        status = game_data.get("status") or {}
-        teams = game_data.get("teams") or {}
-        linescore = live_data.get("linescore") or {}
-        away_team = teams.get("away") or {}
-        home_team = teams.get("home") or {}
-        away_ls = linescore.get("teams", {}).get("away", {})
-        home_ls = linescore.get("teams", {}).get("home", {})
-        return {
-            "is_final": _game_final_status({"status": status}),
-            "away_score": away_ls.get("runs"),
-            "home_score": home_ls.get("runs"),
-            "away_name": away_team.get("name") or "",
-            "home_name": home_team.get("name") or "",
-        }
-    except Exception:
-        return {"is_final": False, "away_score": None, "home_score": None, "away_name": "", "home_name": ""}
-
-
-def _boxscore_for_game(game_pk) -> dict:
-    try:
-        return _api_get(f"/game/{game_pk}/boxscore")
-    except Exception:
-        return {}
-
-
-def _iter_boxscore_players(game: dict, target_team: str | None = None):
-    game_pk = game.get("gamePk")
-    box = _boxscore_for_game(game_pk) if game_pk else {}
-    teams = box.get("teams") or {}
-    target_norm = _norm_name(target_team) if target_team else ""
-    for side in ("away", "home"):
-        block = teams.get(side) or {}
-        team_name = ((block.get("team") or {}).get("name")) or ""
-        if target_norm and _norm_name(team_name) != target_norm:
-            continue
-        for pdata in (block.get("players") or {}).values():
-            person = pdata.get("person") or {}
-            yield team_name, pdata, person
-
-
-def _boxscore_player_stat_by_name(target_date: str, player_name: str, group: str, team_name: str | None = None) -> dict | None:
-    """
-    Find a player's actual boxscore line by name.
-    Important: do NOT require schedule status to say Final. Some MLB schedule statuses lag,
-    but the boxscore/player stats can already be complete.
-    """
-    target = _norm_name(player_name)
-    if not target:
-        return None
-    games = _schedule_games_by_date(target_date)
-
-    # First try the saved team, then try the entire slate.
-    for use_team in (True, False):
-        for game in games:
-            for team, pdata, person in _iter_boxscore_players(game, team_name if use_team else None):
-                full = person.get("fullName") or ""
-                if _norm_name(full) == target:
-                    return pdata.get("stats", {}).get(group, {}) or {}
+def _parse_k_line(row: dict) -> float | None:
+    text = " ".join(str(row.get(k) or "") for k in ["why_it_made_the_card", "reason", "pick", "bet_type"])
+    for pat in [r"over\s+up\s+to\s+(\d+(?:\.5)?)", r"max\s+line\s+(\d+(?:\.5)?)", r"line\s+(\d+(?:\.5)?)", r"(\d+(?:\.5)?)\s*ks"]:
+        m = re.search(pat, text, flags=re.I)
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                pass
     return None
 
 
 def _grade_moneyline(row: dict, target_date: str) -> tuple[str, str]:
     team = str(row.get("team") or row.get("teamName") or "").strip()
     if not team:
-        pick = str(row.get("pick") or "")
-        team = pick.replace(" ML", "").strip()
+        team = str(row.get("pick") or "").replace(" ML", "").strip()
     if not team:
         return "Unable to Grade", "Missing team name"
-
     team_norm = _norm_name(team)
     for game in _schedule_games_by_date(target_date):
         teams = game.get("teams") or {}
@@ -468,74 +497,41 @@ def _grade_moneyline(row: dict, target_date: str) -> tuple[str, str]:
         home_name = ((home.get("team") or {}).get("name")) or ""
         if team_norm not in {_norm_name(away_name), _norm_name(home_name)}:
             continue
-
-        game_pk = game.get("gamePk")
-        live_score = _live_score_for_game(game_pk)
-
-        away_score = away.get("score")
-        home_score = home.get("score")
-
-        # Prefer live feed score when schedule score is missing.
-        if away_score is None:
-            away_score = live_score.get("away_score")
-        if home_score is None:
-            home_score = live_score.get("home_score")
-
-        if not away_name:
-            away_name = live_score.get("away_name") or away_name
-        if not home_name:
-            home_name = live_score.get("home_name") or home_name
-
-        final_now = _is_final_game(game) or _game_final_status(game) or live_score.get("is_final")
-
-        # Key fix: if both scores exist, grade it even if the API status still says non-final.
+        if not _game_is_final(game):
+            return "Pending", f"{away_name} @ {home_name} not final yet"
+        live_score = _live_score_for_game(game.get("gamePk"))
+        away_score = away.get("score") if away.get("score") is not None else live_score.get("away_score")
+        home_score = home.get("score") if home.get("score") is not None else live_score.get("home_score")
+        away_name = away_name or live_score.get("away_name")
+        home_name = home_name or live_score.get("home_name")
         if away_score is not None and home_score is not None:
             winner = away_name if int(away_score) > int(home_score) else home_name
             result = "Win" if _norm_name(winner) == team_norm else "Loss"
-            status_note = "final" if final_now else "score available; status lagged"
-            return result, f"{away_name} {away_score}, {home_name} {home_score}; winner={winner}; {status_note}"
-
+            return result, f"{away_name} {away_score}, {home_name} {home_score}; winner={winner}"
         return "Pending", f"{away_name} @ {home_name} score not available yet"
-
     return "Unable to Grade", f"Could not find game for {team} on {target_date}"
+
 
 def _grade_hitter(row: dict, target_date: str, season: int, mode: str) -> tuple[str, str]:
     player = str(row.get("pick") or row.get("playerName") or "").strip()
     team = str(row.get("team") or row.get("teamName") or "").strip()
     if not player:
         return "Unable to Grade", "Missing player"
-
+    pending, reason = _pending_if_game_not_final(row, target_date)
+    if pending:
+        return "Pending", reason
     stat = _boxscore_player_stat_by_name(target_date, player, "batting", team_name=team)
     if stat is None:
         pid = row.get("playerId") or (_find_player_id_on_team(player, team, season) if team else None)
         if pid:
             stat = _player_game_log_for_date(int(pid), "hitting", season, target_date)
-
     if not stat:
         return "No Action", f"No hitting boxscore/game log found for {player} on {target_date}"
-
     hits = int(stat.get("hits", 0) or 0)
     hrs = int(stat.get("homeRuns", 0) or 0)
     if mode == "hit":
         return ("Win" if hits >= 1 else "Loss"), f"{player}: {hits} hit(s), {hrs} HR"
     return ("Win" if hrs >= 1 else "Loss"), f"{player}: {hrs} HR, {hits} hit(s)"
-
-def _parse_k_line(row: dict) -> float | None:
-    text = " ".join(str(row.get(k) or "") for k in ["why_it_made_the_card", "reason", "pick", "bet_type"])
-    patterns = [
-        r"over\s+up\s+to\s+(\d+(?:\.5)?)",
-        r"max\s+line\s+(\d+(?:\.5)?)",
-        r"line\s+(\d+(?:\.5)?)",
-        r"(\d+(?:\.5)?)\s*ks",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, flags=re.I)
-        if m:
-            try:
-                return float(m.group(1))
-            except Exception:
-                pass
-    return None
 
 
 def _grade_k_prop(row: dict, target_date: str, season: int) -> tuple[str, str]:
@@ -546,21 +542,21 @@ def _grade_k_prop(row: dict, target_date: str, season: int) -> tuple[str, str]:
     line = _parse_k_line(row)
     if line is None:
         return "Unable to Grade", "Could not determine K line from card text"
-
+    pending, reason = _pending_if_game_not_final(row, target_date)
+    if pending:
+        return "Pending", reason
     stat = _boxscore_player_stat_by_name(target_date, player, "pitching", team_name=team)
     if stat is None:
         pid = row.get("playerId") or (_find_player_id_on_team(player, team, season) if team else None)
         if pid:
             stat = _player_game_log_for_date(int(pid), "pitching", season, target_date)
-
     if not stat:
         return "No Action", f"No pitching boxscore/game log found for {player} on {target_date}"
-
     ks = int(stat.get("strikeOuts", 0) or 0)
-    result = "Win" if ks > line else "Loss"
-    return result, f"{player}: {ks} Ks vs line {line}"
+    return ("Win" if ks > line else "Loss"), f"{player}: {ks} Ks vs line {line}"
 
-def _grade_pick(row: dict, target_date: str, season: int = 2026) -> dict:
+
+def _grade_pick(row: dict, target_date: str, season: int = 2026, card_type: str = "Final Card") -> dict:
     bet_type = str(row.get("bet_type") or row.get("play_type") or "").strip()
     lower = bet_type.lower()
     if "moneyline" in lower or lower == "ml":
@@ -573,41 +569,31 @@ def _grade_pick(row: dict, target_date: str, season: int = 2026) -> dict:
         result, detail = _grade_k_prop(row, target_date, season)
     else:
         result, detail = "Unable to Grade", f"Unsupported bet type: {bet_type}"
-
     return {
         "target_date": target_date,
+        "card_type": card_type,
         "bet_type": bet_type,
         "pick": row.get("pick") or row.get("playerName") or row.get("pitcherName"),
         "team": row.get("team") or row.get("teamName"),
-        "opponent": row.get("opponent") or row.get("opponentTeam"),
+        "opponent": row.get("opponent") or row.get("opponentTeam") or row.get("opponent_pitcher_team"),
         "confidence": row.get("confidence"),
-        "slot": row.get("slot") or row.get("play_type") or row.get("section"),
+        "slot": row.get("slot") or row.get("play_type") or row.get("section") or row.get("category"),
         "result_status": result,
         "result_detail": detail,
-        "source_tab": row.get("source_tab"),
+        "source_tab": row.get("source_tab") or ("Refined_Picks" if card_type == "Refined Picks" else "Final_Card"),
         "graded_at_et": dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " "),
     }
 
 
 def _dedupe_result_rows(rows: list) -> list:
-    seen = set()
-    out = []
+    seen = set(); out = []
     for r in rows:
         if not isinstance(r, dict):
             continue
-        key = (
-            r.get("target_date"),
-            str(r.get("bet_type") or "").lower(),
-            _norm_name(r.get("pick")),
-            _norm_name(r.get("team")),
-            _norm_name(r.get("opponent")),
-            str(r.get("confidence") or ""),
-        )
-        # keep the most recent occurrence by iterating reversed before calling this if needed
+        key = (r.get("target_date"), r.get("card_type"), str(r.get("bet_type") or "").lower(), _norm_name(r.get("pick")), _norm_name(r.get("team")), _norm_name(r.get("opponent")), str(r.get("confidence") or ""))
         if key in seen:
             continue
-        seen.add(key)
-        out.append(r)
+        seen.add(key); out.append(r)
     return out
 
 
@@ -616,90 +602,116 @@ def _build_performance_summary(rows: list) -> dict:
     wins = sum(1 for r in graded if r.get("result_status") == "Win")
     losses = sum(1 for r in graded if r.get("result_status") == "Loss")
     total = wins + losses
-
     def group_summary(field):
         groups = {}
         for r in graded:
             k = str(r.get(field) or "Unknown")
             groups.setdefault(k, {"graded_picks": 0, "wins": 0, "losses": 0})
             groups[k]["graded_picks"] += 1
-            if r.get("result_status") == "Win":
-                groups[k]["wins"] += 1
-            else:
-                groups[k]["losses"] += 1
-        out = []
-        for k, v in sorted(groups.items()):
+            if r.get("result_status") == "Win": groups[k]["wins"] += 1
+            else: groups[k]["losses"] += 1
+        out=[]
+        for k,v in sorted(groups.items()):
             denom = v["wins"] + v["losses"]
             out.append({field: k, **v, "win_rate": round(v["wins"] / denom, 4) if denom else None})
         return out
-
-    recent = sorted(rows, key=lambda r: (str(r.get("target_date") or ""), str(r.get("graded_at_et") or "")), reverse=True)[:50]
+    recent = sorted(rows, key=lambda r: (str(r.get("target_date") or ""), str(r.get("graded_at_et") or "")), reverse=True)[:100]
     return {
-        "overall": {
-            "graded_picks": total,
-            "wins": wins,
-            "losses": losses,
-            "win_rate": round(wins / total, 4) if total else None,
-        },
+        "overall": {"graded_picks": total, "wins": wins, "losses": losses, "win_rate": round(wins / total, 4) if total else None},
         "by_bet_type": group_summary("bet_type"),
         "by_confidence": group_summary("confidence"),
+        "by_card_type": group_summary("card_type"),
         "recent_results": recent,
     }
 
 
-def grade_date_results(target_date: str, season: int = 2026) -> dict:
+def grade_date_results(target_date: str, season: int = 2026, include_refined: bool = True) -> dict:
     hist = _history_dir()
-    app_file = _latest_appdata_for_date(target_date)
-    if not app_file:
-        return {"status": "no_file", "message": f"No appdata file found for {target_date}"}
-
-    with open(app_file, "r", encoding="utf-8") as f:
-        payload = json.load(f)
-    plays = _extract_final_card_rows(payload)
-
-    # Save/refresh the locked final card snapshot used by the app.
-    final_card_snapshot = {"target_date": target_date, "source_file": app_file.name, "rows": plays}
-    (hist / "final_card_by_date_latest.json").write_text(json.dumps(final_card_snapshot, indent=2), encoding="utf-8")
-
-    if not plays:
-        return {"status": "no_plays", "message": f"No gradeable final-card plays found in {app_file.name}", "source_file": app_file.name}
-
-    new_rows = [_grade_pick(play, target_date, season) for play in plays]
-
-    existing_rows = []
+    final_rows = _card_rows_for_date(target_date, "final_card")
+    refined_rows = _card_rows_for_date(target_date, "refined_picks") if include_refined else []
+    new_rows = []
+    new_rows.extend(_grade_pick(play, target_date, season, "Final Card") for play in final_rows)
+    new_rows.extend(_grade_pick(play, target_date, season, "Refined Picks") for play in refined_rows)
+    if not new_rows:
+        return {"status": "no_plays", "date": target_date, "message": "No locked/appdata picks found to grade"}
     latest_path = hist / "results_history_latest.json"
+    existing_rows = []
     if latest_path.exists():
         try:
-            existing = json.loads(latest_path.read_text(encoding="utf-8"))
-            existing_rows = existing.get("rows") or []
+            existing_rows = (json.loads(latest_path.read_text(encoding="utf-8")).get("rows") or [])
         except Exception:
             existing_rows = []
-
-    # New rows first so same-date regrades replace older attempts.
     all_rows = _dedupe_result_rows(new_rows + existing_rows)
     summary = _build_performance_summary(all_rows)
-
     latest_payload = {"graded_rows": len(all_rows), "rows": all_rows, "updated_at_et": dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ")}
-    latest_path.write_text(json.dumps(latest_payload, indent=2), encoding="utf-8")
-    (hist / "performance_summary_latest.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-
-    # Also maintain append-readable jsonl files for troubleshooting.
+    latest_path.write_text(json.dumps(latest_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    (hist / "performance_summary_latest.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     (hist / "results_history.jsonl").write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in all_rows) + "\n", encoding="utf-8")
+    return {"status": "ok", "date": target_date, "final_card_rows": len(final_rows), "refined_rows": len(refined_rows), "graded_new_rows": len(new_rows), "total_rows": len(all_rows), "summary": summary.get("overall")}
 
-    return {"status": "ok", "date": target_date, "source_file": app_file.name, "graded_new_rows": len(new_rows), "total_rows": len(all_rows), "summary": summary.get("overall")}
 
+def grade_recent_slates_including_today(season: int = 2026, days_back: int = 4) -> dict:
+    """Grade today's slate plus recent previous slates every time Reload App runs.
 
-def grade_recent_finished_cards(days_back: int = 4, season: int = 2026) -> dict:
-    today = dt.datetime.now(ZoneInfo("America/New_York")).date()
+    This does NOT unlock/remove picks. The 4AM lock still protects the cards.
+    It only updates result files, and re-grades pending rows when final stats appear.
+    """
+    now = dt.datetime.now(ZoneInfo("America/New_York"))
     results = []
-    # Grade yesterday and a few recent prior dates. Do not grade today by default because games may still be pending.
-    for i in range(1, max(days_back, 1) + 1):
-        d = (today - dt.timedelta(days=i)).strftime("%Y-%m-%d")
+    # Include today (i=0) because some slates finish before midnight and the user wants results immediately.
+    for i in range(0, max(days_back, 0) + 1):
+        d = (now.date() - dt.timedelta(days=i)).strftime("%Y-%m-%d")
         try:
-            results.append(grade_date_results(d, season))
+            results.append(grade_date_results(d, season, include_refined=True))
         except Exception as e:
             results.append({"status": "error", "date": d, "message": str(e)})
-    return {"status": "ok", "graded_dates_checked": results}
+    return {
+        "status": "ok",
+        "mode": "today_plus_recent",
+        "ran_at_et": now.strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " "),
+        "results": results,
+    }
+
+
+def auto_grade_after_4am(season: int = 2026) -> dict:
+    """Compatibility endpoint. Kept for older code, but now grades today + recent slates.
+
+    The app's card lock/reset remains governed by the V41 4AM slate lock.
+    Result grading is safe to run anytime because pending rows are replaced when final stats arrive.
+    """
+    return grade_recent_slates_including_today(season=season, days_back=4)
+
+
+@app.get("/reset-results")
+def reset_results(start_date: str | None = None):
+    hist = _history_dir()
+    backup_dir = hist / "backup_results"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d_%H%M%S")
+    for name in ["performance_summary_latest.json", "results_history_latest.json", "results_history.jsonl"]:
+        src = hist / name
+        if src.exists():
+            try:
+                (backup_dir / f"{stamp}_{name}").write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+            except Exception:
+                pass
+            try:
+                src.unlink()
+            except Exception:
+                pass
+    if start_date:
+        start = dt.datetime.strptime(start_date, "%Y-%m-%d").date()
+        today = dt.datetime.now(ZoneInfo("America/New_York")).date()
+        results = []
+        d = start
+        while d <= today:
+            results.append(grade_date_results(d.strftime("%Y-%m-%d"), season=2026))
+            d += dt.timedelta(days=1)
+        return JSONResponse({"status": "ok", "message": "Results reset and regraded. Pregame/in-progress picks stay Pending and do not count as losses.", "start_date": start_date, "results": results})
+    empty_summary = _build_performance_summary([])
+    (hist / "performance_summary_latest.json").write_text(json.dumps(empty_summary, indent=2), encoding="utf-8")
+    (hist / "results_history_latest.json").write_text(json.dumps({"graded_rows": 0, "rows": []}, indent=2), encoding="utf-8")
+    return JSONResponse({"status": "ok", "message": "Results reset. No dates regraded."})
 
 
 @app.get("/latest")
@@ -707,14 +719,17 @@ def latest():
     return JSONResponse(load_latest_data())
 
 
+@app.get("/health")
+def health():
+    return JSONResponse({"status": "ok", "service": "hr-picks-app"})
+
+
 @app.get("/grade-results")
 def grade_results(date: str | None = None):
     try:
         if date:
-            result = grade_date_results(date, 2026)
-        else:
-            result = grade_recent_finished_cards(days_back=4, season=2026)
-        return JSONResponse(result)
+            return JSONResponse(grade_date_results(date, 2026, include_refined=True))
+        return JSONResponse(auto_grade_after_4am(season=2026))
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
@@ -743,19 +758,18 @@ def refresh_data():
         today = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
         try:
-            # First grade any recently completed cards so the Results tab updates.
-            grade_recent_finished_cards(days_back=4, season=2026)
-
-            # Then build today's fresh card.
+            # First build/lock today's latest cards.
+            # Then grade today + recent slates so completed games immediately appear in Results.
             run_model_main(2026, today)
-
+            auto_grade_result = grade_recent_slates_including_today(season=2026, days_back=4)
             duration = round(time.time() - start_time, 2)
             return JSONResponse({
                 "status": "ok",
-                "message": "Data refreshed",
+                "message": "Data refreshed and results checked",
                 "date": today,
                 "timezone": "America/New_York",
                 "duration_seconds": duration,
+                "auto_grade": auto_grade_result,
             })
         except Exception as e:
             return JSONResponse(
@@ -1571,7 +1585,49 @@ function renderResults() {
   const overall = results.overall || {};
   const byType = Array.isArray(results.by_bet_type) ? results.by_bet_type : [];
   const byConf = Array.isArray(results.by_confidence) ? results.by_confidence : [];
+  const byCardType = Array.isArray(results.by_card_type) ? results.by_card_type : [];
   const recent = Array.isArray(results.recent_results) ? results.recent_results : [];
+
+  function pctText(v) {
+    return v !== undefined && v !== null ? esc((Number(v) * 100).toFixed(1) + '%') : '—';
+  }
+
+  function cardSummary(cardType) {
+    const rows = recent.filter(r => String(r.card_type || '') === cardType && ['Win', 'Loss'].includes(String(r.result_status || '')));
+    const wins = rows.filter(r => r.result_status === 'Win').length;
+    const losses = rows.filter(r => r.result_status === 'Loss').length;
+    const total = wins + losses;
+    return { total, wins, losses, winRate: total ? wins / total : null };
+  }
+
+  function summaryCard(title, cardType, note) {
+    const s = cardSummary(cardType);
+    return `<div class="card">
+      <h2>${esc(title)}</h2>
+      <div class="line"><span class="label">Graded Picks:</span> ${esc(fmt(s.total))}</div>
+      <div class="line"><span class="label">Wins:</span> ${esc(fmt(s.wins))}</div>
+      <div class="line"><span class="label">Losses:</span> ${esc(fmt(s.losses))}</div>
+      <div class="line"><span class="label">Win Rate:</span> ${s.winRate !== null ? esc((s.winRate * 100).toFixed(1) + '%') : '—'}</div>
+      <div class="muted">${esc(note)}</div>
+    </div>`;
+  }
+
+  function tableRowsFor(cardType) {
+    return recent.filter(r => String(r.card_type || '') === cardType);
+  }
+
+  function resultsTable(title, rows) {
+    return `<div class="table-shell" style="margin-top:18px;">
+      <h2 style="margin-top:0;">${esc(title)}</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Date</th><th>Card</th><th>Bet Type</th><th>Pick</th><th>Team</th><th>Opponent</th><th>Confidence</th><th>Result</th><th class="wrap">Detail</th></tr></thead>
+        <tbody>
+        ${rows.map(r => `<tr><td>${esc(fmt(r.target_date))}</td><td>${esc(fmt(r.card_type || 'Unknown'))}</td><td>${esc(fmt(r.bet_type))}</td><td>${esc(fmt(r.pick))}</td><td>${esc(fmt(r.team))}</td><td>${esc(fmt(r.opponent))}</td><td>${esc(fmt(r.confidence))}</td><td>${esc(fmt(r.result_status))}</td><td class="wrap">${esc(fmt(r.result_detail))}</td></tr>`).join("") || '<tr><td colspan="9">No graded picks yet.</td></tr>'}
+        </tbody>
+      </table></div>
+    </div>`;
+  }
+
   mount.innerHTML = `
     <div class="cards">
       <div class="card"><h2>Overall Performance</h2>
@@ -1581,29 +1637,39 @@ function renderResults() {
         <div class="line"><span class="label">Win Rate:</span> ${overall.win_rate !== undefined && overall.win_rate !== null ? esc((overall.win_rate * 100).toFixed(1) + '%') : '—'}</div>
       </div>
       <div class="card"><h2>What This Is For</h2>
-        <div class="line">This tab tracks how saved picks perform over time so you can see what the model does well and where it needs tightening.</div>
+        <div class="line">Final Card = official top-card plays. Refined Picks = broader model/research plays. They are now tracked separately.</div>
       </div>
     </div>
+
     <div class="cards" style="margin-top:18px;">
+      ${summaryCard('Final Card Results', 'Final Card', 'Official card picks only.')}
+      ${summaryCard('Refined Picks Results', 'Refined Picks', 'Broader research/model picks only.')}
+    </div>
+
+    <div class="cards" style="margin-top:18px;">
+      <div class="table-shell">
+        <h2 style="margin-top:0;">By Card Type</h2>
+        <div class="table-wrap"><table><thead><tr><th>Card Type</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
+        ${byCardType.map(r => `<tr><td>${esc(fmt(r.card_type))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${pctText(r.win_rate)}</td></tr>`).join("") || '<tr><td colspan="5">No card-type results yet.</td></tr>'}
+        </tbody></table></div>
+      </div>
       <div class="table-shell">
         <h2 style="margin-top:0;">By Bet Type</h2>
         <div class="table-wrap"><table><thead><tr><th>Bet Type</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
-        ${byType.map(r => `<tr><td>${esc(fmt(r.bet_type))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${r.win_rate !== undefined && r.win_rate !== null ? esc((Number(r.win_rate) * 100).toFixed(1) + '%') : '—'}</td></tr>`).join("") || '<tr><td colspan="5">No graded results yet.</td></tr>'}
+        ${byType.map(r => `<tr><td>${esc(fmt(r.bet_type))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${pctText(r.win_rate)}</td></tr>`).join("") || '<tr><td colspan="5">No graded results yet.</td></tr>'}
         </tbody></table></div>
       </div>
       <div class="table-shell">
         <h2 style="margin-top:0;">By Confidence</h2>
         <div class="table-wrap"><table><thead><tr><th>Confidence</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
-        ${byConf.map(r => `<tr><td>${esc(fmt(r.confidence))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${r.win_rate !== undefined && r.win_rate !== null ? esc((Number(r.win_rate) * 100).toFixed(1) + '%') : '—'}</td></tr>`).join("") || '<tr><td colspan="5">No confidence-level results yet.</td></tr>'}
+        ${byConf.map(r => `<tr><td>${esc(fmt(r.confidence))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${pctText(r.win_rate)}</td></tr>`).join("") || '<tr><td colspan="5">No confidence-level results yet.</td></tr>'}
         </tbody></table></div>
       </div>
     </div>
-    <div class="table-shell" style="margin-top:18px;">
-      <h2 style="margin-top:0;">Recent Graded Picks</h2>
-      <div class="table-wrap"><table><thead><tr><th>Date</th><th>Bet Type</th><th>Pick</th><th>Team</th><th>Opponent</th><th>Confidence</th><th>Result</th><th class="wrap">Detail</th></tr></thead><tbody>
-      ${recent.map(r => `<tr><td>${esc(fmt(r.target_date))}</td><td>${esc(fmt(r.bet_type))}</td><td>${esc(fmt(r.pick))}</td><td>${esc(fmt(r.team))}</td><td>${esc(fmt(r.opponent))}</td><td>${esc(fmt(r.confidence))}</td><td>${esc(fmt(r.result_status))}</td><td class="wrap">${esc(fmt(r.result_detail))}</td></tr>`).join("") || '<tr><td colspan="8">No graded picks yet.</td></tr>'}
-      </tbody></table></div>
-    </div>
+
+    ${resultsTable('Final Card Graded Picks', tableRowsFor('Final Card'))}
+    ${resultsTable('Refined Picks Graded Picks', tableRowsFor('Refined Picks'))}
+    ${resultsTable('All Recent Graded Picks', recent)}
   `;
 }
 
