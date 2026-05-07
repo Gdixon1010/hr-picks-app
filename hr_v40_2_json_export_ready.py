@@ -1578,7 +1578,7 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
             lineup_mask &
             (
                 ((rows["lineup_status"].astype(str).eq("Confirmed Starter")) & (rows["Hit_score"] >= 4.25)) |
-                ((~rows["lineup_status"].astype(str).eq("Confirmed Starter")) & (rows["Hit_score"] >= 4.75))
+                ((~rows["lineup_status"].astype(str).eq("Confirmed Starter")) & (rows["Hit_score"] >= 3.70))
             ) &
             (~rows["opponent_pitcher_pick_type"].astype(str).isin(["Strong SP"]))
         ].copy()
@@ -1706,12 +1706,12 @@ def build_refined_from_top_hits(top_picks, pitcher_metrics=None, game_rankings=N
         valid_game_mask &
         (
             (confirmed_mask & (rows["Hit_score"] >= 4.25)) |
-            (unknown_mask & (rows["Hit_score"] >= 4.75))
+            (unknown_mask & (rows["Hit_score"] >= 3.70))
         ) &
         (~rows["opponent_pitcher_pick_type"].astype(str).eq("Strong SP"))
     ].copy()
     if rows.empty:
-        return pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No Top Picks HIT rows passed refined Top-6 fallback filter"}], columns=cols)
+        return pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No Top Picks HIT rows passed refined Top-6 fallback filter (confirmed>=4.25, prelineup unknown>=3.70, valid game required)"}], columns=cols)
 
     rows = rows.sort_values(["lineup_status","Hit_score","slot_num"], ascending=[True, False, True])
     # No duplicate player within the same slate/game context.
