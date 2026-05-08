@@ -1403,6 +1403,206 @@ def build_pitcher_line_value(pitcher_metrics):
     return pd.DataFrame(rows, columns=cols).sort_values(["projected_k_mid","pitcher_score_adj"], ascending=False).reset_index(drop=True)
 
 
+
+# ------------------------------
+# K PROP MARKET VALIDATION V2
+# ------------------------------
+def _k_first_existing_column(df: pd.DataFrame, candidates: list[str]):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _k_norm_text(v) -> str:
+    if v is None:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", str(v).strip().lower())
+
+
+def load_current_k_market_lines(target_date: str) -> pd.DataFrame:
+    """
+    Optional current sportsbook K-line file.
+
+    This is intentionally strict: K props are blocked from the Final Card unless
+    a CURRENT market line is supplied. This prevents stale 5.5 lines from being
+    treated as live value when the real book is already 7.5.
+
+    Accepted files in OUTPUT_DIR:
+      - k_lines_YYYY-MM-DD.csv
+      - posted_k_lines_YYYY-MM-DD.csv
+      - current_k_lines_YYYY-MM-DD.csv
+      - k_lines.csv
+      - posted_k_lines.csv
+      - current_k_lines.csv
+
+    Accepted columns:
+      pitcherName / pitcher / player / playerName / name
+      teamName / team / pitcherTeam
+      opponentTeam / opponent / opp
+      current_k_line / posted_k_line / k_line / line / strikeout_line
+      opening_k_line / open_k_line / opener_line   optional
+      over_odds / k_over_odds / odds               optional
+      book / sportsbook / source                   optional
+    """
+    configured = os.getenv("HR_K_LINES_CSV")
+    candidates = []
+    if configured:
+        candidates.append(Path(configured))
+    candidates.extend([
+        OUTPUT_DIR / f"current_k_lines_{target_date}.csv",
+        OUTPUT_DIR / f"posted_k_lines_{target_date}.csv",
+        OUTPUT_DIR / f"k_lines_{target_date}.csv",
+        OUTPUT_DIR / "current_k_lines.csv",
+        OUTPUT_DIR / "posted_k_lines.csv",
+        OUTPUT_DIR / "k_lines.csv",
+    ])
+
+    empty_cols = [
+        "pitcherName", "teamName", "opponentTeam", "current_k_line",
+        "opening_k_line", "k_over_odds", "k_line_book", "k_line_source",
+        "_pitcher_key", "_team_key"
+    ]
+
+    path = next((p for p in candidates if p and p.exists()), None)
+    if path is None:
+        print_step("⚠️ No current K-line CSV found. K props will be blocked from Final Card until live lines are supplied.")
+        return pd.DataFrame(columns=empty_cols)
+
+    try:
+        raw = pd.read_csv(path)
+    except Exception as e:
+        print_step(f"⚠️ Could not read K-line CSV {path}: {e}. K props will be blocked from Final Card.")
+        return pd.DataFrame(columns=empty_cols)
+
+    if raw is None or raw.empty:
+        print_step(f"⚠️ K-line CSV {path} was empty. K props will be blocked from Final Card.")
+        return pd.DataFrame(columns=empty_cols)
+
+    pitcher_col = _k_first_existing_column(raw, ["pitcherName", "pitcher", "player", "playerName", "name"])
+    team_col = _k_first_existing_column(raw, ["teamName", "team", "pitcherTeam"])
+    opp_col = _k_first_existing_column(raw, ["opponentTeam", "opponent", "opp", "opponentName"])
+    current_line_col = _k_first_existing_column(raw, ["current_k_line", "posted_k_line", "k_line", "line", "strikeout_line", "strikeouts_line", "so_line"])
+    opening_line_col = _k_first_existing_column(raw, ["opening_k_line", "open_k_line", "opener_line", "opening_line"])
+    odds_col = _k_first_existing_column(raw, ["over_odds", "k_over_odds", "odds", "price"])
+    book_col = _k_first_existing_column(raw, ["book", "sportsbook", "source"])
+
+    if pitcher_col is None or current_line_col is None:
+        print_step(f"⚠️ K-line CSV {path} is missing pitcher/current line columns. K props will be blocked from Final Card.")
+        return pd.DataFrame(columns=empty_cols)
+
+    out = pd.DataFrame()
+    out["pitcherName"] = raw[pitcher_col].astype(str)
+    out["teamName"] = raw[team_col].astype(str) if team_col else ""
+    out["opponentTeam"] = raw[opp_col].astype(str) if opp_col else ""
+    out["current_k_line"] = pd.to_numeric(raw[current_line_col], errors="coerce")
+    out["opening_k_line"] = pd.to_numeric(raw[opening_line_col], errors="coerce") if opening_line_col else None
+    out["k_over_odds"] = raw[odds_col].astype(str) if odds_col else ""
+    out["k_line_book"] = raw[book_col].astype(str) if book_col else "manual_csv"
+    out["k_line_source"] = str(path)
+    out = out[out["current_k_line"].notna()].copy()
+    out["_pitcher_key"] = out["pitcherName"].apply(_k_norm_text)
+    out["_team_key"] = out["teamName"].apply(_k_norm_text)
+    out = out.drop_duplicates(subset=["_pitcher_key", "_team_key"], keep="last")
+    print_step(f"✅ Loaded current K market lines from {path}: {len(out)} verified lines")
+    return out
+
+
+def apply_k_market_validation(pitcher_line_value: pd.DataFrame, target_date: str) -> pd.DataFrame:
+    """
+    Adds current-market validation for K props.
+
+    Final Card rule:
+    - Must have a supplied current sportsbook line
+    - Current line must be <= model max playable line
+    - Projected midpoint must clear current line by at least +1.25 Ks
+    - If opening line is supplied and market moved up by >= 1.5 Ks, require +1.75 Ks edge
+    """
+    if pitcher_line_value is None:
+        return pitcher_line_value
+
+    df = pitcher_line_value.copy()
+    if df.empty:
+        return df
+
+    df["_pitcher_key"] = df["pitcherName"].apply(_k_norm_text) if "pitcherName" in df.columns else ""
+    df["_team_key"] = df["teamName"].apply(_k_norm_text) if "teamName" in df.columns else ""
+
+    lines = load_current_k_market_lines(target_date)
+
+    for c in ["current_k_line", "opening_k_line", "k_over_odds", "k_line_book", "k_line_source"]:
+        if c not in df.columns:
+            df[c] = None
+
+    if lines.empty:
+        df["k_market_line_status"] = "Missing current sportsbook K line - blocked from Final Card"
+        df["k_market_ok"] = False
+        df["k_edge_vs_market"] = None
+        df["k_line_movement"] = None
+        df["k_market_moved_up_flag"] = False
+    else:
+        df = df.merge(
+            lines[["_pitcher_key", "_team_key", "current_k_line", "opening_k_line", "k_over_odds", "k_line_book", "k_line_source"]],
+            on=["_pitcher_key", "_team_key"],
+            how="left",
+            suffixes=("", "_line")
+        )
+
+        for col in ["current_k_line", "opening_k_line", "k_over_odds", "k_line_book", "k_line_source"]:
+            line_col = f"{col}_line"
+            if line_col in df.columns:
+                df[col] = df[line_col].combine_first(df[col])
+                df = df.drop(columns=[line_col])
+
+        # Pitcher-only fallback if team names do not match exactly.
+        missing = df["current_k_line"].isna()
+        if missing.any():
+            pitcher_only = lines.drop_duplicates(subset=["_pitcher_key"], keep="last")[["_pitcher_key", "current_k_line", "opening_k_line", "k_over_odds", "k_line_book", "k_line_source"]]
+            fallback = df.loc[missing, ["_pitcher_key"]].merge(pitcher_only, on="_pitcher_key", how="left")
+            for col in ["current_k_line", "opening_k_line", "k_over_odds", "k_line_book", "k_line_source"]:
+                df.loc[missing, col] = fallback[col].values
+
+        projected_mid = pd.to_numeric(df.get("projected_k_mid"), errors="coerce")
+        current_line = pd.to_numeric(df.get("current_k_line"), errors="coerce")
+        opening_line = pd.to_numeric(df.get("opening_k_line"), errors="coerce")
+        model_max = pd.to_numeric(df.get("max_playable_k_line"), errors="coerce")
+
+        df["k_edge_vs_market"] = (projected_mid - current_line).round(2)
+        df["k_line_movement"] = (current_line - opening_line).round(2)
+        df["k_market_moved_up_flag"] = df["k_line_movement"].fillna(0) >= 1.5
+
+        required_edge = df["k_market_moved_up_flag"].map(lambda moved: 1.75 if moved else 1.25)
+        df["k_market_ok"] = (
+            current_line.notna()
+            & model_max.notna()
+            & (current_line <= model_max)
+            & (df["k_edge_vs_market"] >= required_edge)
+        )
+
+        def _status(row):
+            line = row.get("current_k_line")
+            if pd.isna(line):
+                return "Missing current sportsbook K line - blocked from Final Card"
+            edge = row.get("k_edge_vs_market")
+            model_max_line = row.get("max_playable_k_line")
+            moved = bool(row.get("k_market_moved_up_flag"))
+            move = row.get("k_line_movement")
+            if not row.get("k_market_ok"):
+                reason = f"Current line {line:g}; projected mid {row.get('projected_k_mid')}; edge {edge}; model max {model_max_line}"
+                if moved:
+                    reason += f"; market moved up {move:g} Ks"
+                return reason + " - blocked from Final Card"
+            reason = f"Current line {line:g}; projected mid {row.get('projected_k_mid')}; edge +{edge}; model max {model_max_line}"
+            if moved:
+                reason += f"; market moved up {move:g} Ks but edge still qualifies"
+            return reason + " - eligible"
+
+        df["k_market_line_status"] = df.apply(_status, axis=1)
+
+    df = df.drop(columns=[c for c in ["_pitcher_key", "_team_key"] if c in df.columns], errors="ignore")
+    return df
+
+
 def build_daily_card(game_rankings, refined_picks, pitcher_line_value, hr_drought):
     rows = []
     used_teams = set()
@@ -1583,21 +1783,41 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
         )
         hr_added += 1
 
-    # K prop: one elite only
+    # K prop: one elite only, but ONLY if current sportsbook line still has value.
+    # This blocks stale 5.5-line picks when the live market has already moved to 7.5.
     if pitcher_line_value is not None and not pitcher_line_value.empty:
-        k_pool = pitcher_line_value[
-            (pitcher_line_value["starter_status"] == "Confirmed") &
-            (~pitcher_line_value["short_leash_flag"].astype(str).str.startswith("Yes", na=False)) &
-            (pitcher_line_value["k_value_tier"].isin(["Hammer", "Strong"])) &
-            (pitcher_line_value["max_playable_k_line"].astype(str) != "")
-        ].copy().sort_values(["projected_k_mid","pitcher_score_adj"], ascending=[False, False])
+        kdf = pitcher_line_value.copy()
+        for c, default in [
+            ("starter_status", ""), ("short_leash_flag", ""), ("k_value_tier", ""),
+            ("max_playable_k_line", None), ("projected_k_mid", 0), ("projected_k_floor", 0),
+            ("projected_k_ceiling", 0), ("pitcher_score_adj", 0),
+            ("current_k_line", None), ("k_market_ok", False), ("k_edge_vs_market", None),
+            ("k_market_line_status", "Missing current sportsbook K line - blocked from Final Card"),
+            ("k_line_book", ""), ("k_over_odds", ""),
+        ]:
+            if c not in kdf.columns:
+                kdf[c] = default
+
+        k_pool = kdf[
+            (kdf["starter_status"] == "Confirmed") &
+            (~kdf["short_leash_flag"].astype(str).str.startswith("Yes", na=False)) &
+            (kdf["k_value_tier"].isin(["Hammer", "Strong"])) &
+            (kdf["k_market_ok"].astype(bool) == True)
+        ].copy().sort_values(["k_edge_vs_market", "projected_k_mid", "pitcher_score_adj"], ascending=[False, False, False])
+
         for _, r in k_pool.iterrows():
             if not can_use_team(r["teamName"], 2):
                 continue
+            current_line = r.get("current_k_line")
+            edge = r.get("k_edge_vs_market")
             add_row(
                 f"Pitch {1}", "K Prop", r["pitcherName"], r["teamName"], r["opponentTeam"],
-                "A" if r["k_value_tier"] == "Hammer" else "B",
-                f"{r['recommended_k_action']}; projected {r['projected_k_floor']}-{r['projected_k_ceiling']} Ks",
+                "A" if float(edge or 0) >= 1.75 else "B",
+                (
+                    f"Current market line {float(current_line):g}; projected {r['projected_k_floor']}-{r['projected_k_ceiling']} Ks; "
+                    f"edge vs market +{float(edge):.2f}; {r.get('k_market_line_status')}; "
+                    f"book/source {r.get('k_line_book') or 'manual_csv'}"
+                ),
                 "Pitcher_Line_Value"
             )
             break
@@ -1663,6 +1883,7 @@ def main(season: int, target_date: str):
     player_rows = enrich_player_rows_with_team_context(player_rows, pitcher_metrics, team_context_df)
     pitcher_metrics = enrich_pitcher_metrics_with_team_context(pitcher_metrics, team_context_df)
     pitcher_line_value = build_pitcher_line_value(pitcher_metrics)
+    pitcher_line_value = apply_k_market_validation(pitcher_line_value, target_date)
     game_rankings = build_game_rankings(schedule_rows, player_rows, player_rows, pitcher_metrics)
     game_rankings = add_game_edge_engine(game_rankings)
     print_step("✅ Game Edge Engine applied to Game_Rankings")
