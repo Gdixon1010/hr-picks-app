@@ -47,7 +47,7 @@ def gee_edge_to_projected_win_pct(row):
     pitcher_gap = pitcher_adj - opp_pitcher_adj
     win_pct = 50.0
     win_pct += max(min(edge * 0.45, 12), -12)
-    win_pct += max(min(pitcher_gap * 0.12, 8), -8)
+    win_pct += max(min(pitcher_gap * 0.07, 5), -5)
     win_pct += max(min(offense_adv * 4.0, 5), -5)
     win_pct -= volatility_penalty * 6
     win_pct -= public_penalty * 5
@@ -57,7 +57,7 @@ def gee_edge_to_projected_win_pct(row):
     opp_type = str(row.get("opponent_pitcher_pick_type", "")).lower()
     if "strong sp" in opp_type:
         win_pct -= 2.0
-    win_pct = max(35.0, min(72.0, win_pct))
+    win_pct = max(38.0, min(66.0, win_pct))
     return round(win_pct, 1)
 
 def gee_get_volatility_label(row):
@@ -1290,59 +1290,113 @@ def build_game_rankings(schedule_rows, hr_rows, hit_rows, pitcher_metrics):
     return df.sort_values(["game", "team_score"], ascending=[True, False]).reset_index(drop=True)
 
 def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
+    """
+    Refined Picks v2.1 — Top-6 max, hitter-only research card.
+
+    Changes:
+    - HARD cap: max 6 refined picks total.
+    - Removes HR picks from Refined Picks; HR stays in Top Picks/Tier system only.
+    - Max 2 hitters per team.
+    - Requires valid game mapping.
+    - Blocks Strong SP matchups.
+    - If lineups are confirmed, prioritizes confirmed starters in slots 1-6.
+    - If lineups are not available yet, allows only stronger projected hitters.
+    """
     cols = ["category","bet_type","playerName","teamName","game","opponent_pitcher","opponent_pitcher_team","opponent_pitcher_pick_type","opponent_pitcher_sample","lineup_status","batting_order_slot","starter_only_flag","HR_score","Hit_score","park_favorability","stack_tag","reason"]
-    if player_rows.empty or pitcher_metrics.empty:
+
+    if player_rows is None or player_rows.empty or pitcher_metrics is None or pitcher_metrics.empty:
         return pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No refined picks met today’s filters"}], columns=cols)
 
-    pm = pitcher_metrics[["teamName","opponentTeam","pitcherName","pick_type","sample_flag","short_leash_flag"]].rename(columns={
-        "teamName":"opponent_pitcher_team","opponentTeam":"teamName","pitcherName":"opponent_pitcher","pick_type":"opponent_pitcher_pick_type","sample_flag":"opponent_pitcher_sample"
+    pm = pitcher_metrics[["teamName","opponentTeam","pitcherName","pick_type","sample_flag","short_leash_flag"]].drop_duplicates().rename(columns={
+        "teamName":"opponent_pitcher_team",
+        "opponentTeam":"teamName",
+        "pitcherName":"opponent_pitcher",
+        "pick_type":"opponent_pitcher_pick_type",
+        "sample_flag":"opponent_pitcher_sample",
     })
-    ctx = game_rankings[["teamName","opponentTeam","game","offense_score","edge_vs_opponent","recommended_play"]].drop_duplicates()
+
+    if game_rankings is not None and not game_rankings.empty:
+        ctx_cols = [c for c in ["teamName","opponentTeam","game","offense_score","edge_vs_opponent","recommended_play","projected_win_pct","volatility_label","parlay_grade"] if c in game_rankings.columns]
+        ctx = game_rankings[ctx_cols].drop_duplicates()
+    else:
+        ctx = pd.DataFrame(columns=["teamName","opponentTeam","game","offense_score","edge_vs_opponent","recommended_play"])
+
     rows = player_rows.merge(pm, on="teamName", how="left")
     merge_keys = ["teamName", "opponentTeam"] if "opponentTeam" in rows.columns and "opponentTeam" in ctx.columns else ["teamName"]
     rows = rows.merge(ctx, on=merge_keys, how="left")
 
-    picks = []
+    # Defensive defaults
+    for c, default in [("Hit_score", 0), ("HR_score", 0), ("batting_order_slot", 99), ("offense_score", 0), ("edge_vs_opponent", 0)]:
+        if c not in rows.columns:
+            rows[c] = default
+        rows[c] = pd.to_numeric(rows[c], errors="coerce").fillna(default)
+
+    for c, default in [("lineup_status", "Unknown"), ("starter_only_flag", False), ("opponent_pitcher_pick_type", "Neutral"), ("park_favorability", "Unknown")]:
+        if c not in rows.columns:
+            rows[c] = default
+
+    if "game" not in rows.columns:
+        rows["game"] = None
+
+    rows["game_str"] = rows["game"].astype(str)
+    valid_game = rows["game_str"].notna() & (~rows["game_str"].str.strip().isin(["", "—", "-", "None", "nan"]))
+    confirmed_count = int(rows["lineup_status"].astype(str).eq("Confirmed Starter").sum())
+    use_confirmed_only = confirmed_count >= 5
+
+    rows["slot_num"] = pd.to_numeric(rows["batting_order_slot"], errors="coerce").fillna(99)
+    confirmed = rows["lineup_status"].astype(str).eq("Confirmed Starter")
+
+    if use_confirmed_only:
+        quality_mask = confirmed & (rows["slot_num"] <= 6) & (rows["Hit_score"] >= 3.75)
+        mode_label = "confirmed-only"
+    else:
+        # Pregame mode: avoid flooding. Unknowns need a higher score because lineups are not locked yet.
+        quality_mask = (
+            (confirmed & (rows["Hit_score"] >= 3.75)) |
+            ((~confirmed) & (rows["Hit_score"] >= 4.25))
+        )
+        mode_label = "pregame-projected"
+
     hit_pool = rows[
-        (rows["Hit_score"].notna()) &
-        (rows["opponent_pitcher_pick_type"].fillna("Neutral") != "Strong SP") &
-        (rows["starter_only_flag"] == True) &
-        ((rows["offense_score"].fillna(0) >= 2.5) | (rows["edge_vs_opponent"].fillna(0) > 0))
-    ].copy().sort_values(["Hit_score","batting_order_slot"], ascending=[False, True])
-    hit_pool = apply_team_pick_caps(hit_pool, MAX_REFINED_PICKS_PER_TEAM)
-    for _, r in hit_pool.head(5).iterrows():
+        valid_game &
+        quality_mask &
+        (~rows["opponent_pitcher_pick_type"].astype(str).eq("Strong SP"))
+    ].copy()
+
+    if hit_pool.empty:
+        return pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No refined picks met Top-6 quality gate"}], columns=cols)
+
+    # Rank by hitter quality first, then lineup quality, then game edge.
+    hit_pool["lineup_rank"] = hit_pool["lineup_status"].astype(str).eq("Confirmed Starter").astype(int)
+    hit_pool = hit_pool.sort_values(["Hit_score", "lineup_rank", "edge_vs_opponent", "slot_num"], ascending=[False, False, False, True])
+    hit_pool = hit_pool.drop_duplicates(subset=["playerName", "teamName", "game"], keep="first")
+    hit_pool = apply_team_pick_caps(hit_pool, max_per_team=2)
+    hit_pool = hit_pool.head(6)
+
+    picks = []
+    for _, r in hit_pool.iterrows():
+        score = nz(r.get("Hit_score"))
         picks.append({
-            "category":"Hit Pick","bet_type":"1+ Hit","playerName":r["playerName"],"teamName":r["teamName"],"game":r.get("game"),
-            "opponent_pitcher":r.get("opponent_pitcher"),"opponent_pitcher_team":r.get("opponent_pitcher_team"),
-            "opponent_pitcher_pick_type":r.get("opponent_pitcher_pick_type"),"opponent_pitcher_sample":r.get("opponent_pitcher_sample"),
-            "lineup_status":r.get("lineup_status"),"batting_order_slot":r.get("batting_order_slot"),"starter_only_flag":r.get("starter_only_flag"),
-            "HR_score":r.get("HR_score"),"Hit_score":r.get("Hit_score"),"park_favorability":r.get("park_favorability"),
-            "stack_tag":"","reason":f"Hit_score {r.get('Hit_score'):.3f}; team vol {r.get('team_volatility')}; own K {r.get('team_k_tendency')}; opp pen {r.get('opp_bullpen_grade')}"
+            "category":"Hit Pick",
+            "bet_type":"1+ Hit",
+            "playerName":r.get("playerName"),
+            "teamName":r.get("teamName"),
+            "game":r.get("game"),
+            "opponent_pitcher":r.get("opponent_pitcher"),
+            "opponent_pitcher_team":r.get("opponent_pitcher_team"),
+            "opponent_pitcher_pick_type":r.get("opponent_pitcher_pick_type"),
+            "opponent_pitcher_sample":r.get("opponent_pitcher_sample"),
+            "lineup_status":r.get("lineup_status"),
+            "batting_order_slot":r.get("batting_order_slot"),
+            "starter_only_flag":r.get("starter_only_flag"),
+            "HR_score":r.get("HR_score"),
+            "Hit_score":score,
+            "park_favorability":r.get("park_favorability"),
+            "stack_tag":"Top-6 refined",
+            "reason":f"Top-6 refined {mode_label}; Hit_score {score:.3f}; slot {r.get('batting_order_slot')}; opp {r.get('opponent_pitcher_pick_type')}; edge {r.get('edge_vs_opponent')}",
         })
 
-    hr_pool = rows[
-        (rows["HR_score"] >= 6.2) &
-        (rows["opponent_pitcher_pick_type"].fillna("Neutral") != "Strong SP") &
-        (rows["starter_only_flag"] == True)
-    ].copy().sort_values(["HR_score","batting_order_slot"], ascending=[False, True])
-    hr_pool = apply_team_pick_caps(hr_pool, MAX_REFINED_PICKS_PER_TEAM)
-    team_counts = hr_pool.head(4)["teamName"].value_counts().to_dict()
-    for _, r in hr_pool.head(4).iterrows():
-        picks.append({
-            "category":"HR Pick","bet_type":"HR","playerName":r["playerName"],"teamName":r["teamName"],"game":r.get("game"),
-            "opponent_pitcher":r.get("opponent_pitcher"),"opponent_pitcher_team":r.get("opponent_pitcher_team"),
-            "opponent_pitcher_pick_type":r.get("opponent_pitcher_pick_type"),"opponent_pitcher_sample":r.get("opponent_pitcher_sample"),
-            "lineup_status":r.get("lineup_status"),"batting_order_slot":r.get("batting_order_slot"),"starter_only_flag":r.get("starter_only_flag"),
-            "HR_score":r.get("HR_score"),"Hit_score":r.get("Hit_score"),"park_favorability":r.get("park_favorability"),
-            "stack_tag":"STACK HR SPOT" if team_counts.get(r["teamName"], 0) >= 2 else "",
-            "reason":f"HR_score {r.get('HR_score'):.3f}; public bias {r.get('public_bias')}; opp pen {r.get('opp_bullpen_grade')}"
-        })
-
-    out = pd.DataFrame(picks, columns=cols)
-    if out.empty:
-        out = pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No refined picks met today’s filters"}], columns=cols)
-    return out
-
+    return pd.DataFrame(picks, columns=cols)
 
 def build_pitcher_line_value(pitcher_metrics):
     cols = [
