@@ -1291,12 +1291,13 @@ def build_game_rankings(schedule_rows, hr_rows, hit_rows, pitcher_metrics):
 
 def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
     """
-    Refined Picks v2.1 — Top-6 max, hitter-only research card.
+    Refined Picks v2.2 — Rolling slate card, max 2 per game / max 10 total.
 
     Changes:
-    - HARD cap: max 6 refined picks total.
-    - Removes HR picks from Refined Picks; HR stays in Top Picks/Tier system only.
+    - HARD cap: max 10 refined picks total.
+    - Max 2 hitters per game so late games are not crowded out by early games.
     - Max 2 hitters per team.
+    - Removes HR picks from Refined Picks; HR stays in Top Picks/Tier system only.
     - Requires valid game mapping.
     - Blocks Strong SP matchups.
     - If lineups are confirmed, prioritizes confirmed starters in slots 1-6.
@@ -1367,11 +1368,34 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
         return pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No refined picks met Top-6 quality gate"}], columns=cols)
 
     # Rank by hitter quality first, then lineup quality, then game edge.
+    # Rolling slate logic:
+    # - max 2 refined picks per game, so late games can still appear on later refreshes
+    # - max 2 per team, to avoid one offense flooding the refined card
+    # - max 10 total refined picks, so this remains a true refined list rather than a research dump
     hit_pool["lineup_rank"] = hit_pool["lineup_status"].astype(str).eq("Confirmed Starter").astype(int)
     hit_pool = hit_pool.sort_values(["Hit_score", "lineup_rank", "edge_vs_opponent", "slot_num"], ascending=[False, False, False, True])
     hit_pool = hit_pool.drop_duplicates(subset=["playerName", "teamName", "game"], keep="first")
-    hit_pool = apply_team_pick_caps(hit_pool, max_per_team=2)
-    hit_pool = hit_pool.head(6)
+
+    selected_rows = []
+    team_counts = {}
+    game_counts = {}
+    for _, cand in hit_pool.iterrows():
+        team = cand.get("teamName")
+        game = cand.get("game")
+        if team_counts.get(team, 0) >= 2:
+            continue
+        if game_counts.get(game, 0) >= 2:
+            continue
+        selected_rows.append(cand)
+        team_counts[team] = team_counts.get(team, 0) + 1
+        game_counts[game] = game_counts.get(game, 0) + 1
+        if len(selected_rows) >= 10:
+            break
+
+    if selected_rows:
+        hit_pool = pd.DataFrame(selected_rows)
+    else:
+        hit_pool = hit_pool.iloc[0:0].copy()
 
     picks = []
     for _, r in hit_pool.iterrows():
@@ -1392,8 +1416,8 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
             "HR_score":r.get("HR_score"),
             "Hit_score":score,
             "park_favorability":r.get("park_favorability"),
-            "stack_tag":"Top-6 refined",
-            "reason":f"Top-6 refined {mode_label}; Hit_score {score:.3f}; slot {r.get('batting_order_slot')}; opp {r.get('opponent_pitcher_pick_type')}; edge {r.get('edge_vs_opponent')}",
+            "stack_tag":"Rolling refined",
+            "reason":f"Rolling refined max2/game max10 {mode_label}; Hit_score {score:.3f}; slot {r.get('batting_order_slot')}; opp {r.get('opponent_pitcher_pick_type')}; edge {r.get('edge_vs_opponent')}",
         })
 
     return pd.DataFrame(picks, columns=cols)
