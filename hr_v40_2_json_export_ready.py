@@ -1838,28 +1838,10 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
         )
         hit_added += 1
 
-    # HRs: exactly two if available, strict filters
-    hr_pool = base[
-        (base["lineup_ok"] == True) &
-        (base["HR_score"].fillna(0) >= 5.5) &
-        (base["park_favorability"] == "Favorable") &
-        (base["opponent_pitcher_pick_type"].fillna("Neutral").isin(["Short Leash Risk", "Attack With Hitters", "Low Sample"])) &
-        (base["power_filter"] == True) &
-        (base["slot_num"] <= 5)
-    ].copy().sort_values(["HR_score","slot_num","homeRuns"], ascending=[False, True, False])
-
-    hr_added = 0
-    for _, r in hr_pool.iterrows():
-        if hr_added >= 2:
-            break
-        if (r["teamName"], r["playerName"]) in used_players or not can_use_team(r["teamName"], 2):
-            continue
-        add_row(
-            f"Power {hr_added+1}", "HR", r["playerName"], r["teamName"], r.get("opponentTeam"), "B",
-            f"HR_score {r['HR_score']:.3f}; slot {int(r['slot_num'])}; power ok; opp {r.get('opponent_pitcher_pick_type')}; park Favorable",
-            "Refined_Picks"
-        )
-        hr_added += 1
+    # HRs are intentionally NOT allowed on the official Final Card for now.
+    # Audit showed HRs are volatile and should live in Top_Picks / HR_Tier as an upside pool,
+    # not as core bankroll plays. This keeps the Final Card focused on the strongest model area:
+    # elite 1+ Hit plays, verified K props, and rare elite ML edges.
 
     # K prop: one elite only, but ONLY if current sportsbook line still has value.
     # This blocks stale 5.5-line picks when the live market has already moved to 7.5.
@@ -2014,7 +1996,7 @@ def main(season: int, target_date: str):
         pd.DataFrame([
             ("requested_season", season),
             ("target_game_date", target_date),
-            ("message", "v40 Render rebuild with strict pregame Final Card lock"),
+            ("message", "v40 Hit-core rebuild: HR upside only, rolling refined max2/game, K market validation"),
             ("locked_players_count", len(locked_players)),
             ("pregame_eligible_games_for_final_card", len(eligible_schedule_rows)),
             ("run_time_et", now_et.strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ")),
