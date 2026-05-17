@@ -225,12 +225,19 @@ def _is_placeholder_pick(row: dict) -> bool:
     if not isinstance(row, dict):
         return True
     text = " ".join(str(v).lower() for v in row.values())
+    category = str(row.get("category") or "").strip().lower()
+    bet_type = str(row.get("bet_type") or row.get("prop_type") or "").strip().lower()
+    pick = str(row.get("pick") or row.get("playerName") or row.get("pitcherName") or "").strip().lower()
     return (
         "no plays" in text
         or "no qualified" in text
         or "no final card plays qualified" in text
-        or row.get("category") == "Info"
-        or row.get("bet_type") == "No Plays"
+        or "no plus-money prop candidates" in text
+        or "no plus money prop candidates" in text
+        or "no candidates" in text
+        or category == "info"
+        or bet_type in {"no plays", "info", ""}
+        or pick.startswith("no plus")
     )
 
 
