@@ -279,7 +279,8 @@ def build_research_json(
     top_picks,
     refined_picks,
     final_card_df,
-    plus_money_props=None
+    plus_money_props=None,
+    hr_value_watch=None
 ):
     """Layer 3: all research tabs for app browsing."""
     return {
@@ -306,7 +307,8 @@ def build_app_payload(
     hit_drought,
     top_picks,
     refined_picks,
-    plus_money_props=None
+    plus_money_props=None,
+    hr_value_watch=None
 ):
     """Full JSON payload for the future iPhone app."""
     return {
@@ -322,7 +324,8 @@ def build_app_payload(
             top_picks=top_picks,
             refined_picks=refined_picks,
             final_card_df=final_card_df,
-            plus_money_props=plus_money_props
+            plus_money_props=plus_money_props,
+            hr_value_watch=hr_value_watch
         )
     }
 
@@ -1758,6 +1761,149 @@ def apply_k_market_validation(pitcher_line_value: pd.DataFrame, target_date: str
 
 
 
+
+
+# ------------------------------
+# HR VALUE PROFILE ENGINE V1
+# ------------------------------
+def hr_value_bucket(home_runs, league_avg_hr=None):
+    """Bucket HR totals into value-focused groups. Excludes 0-HR players from target logic."""
+    hrs = nz(home_runs, 0)
+    avg = nz(league_avg_hr, 0)
+    try:
+        hrs = float(hrs)
+        avg = float(avg)
+    except Exception:
+        return "Unknown"
+    if hrs <= 0:
+        return "No HR profile"
+    if hrs <= 2:
+        return "Low Power"
+    # Dynamic value band: at/below league average, with a small cushion so the pool adjusts as the season grows.
+    if avg and hrs <= avg + 1:
+        return "HR Value Range"
+    if avg and hrs <= avg + 4:
+        return "Above Average Power"
+    return "Elite / Priced-Up Power"
+
+
+def add_hr_value_profile(player_rows: pd.DataFrame) -> pd.DataFrame:
+    """Add dynamic HR value fields to player rows and HR_Drought output.
+
+    Philosophy:
+    - Exclude 0-HR players from the league average.
+    - Prefer hitters with real power, but not obvious/priced-up elite power.
+    - HR value target = 3+ HRs and at/below the dynamic league average plus a small cushion.
+    - Environment still matters: bad parks and Strong SPs reduce the score.
+    """
+    if player_rows is None or player_rows.empty or "homeRuns" not in player_rows.columns:
+        return player_rows
+
+    df = player_rows.copy()
+    hr_numeric = pd.to_numeric(df["homeRuns"], errors="coerce").fillna(0)
+    positive = hr_numeric[hr_numeric > 0]
+    league_avg_hr = round(float(positive.mean()), 2) if len(positive) else 0.0
+    league_median_hr = round(float(positive.median()), 2) if len(positive) else 0.0
+
+    df["league_avg_hr_excl_zero"] = league_avg_hr
+    df["league_median_hr_excl_zero"] = league_median_hr
+    df["hr_vs_league_avg"] = (hr_numeric - league_avg_hr).round(2)
+    df["hr_value_bucket"] = hr_numeric.apply(lambda x: hr_value_bucket(x, league_avg_hr))
+
+    # Dynamic sweet spot: real HR ability, but not over the market's obvious power bucket.
+    # The +1 cushion avoids overly strict cutoffs when average is 5.6/6.1/etc.
+    df["hr_value_target_flag"] = (hr_numeric >= 3) & (hr_numeric <= (league_avg_hr + 1.0))
+
+    drought = pd.to_numeric(df.get("current_games_without_hr"), errors="coerce").fillna(0)
+    avg_gap = pd.to_numeric(df.get("avg_games_between_hrs"), errors="coerce").fillna(0)
+    drought_over_avg = (drought - avg_gap).clip(lower=0)
+    df["hr_drought_over_avg"] = drought_over_avg.round(2)
+
+    park = df.get("park_favorability", pd.Series(["Neutral"] * len(df), index=df.index)).astype(str)
+    opp_type = df.get("opponent_pitcher_pick_type", pd.Series(["Neutral"] * len(df), index=df.index)).astype(str)
+    slot = pd.to_numeric(df.get("batting_order_slot"), errors="coerce").fillna(9)
+
+    park_adj = park.map({"Favorable": 1.25, "Neutral": 0.55, "Unfavorable": -1.20}).fillna(0.25)
+    pitcher_adj = opp_type.map({
+        "Short Leash Risk": 1.15,
+        "Low Sample": 0.95,
+        "Attack With Hitters": 1.25,
+        "Neutral": 0.35,
+        "K Upside": -0.35,
+        "Strong SP": -1.75,
+    }).fillna(0.0)
+    slot_adj = slot.apply(lambda s: max(0.0, 7 - float(s)) * 0.18 if s <= 9 else 0.0)
+    value_band_adj = df["hr_value_target_flag"].astype(int) * 1.65
+    low_power_penalty = (hr_numeric <= 2).astype(int) * -2.25
+    elite_price_penalty = (hr_numeric > (league_avg_hr + 4.0)).astype(int) * -1.10
+
+    # Controlled score: value range + overdue timing + environment. Not raw HR leader ranking.
+    df["hr_value_score"] = (
+        value_band_adj
+        + low_power_penalty
+        + elite_price_penalty
+        + drought_over_avg.clip(upper=18) * 0.16
+        + park_adj
+        + pitcher_adj
+        + slot_adj
+    ).round(3)
+
+    def _profile(row):
+        if nz(row.get("homeRuns"), 0) <= 0:
+            return "Exclude - no HR sample"
+        if row.get("hr_value_target_flag") and row.get("hr_value_score", 0) >= 3.0:
+            return "Primary HR Value Target"
+        if row.get("hr_value_target_flag"):
+            return "Secondary HR Value Watch"
+        if row.get("hr_value_bucket") == "Elite / Priced-Up Power":
+            return "Priced-Up Power / Upside Only"
+        if row.get("hr_value_bucket") == "Low Power":
+            return "Low-Power Longshot"
+        return "HR Watch"
+
+    df["hr_value_profile"] = df.apply(_profile, axis=1)
+    df["hr_value_reason"] = df.apply(
+        lambda r: (
+            f"HRs {r.get('homeRuns')} vs dynamic avg {r.get('league_avg_hr_excl_zero')}; "
+            f"bucket {r.get('hr_value_bucket')}; drought over avg {r.get('hr_drought_over_avg')}; "
+            f"park {r.get('park_favorability')}; opp {r.get('opponent_pitcher_pick_type')}; "
+            f"score {r.get('hr_value_score')}"
+        ),
+        axis=1,
+    )
+    return df
+
+
+def build_hr_value_watch(player_rows: pd.DataFrame) -> pd.DataFrame:
+    """Research tab for the exact HR value profile the user wants."""
+    cols = [
+        "playerName", "teamName", "homeRuns", "league_avg_hr_excl_zero", "hr_vs_league_avg",
+        "hr_value_bucket", "hr_value_target_flag", "hr_value_score", "hr_value_profile",
+        "avg_games_between_hrs", "current_games_without_hr", "hr_drought_over_avg", "hr_status",
+        "last_hr_date", "gamesPlayed", "park_favorability", "opponent_pitcher", "opponent_pitcher_pick_type",
+        "lineup_status", "batting_order_slot", "starter_only_flag", "hr_value_reason"
+    ]
+    if player_rows is None or player_rows.empty:
+        return pd.DataFrame(columns=cols)
+    df = player_rows.copy()
+    if "hr_value_score" not in df.columns:
+        df = add_hr_value_profile(df)
+    if "opponent_pitcher" not in df.columns and "auto_pitcher_name" in df.columns:
+        df["opponent_pitcher"] = df["auto_pitcher_name"]
+    if "hr_status" not in df.columns and "status" in df.columns:
+        df["hr_status"] = df["status"]
+    pool = df[
+        (pd.to_numeric(df.get("homeRuns"), errors="coerce").fillna(0) > 0)
+        & (df.get("hr_value_target_flag", False).astype(bool))
+    ].copy()
+    if pool.empty:
+        pool = df[pd.to_numeric(df.get("homeRuns"), errors="coerce").fillna(0) > 0].copy()
+    pool = pool.sort_values(["hr_value_score", "hr_drought_over_avg", "HR_score"], ascending=[False, False, False])
+    for c in cols:
+        if c not in pool.columns:
+            pool[c] = None
+    return pool[cols].head(40).reset_index(drop=True)
+
 def build_plus_money_prop_sheet(player_rows: pd.DataFrame, pitcher_line_value: pd.DataFrame, game_rankings: pd.DataFrame) -> pd.DataFrame:
     """Build a research-only prop finder for plus-money/alt props.
 
@@ -2173,7 +2319,12 @@ def main(season: int, target_date: str):
                 player_rows["opponent_pitcher_pick_type"] = player_rows["opponent_pitcher_pick_type"].fillna(player_rows["opponent_pitcher_pick_type_fill"])
                 player_rows = player_rows.drop(columns=["opponent_pitcher_pick_type_fill"])
 
-    hr_drought = player_rows[["season","teamName","playerName","avg_games_between_hrs","current_games_without_hr","longest_games_without_hr","hr_status","homeRuns","last_hr_date","gamesPlayed","park_favorability","lineup_status","batting_order_slot","starter_only_flag"]].rename(columns={"hr_status":"status"}).merge(opp_map, on="teamName", how="left")
+    # Dynamic HR Value Profile: league average recalculates every refresh, excluding 0-HR hitters.
+    player_rows = add_hr_value_profile(player_rows)
+    hr_value_watch = build_hr_value_watch(player_rows)
+
+    hr_drought_cols = [c for c in ["season","teamName","playerName","avg_games_between_hrs","current_games_without_hr","longest_games_without_hr","hr_status","homeRuns","league_avg_hr_excl_zero","league_median_hr_excl_zero","hr_vs_league_avg","hr_value_bucket","hr_value_target_flag","hr_value_score","hr_value_profile","hr_drought_over_avg","hr_value_reason","last_hr_date","gamesPlayed","park_favorability","lineup_status","batting_order_slot","starter_only_flag"] if c in player_rows.columns]
+    hr_drought = player_rows[hr_drought_cols].rename(columns={"hr_status":"status"}).merge(opp_map, on="teamName", how="left")
     hit_drought = player_rows[["season","teamName","playerName","avg_games_between_hits","current_games_without_hit","longestHitDrought","hit_status","totalHits","gamesPlayed","park_favorability","lineup_status","batting_order_slot","starter_only_flag"]].rename(columns={"hit_status":"status"}).merge(opp_map, on="teamName", how="left")
 
     daily_card = build_daily_card(pregame_game_rankings, refined_picks, pregame_pitcher_line_value, hr_drought)
@@ -2188,7 +2339,7 @@ def main(season: int, target_date: str):
         pd.DataFrame([
             ("requested_season", season),
             ("target_game_date", target_date),
-            ("message", "v40 Prop expansion: hit core + plus-money props + alt K/TB/run/RBI sheet"),
+            ("message", "v40 Value Top Picks: dynamic HR value profile + plus-money props + hit quality engine"),
             ("locked_players_count", len(locked_players)),
             ("pregame_eligible_games_for_final_card", len(eligible_schedule_rows)),
             ("run_time_et", now_et.strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ")),
@@ -2205,13 +2356,25 @@ def main(season: int, target_date: str):
         daily_card.to_excel(writer, sheet_name="Daily_Card", index=False)
         final_card.to_excel(writer, sheet_name="Final_Card", index=False)
         plus_money_props.to_excel(writer, sheet_name="Plus_Money_Props", index=False)
+        hr_value_watch.to_excel(writer, sheet_name="HR_Value_Watch", index=False)
 
         top_hr = pd.DataFrame()
         top_hit = pd.DataFrame()
         if not player_rows.empty:
-            top_hr = player_rows.nlargest(6, "HR_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","HR_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
+            # Top Picks should be value probability spots, not just raw HR/stat leaders.
+            hr_pool = player_rows.copy()
+            if "hr_value_score" not in hr_pool.columns:
+                hr_pool = add_hr_value_profile(hr_pool)
+            hr_pool = hr_pool[pd.to_numeric(hr_pool.get("homeRuns"), errors="coerce").fillna(0) > 0].copy()
+            preferred_hr = hr_pool[hr_pool.get("hr_value_target_flag", False).astype(bool)].copy() if "hr_value_target_flag" in hr_pool.columns else hr_pool.iloc[0:0].copy()
+            if preferred_hr.empty:
+                preferred_hr = hr_pool.copy()
+            hr_cols = [c for c in ["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","homeRuns","league_avg_hr_excl_zero","hr_vs_league_avg","hr_value_bucket","hr_value_target_flag","hr_value_score","hr_value_profile","HR_score","current_games_without_hr","avg_games_between_hrs","hr_drought_over_avg","park_favorability","opponent_pitcher_pick_type","batting_order_slot","lineup_status","starter_only_flag","hr_value_reason"] if c in preferred_hr.columns]
+            top_hr = preferred_hr.sort_values(["hr_value_score","hr_drought_over_avg","HR_score"], ascending=[False, False, False]).head(10)[hr_cols].copy()
             top_hr.insert(0, "type", "HR")
-            top_hit = player_rows.nlargest(6, "Hit_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","Hit_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
+
+            hit_cols = [c for c in ["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","Hit_score","hit_pct_last_10","hit_pct_last_5","current_hit_streak","contact_momentum_bonus","batting_order_slot","lineup_status","starter_only_flag"] if c in player_rows.columns]
+            top_hit = player_rows.nlargest(10, "Hit_score")[hit_cols].copy()
             top_hit.insert(0, "type", "HIT")
         top_picks = pd.concat([top_hr, top_hit], ignore_index=True)
         top_picks.to_excel(writer, sheet_name="Top_Picks", index=False)
@@ -2220,7 +2383,7 @@ def main(season: int, target_date: str):
     for s in ["HR_Drought","Hit_Drought"]:
         if s in wb.sheetnames:
             color_status_col(wb[s], "status")
-    for s in ["Pitcher_Metrics","Pitcher_Line_Value","Game_Rankings","Daily_Card","Final_Card","Top_Picks","Team_Context","Plus_Money_Props"]:
+    for s in ["Pitcher_Metrics","Pitcher_Line_Value","Game_Rankings","Daily_Card","Final_Card","Top_Picks","Team_Context","Plus_Money_Props","HR_Value_Watch"]:
         if s in wb.sheetnames:
             highlight_top_rows(wb[s], 10)
     wb.save(outfile)
@@ -2239,7 +2402,8 @@ def main(season: int, target_date: str):
         hit_drought=hit_drought,
         top_picks=top_picks,
         refined_picks=refined_picks,
-        plus_money_props=plus_money_props
+        plus_money_props=plus_money_props,
+        hr_value_watch=hr_value_watch
     )
 
     save_app_json(app_payload, json_output_path)
