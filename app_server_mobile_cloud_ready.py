@@ -148,39 +148,61 @@ def load_latest_data():
     data["results"] = read_json_file(history_dir / "performance_summary_latest.json", {"overall": {}, "by_bet_type": [], "by_confidence": [], "recent_results": []})
     data["results_latest"] = read_json_file(history_dir / "results_history_latest.json", {"graded_rows": 0, "rows": []})
     data["info"] = {
-        "purpose": "This app finds MLB betting edges by combining player trends, drought logic, matchup strength, pitcher quality, lineup context, and park factors.",
+        "purpose": "This app finds MLB betting edges by combining value-adjusted probability, recent form, player trends, drought logic, matchup strength, pitcher quality, lineup context, park factors, and results tracking. The goal is not to list the biggest names; it is to surface the strongest risk-adjusted value spots for today’s slate.",
         "how_to_use": [
-            "Start on Final Card for the strongest condensed plays.",
-            "Use Games to see matchup context, start time, and top game-level picks.",
-            "Use Research to drill into HR drought, hit drought, pitcher metrics, and game rankings.",
-            "Filter for overdue players, favorable parks, and weaker pitcher types to isolate stronger spots.",
-            "Treat Strong SP as a warning for hitter props and Short Leash Risk or Attack With Hitters as friendlier hitting environments."
+            "Start on Final Card for the most condensed plays. This card is designed to be selective and risk-adjusted, not a full list of every good-looking spot.",
+            "Use Research to review the deeper model tables: Refined Picks, Plus Money Props, HR Drought, HR Value Watch, Hit Drought, Pitcher Metrics, Pitcher Line Value, Game Rankings, and Top Picks.",
+            "Use Refined Picks as the broader hit-prop research pool. These are generally stronger for consistency than HRs or plus-money props.",
+            "Use Plus Money Props for higher-payout opportunities such as 5+ strikeouts, 2+ total bases, 1+ RBI, and 1+ run. These are more volatile and should be treated differently than standard 1+ hit plays.",
+            "Use HR Value Watch to look for underpriced HR candidates. The model dynamically calculates the average HR total from the current slate/player pool, excludes zero-HR players from that average, and favors players with enough power to matter without automatically chasing the most public sluggers.",
+            "Use filters to find overlapping signals: recent form, favorable park, non-Strong-SP matchup, strong lineup context, positive drought profile, and supportive game environment.",
+            "Treat Strong SP as a warning for hitter props. Short Leash Risk, Low Sample, Neutral, or K Upside environments may be more hitter-friendly depending on the full context.",
+            "The app locks and preserves same-day cards so refreshes do not erase earlier valid plays. Later refreshes may add qualifying late-game plays, but previously locked real plays should remain available for grading and review."
         ],
         "card_logic": [
-            {"label": "Core 1", "meaning": "Highest-priority main play on the card. Usually the cleanest overall edge among the non-HR hitter or ML plays."},
-            {"label": "Core 2", "meaning": "Strong play that ranks just below Core 1. Still a main card option, but slightly less clean than the top play."},
-            {"label": "Core 3", "meaning": "Solid playable pick that made the card, but with a little less edge or a little more volatility than the top two cores."},
-            {"label": "Pitch 1", "meaning": "Top strikeout prop on the card based on projected Ks versus the listed line and matchup context."},
-            {"label": "Power 1", "meaning": "Top home run upside play on the card. This is the highest-variance play type and should usually be bet smaller."}
+            {"label": "Final Card", "meaning": "The strongest condensed card. It prioritizes risk-adjusted value, recent form, matchup quality, volatility, and card discipline rather than simply picking the highest raw projection."},
+            {"label": "Core 1", "meaning": "Highest-priority main play on the card. Usually the cleanest overall combination of probability, matchup, recent form, and value."},
+            {"label": "Core 2", "meaning": "Strong playable edge that ranks just below Core 1. Still a main-card option, but usually with slightly less edge or slightly more volatility."},
+            {"label": "Core 3", "meaning": "Playable card pick with some edge, but less clean than the top two cores. Should usually be sized smaller than Core 1."},
+            {"label": "Pitch 1", "meaning": "Top strikeout prop based on projected strikeouts, opponent K tendency, pitcher workload/leash, recent form, and current line validation."},
+            {"label": "Plus Money Props", "meaning": "Higher-payout props such as 5+ Ks, 2+ total bases, 1+ run, and 1+ RBI. These are value opportunities, not guaranteed plays, and carry more variance."},
+            {"label": "HR Value Watch", "meaning": "A value-focused HR research pool that looks for players at or near the dynamic HR average with useful drought, power, park, and pitcher context."},
+            {"label": "Top Picks", "meaning": "A curated research card. HR rows should favor value-style HR profiles rather than only raw HR leaders, while hit rows should favor recent form and consistency."},
+            {"label": "Refined Picks", "meaning": "Broader model/research plays, especially for 1+ hit props. This pool can be larger than Final Card and is tracked separately in Results."}
         ],
         "unit_strategy": [
             "Use a consistent unit size instead of changing bet size emotionally. A common baseline is 1 unit = 1% of bankroll.",
-            "Suggested sizing: Core 1 = 1.0u, Core 2 = 0.75u, Core 3 = 0.5u to 0.75u, Pitch 1 = 0.75u to 1.0u, Power 1 = 0.25u to 0.5u.",
-            "Treat HR picks as the most volatile part of the card. They can be valuable, but they should usually carry the smallest risk.",
-            "Do not chase losses, double units after a bad day, or force action on every pick. The card works best when sizing stays disciplined over time."
+            "Suggested sizing: Core 1 = 1.0u, Core 2 = 0.75u, Core 3 = 0.5u to 0.75u, Pitch 1 = 0.5u to 1.0u depending on line confidence, Plus Money Props = 0.25u to 0.5u, HR Value plays = 0.25u to 0.5u.",
+            "Hit props have historically been the strongest and most stable part of the model, so they can be treated as the core engine when the context is clean.",
+            "HRs, total bases, runs, RBIs, and plus-money props are higher variance. They can be valuable, but they should generally be sized smaller than clean 1+ hit plays.",
+            "Do not chase losses, double units after a bad day, or force action on every pick. The model works best when the user respects card discipline and long-term tracking."
         ],
         "terms": [
-            {"term": "Model Insight", "meaning": "A short plain-English explanation of why a pick made the card based on the model's edge, matchup, and context signals."},
+            {"term": "Value-Adjusted Probability", "meaning": "The model is looking for spots where the probability appears stronger than the market/public perception, not simply the most famous player or highest season total."},
+            {"term": "Recent Form", "meaning": "Rolling form signals such as last 5/last 10 hit rate, current streak, consistency, and contact momentum. Hot or stable hitters may be upgraded; cold or volatile hitters may be downgraded."},
+            {"term": "Hit Score", "meaning": "Composite score for 1+ hit probability using matchup, form, lineup opportunity, pitcher profile, park, and trend inputs. Higher is better, but context still matters."},
+            {"term": "Hit Quality Engine", "meaning": "The layer that rewards recent consistency and contact form while penalizing volatility or poor current form."},
+            {"term": "HR Score", "meaning": "Composite score for home run appeal using power, park, matchup, drought context, and pitcher vulnerability."},
+            {"term": "HR Value Profile", "meaning": "A value-focused HR concept that favors players with real but not fully obvious power. The model excludes 0-HR players from the average and dynamically compares each player’s HR total to the current pool average."},
+            {"term": "Dynamic League HR Average", "meaning": "The average home run total is recalculated from the current player pool each run. It is not hardcoded, so it moves as the season changes."},
+            {"term": "HR Value Watch", "meaning": "Research tab for HR candidates near the dynamic average with positive drought, park, and matchup context. This is meant to find underpriced HR upside, not just public sluggers."},
+            {"term": "Plus Money Props", "meaning": "Higher-payout props such as 5+ strikeouts, 2+ total bases, 1+ run, or 1+ RBI. These are graded separately and should be treated as higher-variance value plays."},
+            {"term": "5+ Strikeouts", "meaning": "Pitcher prop candidate based on strikeout projection, opponent K tendency, workload/leash, recent pitcher form, and current line context."},
+            {"term": "2+ Total Bases", "meaning": "Hitter prop candidate driven by extra-base ability, hard contact, matchup, park, and recent form. More volatile than 1+ hit props."},
+            {"term": "1+ RBI", "meaning": "Run-production prop that depends heavily on lineup slot, runners ahead, team scoring environment, pitcher traffic allowed, and game context."},
+            {"term": "1+ Run", "meaning": "Scoring prop that depends heavily on batting order, on-base ability, hitters behind the player, team implied offense, and bullpen quality."},
+            {"term": "Model Insight", "meaning": "A short plain-English explanation of why a pick made the card based on edge, matchup, form, and context signals."},
             {"term": "Attack With Hitters", "meaning": "Pitcher or pitching environment is vulnerable enough to target hitters."},
-            {"term": "Strong SP", "meaning": "Strong starting pitcher. Usually a downgrade for hitter props."},
+            {"term": "Strong SP", "meaning": "Strong starting pitcher. Usually a downgrade or exclusion warning for hitter props unless other signals are very strong."},
             {"term": "Short Leash Risk", "meaning": "Pitcher may not work deep into the game, which can help hitters later against the bullpen."},
-            {"term": "K Upside", "meaning": "Pitcher has a favorable strikeout profile for K props."},
+            {"term": "K Upside", "meaning": "Pitcher has a favorable strikeout profile for K props. For hitters, this can be a caution depending on the rest of the matchup."},
             {"term": "On Pace", "meaning": "Current drought is normal relative to the player’s average pattern."},
             {"term": "Slightly Overdue", "meaning": "Player is running a bit longer than usual without the event."},
-            {"term": "Overdue", "meaning": "Player is well beyond normal drought range and may be due for regression."},
-            {"term": "Hit Score", "meaning": "Composite score for hit probability using matchup, context, and trend inputs. Higher is better."},
-            {"term": "HR Score", "meaning": "Composite score for home run appeal using power, park, matchup, and drought context. Higher is better."},
-            {"term": "Moneyline Lean", "meaning": "The model sees an edge on that team, but size depends on edge strength and matchup quality."}
+            {"term": "Overdue", "meaning": "Player is well beyond normal drought range, but this is only useful when supported by matchup, form, and environment."},
+            {"term": "Environment Scoring", "meaning": "Daily adjustment for pitcher quality, bullpen risk, park, lineup slot, team scoring context, and game conditions."},
+            {"term": "Moneyline Lean", "meaning": "The model sees an edge on that team, but moneyline plays are more selective because earlier tracking showed ML performance needed tighter filters."},
+            {"term": "Lock / Preserve Logic", "meaning": "Same-day cards are preserved so valid earlier plays do not disappear after refresh. Later refreshes can add new qualifying late-game plays without wiping real locked plays."},
+            {"term": "Results Tracking", "meaning": "Final Card, Refined Picks, and Plus Money Props are tracked separately so the user can see which model areas are working and which need adjustment."}
         ]
     }
     data["_meta"] = {
