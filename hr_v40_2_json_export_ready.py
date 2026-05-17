@@ -278,7 +278,8 @@ def build_research_json(
     hit_drought,
     top_picks,
     refined_picks,
-    final_card_df
+    final_card_df,
+    plus_money_props=None
 ):
     """Layer 3: all research tabs for app browsing."""
     return {
@@ -289,6 +290,7 @@ def build_research_json(
         "hit_drought": df_to_records(hit_drought),
         "top_picks": df_to_records(top_picks),
         "refined_picks": df_to_records(refined_picks),
+        "plus_money_props": df_to_records(plus_money_props),
         "final_card": df_to_records(final_card_df),
     }
 
@@ -303,7 +305,8 @@ def build_app_payload(
     hr_drought,
     hit_drought,
     top_picks,
-    refined_picks
+    refined_picks,
+    plus_money_props=None
 ):
     """Full JSON payload for the future iPhone app."""
     return {
@@ -318,7 +321,8 @@ def build_app_payload(
             hit_drought=hit_drought,
             top_picks=top_picks,
             refined_picks=refined_picks,
-            final_card_df=final_card_df
+            final_card_df=final_card_df,
+            plus_money_props=plus_money_props
         )
     }
 
@@ -544,6 +548,7 @@ def summarize_recent_pitcher_form(logs: pd.DataFrame) -> dict:
             "last2_ip_avg": None, "last3_ip_avg": None, "last2_k_avg": None, "last3_k_avg": None,
             "last2_pitch_avg": None, "last_start_ip": None, "last_start_k": None, "last_start_pitch_count": None,
             "last2_under5_count": None, "short_leash_flag": "Unknown", "recent_form_score": 0.0,
+            "k5plus_last10_pct": None, "k6plus_last10_pct": None, "k7plus_last10_pct": None,
         }
     last2 = logs.tail(2).copy()
     last3 = logs.tail(3).copy()
@@ -564,6 +569,9 @@ def summarize_recent_pitcher_form(logs: pd.DataFrame) -> dict:
     elif nz(last2_pitch_avg) and nz(last2_pitch_avg) < 85:
         short_flag = "Yes - pitch count risk"
     recent_form_score = round((nz(last2_ip_avg) * 1.4) + (nz(last2_k_avg) * 1.1) + (nz(last2_pitch_avg) * 0.03) - (under5 or 0) * 1.5, 3)
+    k5plus_last10_pct = event_rate_last_n(logs, "strikeOuts", 10, 5)
+    k6plus_last10_pct = event_rate_last_n(logs, "strikeOuts", 10, 6)
+    k7plus_last10_pct = event_rate_last_n(logs, "strikeOuts", 10, 7)
     return {
         "last2_ip_avg": last2_ip_avg,
         "last3_ip_avg": last3_ip_avg,
@@ -576,6 +584,9 @@ def summarize_recent_pitcher_form(logs: pd.DataFrame) -> dict:
         "last2_under5_count": under5,
         "short_leash_flag": short_flag,
         "recent_form_score": recent_form_score,
+        "k5plus_last10_pct": k5plus_last10_pct,
+        "k6plus_last10_pct": k6plus_last10_pct,
+        "k7plus_last10_pct": k7plus_last10_pct,
     }
 
 def apply_team_pick_caps(df: pd.DataFrame, max_per_team: int = MAX_REFINED_PICKS_PER_TEAM) -> pd.DataFrame:
@@ -996,8 +1007,16 @@ def get_player_game_logs(player_id: int, season: int) -> pd.DataFrame:
         stat = s.get("stat", {})
         rows.append({
             "date": pd.to_datetime(s.get("date")).normalize() if s.get("date") else pd.NaT,
-            "homeRuns": int(stat.get("homeRuns", 0)),
-            "hits": int(stat.get("hits", 0)),
+            "homeRuns": int(stat.get("homeRuns", 0) or 0),
+            "hits": int(stat.get("hits", 0) or 0),
+            "totalBases": int(stat.get("totalBases", 0) or 0),
+            "rbi": int(stat.get("rbi", 0) or 0),
+            "runs": int(stat.get("runs", 0) or 0),
+            "atBats": int(stat.get("atBats", 0) or 0),
+            "doubles": int(stat.get("doubles", 0) or 0),
+            "triples": int(stat.get("triples", 0) or 0),
+            "baseOnBalls": int(stat.get("baseOnBalls", 0) or 0),
+            "strikeOuts": int(stat.get("strikeOuts", 0) or 0),
         })
     return pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
 
@@ -1016,6 +1035,47 @@ def compute_drought_metrics(df: pd.DataFrame, col: str) -> dict:
         return {"last_event_date": last_event_date.date() if pd.notna(last_event_date) else None, "current_gap": current_gap, "avg_games_between": None, "longest_drought": longest}
     gaps = [idxs[i + 1] - idxs[i] - 1 for i in range(len(idxs) - 1)]
     return {"last_event_date": last_event_date.date() if pd.notna(last_event_date) else None, "current_gap": current_gap, "avg_games_between": round(sum(gaps) / len(gaps), 2) if gaps else None, "longest_drought": max(idxs[0], current_gap, max(gaps))}
+
+
+
+def event_rate_last_n(logs: pd.DataFrame, col: str, n: int, threshold: float = 1) -> float | None:
+    """Percent of last N games where col >= threshold."""
+    if logs is None or logs.empty or col not in logs.columns:
+        return None
+    tail = logs.tail(n)
+    if len(tail) < n:
+        return None
+    return round(float((pd.to_numeric(tail[col], errors="coerce").fillna(0) >= threshold).mean() * 100), 1)
+
+
+def current_event_streak(logs: pd.DataFrame, col: str, threshold: float = 1) -> int:
+    """Current consecutive games from most recent backwards where col >= threshold."""
+    if logs is None or logs.empty or col not in logs.columns:
+        return 0
+    streak = 0
+    vals = pd.to_numeric(logs[col], errors="coerce").fillna(0).tolist()[::-1]
+    for v in vals:
+        if v >= threshold:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def contact_momentum_bonus(hit_l5, hit_l10, streak) -> float:
+    bonus = 0.0
+    if hit_l10 is not None:
+        if hit_l10 >= 90: bonus += 0.45
+        elif hit_l10 >= 80: bonus += 0.30
+        elif hit_l10 >= 70: bonus += 0.15
+        elif hit_l10 >= 60: bonus += 0.05
+    if hit_l5 is not None:
+        if hit_l5 >= 100: bonus += 0.30
+        elif hit_l5 >= 80: bonus += 0.20
+        elif hit_l5 <= 40: bonus -= 0.20
+    if streak >= 5: bonus += 0.15
+    elif streak >= 3: bonus += 0.08
+    return round(bonus, 3)
 
 def determine_status(current_gap, avg_gap):
     if avg_gap is None or current_gap is None:
@@ -1122,12 +1182,15 @@ def build_pitcher_metrics(schedule_rows: pd.DataFrame, season: int) -> pd.DataFr
                 "last_start_ip": recent.get("last_start_ip"), "last_start_k": recent.get("last_start_k"),
                 "last_start_pitch_count": recent.get("last_start_pitch_count"),
                 "last2_under5_count": recent.get("last2_under5_count"),
+                "k5plus_last10_pct": recent.get("k5plus_last10_pct"),
+                "k6plus_last10_pct": recent.get("k6plus_last10_pct"),
+                "k7plus_last10_pct": recent.get("k7plus_last10_pct"),
                 "short_leash_flag": recent.get("short_leash_flag"),
                 "sample_flag": "Low Sample" if nz(ip) < 3 else "OK",
                 "pick_type": pick_type, "probable_starter_name": pitcher_name, "starter_status": "Confirmed",
             })
             time.sleep(SLEEP_BETWEEN_CALLS)
-    cols = ["pitcherName","teamName","opponentTeam","innings_pitched","strikeouts","earned_runs","hits_allowed","walks","games_started","era","whip","pitcher_score","pitcher_score_adj","recent_form_score","last2_ip_avg","last3_ip_avg","last2_k_avg","last3_k_avg","last2_pitch_avg","last_start_ip","last_start_k","last_start_pitch_count","last2_under5_count","short_leash_flag","sample_flag","pick_type","probable_starter_name","starter_status"]
+    cols = ["pitcherName","teamName","opponentTeam","innings_pitched","strikeouts","earned_runs","hits_allowed","walks","games_started","era","whip","pitcher_score","pitcher_score_adj","recent_form_score","last2_ip_avg","last3_ip_avg","last2_k_avg","last3_k_avg","last2_pitch_avg","last_start_ip","last_start_k","last_start_pitch_count","last2_under5_count","k5plus_last10_pct","k6plus_last10_pct","k7plus_last10_pct","short_leash_flag","sample_flag","pick_type","probable_starter_name","starter_status"]
     return pd.DataFrame(rows, columns=cols).sort_values(["pitcher_score_adj","pitcher_score"], ascending=False).reset_index(drop=True)
 
 def get_confirmed_lineups(target_date: str):
@@ -1167,183 +1230,6 @@ def get_confirmed_lineups(target_date: str):
         pass
     return status_map, slot_map
 
-
-# ==============================
-# HIT QUALITY ENGINE V1
-# Adds recent-form, consistency, and final-card gates for 1+ Hit projections.
-# ==============================
-
-def calculate_hit_momentum_metrics(logs: pd.DataFrame) -> dict:
-    """Controlled recent-form layer for 1+ Hit props.
-
-    This is intentionally an enhancement, not the whole model. It rewards hitters
-    who are repeatedly getting at least one hit while penalizing volatile 0/3/0/2
-    profiles that can look good by average but feel coin-flippy for 1+ Hit props.
-    """
-    if logs is None or logs.empty or "hits" not in logs.columns:
-        return {
-            "hit_pct_last_5": None,
-            "hit_pct_last_10": None,
-            "multi_hit_pct_last_10": None,
-            "zero_hit_games_last_10": None,
-            "current_hit_streak": 0,
-            "hit_volatility_index": None,
-            "hit_consistency_score": 0.0,
-            "hit_momentum_bonus": 0.0,
-            "hit_volatility_penalty_form": 0.0,
-            "hit_form_label": "Unknown",
-        }
-
-    clean = logs.copy()
-    clean["hits"] = pd.to_numeric(clean["hits"], errors="coerce").fillna(0)
-    last5 = clean.tail(5)
-    last10 = clean.tail(10)
-
-    def _hit_rate(frame):
-        if frame is None or frame.empty:
-            return None
-        return round(float((frame["hits"] > 0).mean() * 100), 1)
-
-    hit_pct_5 = _hit_rate(last5) if len(last5) >= 3 else None
-    hit_pct_10 = _hit_rate(last10) if len(last10) >= 5 else None
-    multi_hit_pct_10 = round(float((last10["hits"] >= 2).mean() * 100), 1) if len(last10) >= 5 else None
-    zero_hit_games_10 = int((last10["hits"] == 0).sum()) if len(last10) >= 5 else None
-
-    streak = 0
-    for h in reversed(clean["hits"].tolist()):
-        if h > 0:
-            streak += 1
-        else:
-            break
-
-    volatility_index = None
-    if len(last10) >= 5:
-        # Higher means more 0-hit risk and more hit-count variance.
-        volatility_index = round((float((last10["hits"] == 0).mean()) * 70) + (float(last10["hits"].std() or 0) * 15), 1)
-
-    # Controlled streak bonus: meaningful, but capped so it cannot overpower matchup/context.
-    bonus = 0.0
-    if hit_pct_10 is not None:
-        if hit_pct_10 >= 90:
-            bonus += 0.45
-        elif hit_pct_10 >= 80:
-            bonus += 0.30
-        elif hit_pct_10 >= 70:
-            bonus += 0.15
-        elif hit_pct_10 >= 60:
-            bonus += 0.05
-    if hit_pct_5 is not None and hit_pct_5 >= 80:
-        bonus += 0.10
-    if streak >= 4:
-        bonus += 0.10
-    bonus = round(min(bonus, 0.55), 3)
-
-    vol_penalty = 0.0
-    if zero_hit_games_10 is not None:
-        if zero_hit_games_10 >= 5:
-            vol_penalty += 0.20
-        elif zero_hit_games_10 >= 4:
-            vol_penalty += 0.10
-    if volatility_index is not None and volatility_index >= 45:
-        vol_penalty += 0.10
-    vol_penalty = round(vol_penalty, 3)
-
-    # 0-100 score for ranking/review, not a direct probability.
-    consistency_score = 0.0
-    if hit_pct_10 is not None:
-        consistency_score += hit_pct_10 * 0.45
-    if hit_pct_5 is not None:
-        consistency_score += hit_pct_5 * 0.30
-    if multi_hit_pct_10 is not None:
-        consistency_score += multi_hit_pct_10 * 0.10
-    consistency_score += min(streak, 5) * 3.0
-    if volatility_index is not None:
-        consistency_score -= max(0.0, volatility_index - 25) * 0.20
-    consistency_score = round(max(0.0, min(100.0, consistency_score)), 1)
-
-    if hit_pct_10 is not None and hit_pct_10 >= 80:
-        label = "Hot 80%+ L10"
-    elif hit_pct_10 is not None and hit_pct_10 >= 70:
-        label = "Positive 70%+ L10"
-    elif hit_pct_10 is not None and hit_pct_10 < 50:
-        label = "Cold/Volatile L10"
-    elif consistency_score >= 65:
-        label = "Stable Contact"
-    else:
-        label = "Neutral"
-
-    return {
-        "hit_pct_last_5": hit_pct_5,
-        "hit_pct_last_10": hit_pct_10,
-        "multi_hit_pct_last_10": multi_hit_pct_10,
-        "zero_hit_games_last_10": zero_hit_games_10,
-        "current_hit_streak": streak,
-        "hit_volatility_index": volatility_index,
-        "hit_consistency_score": consistency_score,
-        "hit_momentum_bonus": bonus,
-        "hit_volatility_penalty_form": vol_penalty,
-        "hit_form_label": label,
-    }
-
-
-def classify_hit_model_tier(row_or_score, hit_pct_last_10=None, hit_pct_last_5=None, slot=None, opp_type=None, confirmed=True) -> str:
-    """Tier 1+ Hit plays so Final Card does not treat every A the same."""
-    if isinstance(row_or_score, dict) or hasattr(row_or_score, "get"):
-        r = row_or_score
-        score = nz(r.get("Hit_score"))
-        hit_pct_last_10 = r.get("hit_pct_last_10")
-        hit_pct_last_5 = r.get("hit_pct_last_5")
-        slot = r.get("batting_order_slot")
-        opp_type = r.get("opponent_pitcher_pick_type")
-        confirmed = str(r.get("lineup_status") or "").eq("Confirmed Starter") if hasattr(str(r.get("lineup_status") or ""), 'eq') else str(r.get("lineup_status") or "") == "Confirmed Starter"
-    else:
-        score = nz(row_or_score)
-
-    slot_num = safe_int_value(slot, 99)
-    l10 = nz(hit_pct_last_10, 0)
-    l5 = nz(hit_pct_last_5, 0)
-    opp = str(opp_type or "Neutral")
-    is_confirmed = bool(confirmed)
-
-    if not is_confirmed or opp == "Strong SP" or slot_num > 6:
-        return "Research"
-    if score >= 4.45 and l10 >= 80 and slot_num <= 4:
-        return "A+"
-    if score >= 4.15 and l10 >= 70 and slot_num <= 5:
-        return "A"
-    if score >= 3.85 and (l10 >= 60 or l5 >= 80) and slot_num <= 6:
-        return "B"
-    return "Research"
-
-
-def hit_final_card_gate(row) -> bool:
-    """Elite-only gate for official Final Card hit picks."""
-    score = nz(row.get("Hit_score"))
-    l10 = nz(row.get("hit_pct_last_10"), 0)
-    l5 = nz(row.get("hit_pct_last_5"), 0)
-    slot = safe_int_value(row.get("batting_order_slot"), 99)
-    opp_type = str(row.get("opponent_pitcher_pick_type") or "Neutral")
-    confirmed = str(row.get("lineup_status") or "") == "Confirmed Starter" or bool(row.get("starter_only_flag"))
-    consistency = nz(row.get("hit_consistency_score"), 0)
-    zeroes = row.get("zero_hit_games_last_10")
-    zeroes = 99 if zeroes is None or pd.isna(zeroes) else int(zeroes)
-
-    if not confirmed or slot > 5 or opp_type == "Strong SP":
-        return False
-    if zeroes >= 5:
-        return False
-    if score >= 4.45 and l10 >= 80:
-        return True
-    if score >= 4.20 and l10 >= 70 and consistency >= 62:
-        return True
-    if score >= 4.10 and l5 >= 80 and consistency >= 65:
-        return True
-    return False
-
-
-def hit_tier_rank(tier: str) -> int:
-    return {"A+": 1, "A": 2, "B": 3, "Research": 9}.get(str(tier or "Research"), 9)
-
 def build_locked_player_pool(all_players: pd.DataFrame, lineup_map: dict, slot_map: dict) -> pd.DataFrame:
     print_step("🔒 Locking players to confirmed lineups ...")
     if all_players.empty:
@@ -1368,17 +1254,15 @@ def build_hit_hr_rows(pool_df: pd.DataFrame, season: int, sched_ctx: dict) -> pd
         avg_games_between_hits = average_games_per_event(row.get("gamesPlayed"), row.get("hits"))
         hr_status = determine_status(hr_d["current_gap"], avg_games_between_hrs)
         hit_status = determine_status(hit_d["current_gap"], avg_games_between_hits)
-        hit_form = calculate_hit_momentum_metrics(logs)
-        hit_pct_last_5 = hit_form.get("hit_pct_last_5")
-        hit_pct_last_10 = hit_form.get("hit_pct_last_10")
-        multi_hit_pct_last_10 = hit_form.get("multi_hit_pct_last_10")
-        zero_hit_games_last_10 = hit_form.get("zero_hit_games_last_10")
-        current_hit_streak = hit_form.get("current_hit_streak")
-        hit_volatility_index = hit_form.get("hit_volatility_index")
-        hit_consistency_score = hit_form.get("hit_consistency_score")
-        hit_momentum_bonus = hit_form.get("hit_momentum_bonus")
-        hit_form_vol_penalty = hit_form.get("hit_volatility_penalty_form")
-        hit_form_label = hit_form.get("hit_form_label")
+        last10 = logs.tail(10)
+        hit_pct_last_10 = event_rate_last_n(logs, "hits", 10, 1)
+        hit_pct_last_5 = event_rate_last_n(logs, "hits", 5, 1)
+        current_hit_streak = current_event_streak(logs, "hits", 1)
+        tb2plus_last10_pct = event_rate_last_n(logs, "totalBases", 10, 2)
+        tb2plus_last5_pct = event_rate_last_n(logs, "totalBases", 5, 2)
+        run_last10_pct = event_rate_last_n(logs, "runs", 10, 1)
+        rbi_last10_pct = event_rate_last_n(logs, "rbi", 10, 1)
+        contact_momentum = contact_momentum_bonus(hit_pct_last_5, hit_pct_last_10, current_hit_streak)
         ctx = sched_ctx.get(row["teamName"], {})
         season_hit_pct = pct(row["hits"], row.get("atBats", 0))
         slot_raw = row.get("batting_order_slot")
@@ -1390,19 +1274,9 @@ def build_hit_hr_rows(pool_df: pd.DataFrame, season: int, sched_ctx: dict) -> pd
         hr_vol_penalty = get_volatility_penalty(row["teamName"], "hr")
         hr_public_penalty = get_public_bias_penalty(row["teamName"], "hr")
         hr_score_raw = (row["homeRuns"] / max(row["gamesPlayed"], 1) * 10 * 0.40) + (overdue_value(hr_status) * 0.25) + (park_value(ctx.get("park_favorability")) * 0.20) + lineup_bonus
-        # Hit score now includes a controlled recent-form / contact-consistency layer.
-        # The momentum bonus is capped so streaks help, but do not override matchup, slot, and park context.
-        hit_score_raw = (
-            (nz(season_hit_pct) / 10.0 * 0.36)
-            + (nz(hit_pct_last_10) / 10.0 * 0.18)
-            + (nz(hit_pct_last_5) / 10.0 * 0.08)
-            + (park_value(ctx.get("park_favorability")) * 0.05)
-            + lineup_bonus
-            + nz(hit_momentum_bonus)
-        )
+        hit_score_raw = (nz(season_hit_pct) / 10.0 * 0.40) + (nz(hit_pct_last_10) / 10.0 * 0.20) + (park_value(ctx.get("park_favorability")) * 0.05) + lineup_bonus + contact_momentum
         hr_score = round(hr_score_raw - hr_vol_penalty - hr_public_penalty, 3)
-        hit_score = round(hit_score_raw - hit_vol_penalty - nz(hit_form_vol_penalty), 3)
-        hit_model_tier = classify_hit_model_tier(hit_score, hit_pct_last_10, hit_pct_last_5, slot, None, row.get("starter_only_flag"))
+        hit_score = round(hit_score_raw - hit_vol_penalty, 3)
         rows.append({
             "season": season, "teamName": row["teamName"], "playerName": row["playerName"], "playerId": row["playerId"],
             "homeRuns": row["homeRuns"], "gamesPlayed": row["gamesPlayed"], "totalHits": row["hits"],
@@ -1410,18 +1284,10 @@ def build_hit_hr_rows(pool_df: pd.DataFrame, season: int, sched_ctx: dict) -> pd
             "longest_games_without_hr": hr_d["longest_drought"], "last_hr_date": hr_d["last_event_date"],
             "hr_status": hr_status, "avg_games_between_hits": avg_games_between_hits,
             "current_games_without_hit": hit_d["current_gap"], "longestHitDrought": hit_d["longest_drought"],
-            "hit_status": hit_status,
-            "hit_pct_last_5": hit_pct_last_5,
-            "hit_pct_last_10": hit_pct_last_10,
-            "multi_hit_pct_last_10": multi_hit_pct_last_10,
-            "zero_hit_games_last_10": zero_hit_games_last_10,
-            "current_hit_streak": current_hit_streak,
-            "hit_volatility_index": hit_volatility_index,
-            "hit_consistency_score": hit_consistency_score,
-            "hit_momentum_bonus": hit_momentum_bonus,
-            "hit_form_volatility_penalty": hit_form_vol_penalty,
-            "hit_form_label": hit_form_label,
-            "hit_model_tier": hit_model_tier,
+            "hit_status": hit_status, "hit_pct_last_10": hit_pct_last_10, "hit_pct_last_5": hit_pct_last_5,
+            "current_hit_streak": current_hit_streak, "contact_momentum_bonus": contact_momentum,
+            "tb2plus_last10_pct": tb2plus_last10_pct, "tb2plus_last5_pct": tb2plus_last5_pct,
+            "run_last10_pct": run_last10_pct, "rbi_last10_pct": rbi_last10_pct,
             "season_hit_pct": season_hit_pct,
             "auto_pitcher_name": ctx.get("opp_pitcher_name"), "auto_pitcher_hand": ctx.get("opp_pitcher_hand"),
             "park_favorability": ctx.get("park_favorability"), "game_park_team": ctx.get("game_park_team"),
@@ -1511,7 +1377,7 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
     - If lineups are confirmed, prioritizes confirmed starters in slots 1-6.
     - If lineups are not available yet, allows only stronger projected hitters.
     """
-    cols = ["category","bet_type","playerName","teamName","game","opponent_pitcher","opponent_pitcher_team","opponent_pitcher_pick_type","opponent_pitcher_sample","lineup_status","batting_order_slot","starter_only_flag","HR_score","Hit_score","hit_model_tier","hit_form_label","hit_pct_last_5","hit_pct_last_10","multi_hit_pct_last_10","zero_hit_games_last_10","current_hit_streak","hit_consistency_score","hit_momentum_bonus","park_favorability","confidence","stack_tag","reason"]
+    cols = ["category","bet_type","playerName","teamName","game","opponent_pitcher","opponent_pitcher_team","opponent_pitcher_pick_type","opponent_pitcher_sample","lineup_status","batting_order_slot","starter_only_flag","HR_score","Hit_score","park_favorability","stack_tag","reason"]
 
     if player_rows is None or player_rows.empty or pitcher_metrics is None or pitcher_metrics.empty:
         return pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No refined picks met today’s filters"}], columns=cols)
@@ -1535,12 +1401,12 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
     rows = rows.merge(ctx, on=merge_keys, how="left")
 
     # Defensive defaults
-    for c, default in [("Hit_score", 0), ("HR_score", 0), ("batting_order_slot", 99), ("offense_score", 0), ("edge_vs_opponent", 0), ("hit_pct_last_5", 0), ("hit_pct_last_10", 0), ("multi_hit_pct_last_10", 0), ("zero_hit_games_last_10", 99), ("current_hit_streak", 0), ("hit_consistency_score", 0), ("hit_momentum_bonus", 0)]:
+    for c, default in [("Hit_score", 0), ("HR_score", 0), ("batting_order_slot", 99), ("offense_score", 0), ("edge_vs_opponent", 0)]:
         if c not in rows.columns:
             rows[c] = default
         rows[c] = pd.to_numeric(rows[c], errors="coerce").fillna(default)
 
-    for c, default in [("lineup_status", "Unknown"), ("starter_only_flag", False), ("opponent_pitcher_pick_type", "Neutral"), ("park_favorability", "Unknown"), ("hit_model_tier", "Research"), ("hit_form_label", "Unknown")]:
+    for c, default in [("lineup_status", "Unknown"), ("starter_only_flag", False), ("opponent_pitcher_pick_type", "Neutral"), ("park_favorability", "Unknown")]:
         if c not in rows.columns:
             rows[c] = default
 
@@ -1555,21 +1421,16 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
     rows["slot_num"] = pd.to_numeric(rows["batting_order_slot"], errors="coerce").fillna(99)
     confirmed = rows["lineup_status"].astype(str).eq("Confirmed Starter")
 
-    # Refined is allowed to be broader than Final Card, but now uses form/consistency filters
-    # so the list is less random and less dependent on raw season score alone.
-    form_ok = (rows["hit_pct_last_10"] >= 60) | (rows["hit_pct_last_5"] >= 80) | (rows["hit_consistency_score"] >= 58)
-    elite_form_ok = (rows["hit_pct_last_10"] >= 70) | (rows["hit_consistency_score"] >= 68)
-
     if use_confirmed_only:
-        quality_mask = confirmed & (rows["slot_num"] <= 6) & (rows["Hit_score"] >= 3.80) & form_ok
-        mode_label = "confirmed-only + form gate"
+        quality_mask = confirmed & (rows["slot_num"] <= 6) & (rows["Hit_score"] >= 3.75)
+        mode_label = "confirmed-only"
     else:
-        # Pregame mode: unknown lineups need a higher score and stronger form because PA volume is not locked.
+        # Pregame mode: avoid flooding. Unknowns need a higher score because lineups are not locked yet.
         quality_mask = (
-            (confirmed & (rows["Hit_score"] >= 3.80) & form_ok) |
-            ((~confirmed) & (rows["Hit_score"] >= 4.35) & elite_form_ok)
+            (confirmed & (rows["Hit_score"] >= 3.75)) |
+            ((~confirmed) & (rows["Hit_score"] >= 4.25))
         )
-        mode_label = "pregame-projected + form gate"
+        mode_label = "pregame-projected"
 
     hit_pool = rows[
         valid_game &
@@ -1586,8 +1447,7 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
     # - max 2 per team, to avoid one offense flooding the refined card
     # - max 10 total refined picks, so this remains a true refined list rather than a research dump
     hit_pool["lineup_rank"] = hit_pool["lineup_status"].astype(str).eq("Confirmed Starter").astype(int)
-    hit_pool["tier_rank"] = hit_pool["hit_model_tier"].apply(hit_tier_rank)
-    hit_pool = hit_pool.sort_values(["tier_rank", "Hit_score", "hit_consistency_score", "lineup_rank", "edge_vs_opponent", "slot_num"], ascending=[True, False, False, False, False, True])
+    hit_pool = hit_pool.sort_values(["Hit_score", "lineup_rank", "edge_vs_opponent", "slot_num"], ascending=[False, False, False, True])
     hit_pool = hit_pool.drop_duplicates(subset=["playerName", "teamName", "game"], keep="first")
 
     selected_rows = []
@@ -1629,19 +1489,9 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
             "starter_only_flag":r.get("starter_only_flag"),
             "HR_score":r.get("HR_score"),
             "Hit_score":score,
-            "hit_model_tier":r.get("hit_model_tier"),
-            "hit_form_label":r.get("hit_form_label"),
-            "hit_pct_last_5":r.get("hit_pct_last_5"),
-            "hit_pct_last_10":r.get("hit_pct_last_10"),
-            "multi_hit_pct_last_10":r.get("multi_hit_pct_last_10"),
-            "zero_hit_games_last_10":r.get("zero_hit_games_last_10"),
-            "current_hit_streak":r.get("current_hit_streak"),
-            "hit_consistency_score":r.get("hit_consistency_score"),
-            "hit_momentum_bonus":r.get("hit_momentum_bonus"),
             "park_favorability":r.get("park_favorability"),
-            "confidence":r.get("hit_model_tier") if r.get("hit_model_tier") in ("A+", "A", "B") else "Research",
-            "stack_tag":"Rolling refined + form",
-            "reason":f"Rolling refined max2/game max10 {mode_label}; tier {r.get('hit_model_tier')}; Hit_score {score:.3f}; L10 {r.get('hit_pct_last_10')}%; L5 {r.get('hit_pct_last_5')}%; consistency {r.get('hit_consistency_score')}; slot {r.get('batting_order_slot')}; opp {r.get('opponent_pitcher_pick_type')}; edge {r.get('edge_vs_opponent')}",
+            "stack_tag":"Rolling refined",
+            "reason":f"Rolling refined max2/game max10 {mode_label}; Hit_score {score:.3f}; slot {r.get('batting_order_slot')}; opp {r.get('opponent_pitcher_pick_type')}; edge {r.get('edge_vs_opponent')}",
         })
 
     return pd.DataFrame(picks, columns=cols)
@@ -1651,7 +1501,7 @@ def build_pitcher_line_value(pitcher_metrics):
         "pitcherName", "teamName", "opponentTeam", "pick_type", "sample_flag",
         "innings_pitched", "strikeouts", "earned_runs", "hits_allowed", "walks",
         "pitcher_score_adj", "avg_ip_per_start", "avg_k_per_start", "k_per_inning",
-        "last2_ip_avg", "last2_k_avg", "last2_pitch_avg", "short_leash_flag",
+        "last2_ip_avg", "last2_k_avg", "last2_pitch_avg", "k5plus_last10_pct", "k6plus_last10_pct", "k7plus_last10_pct", "short_leash_flag",
         "opp_team_k_rate", "opp_team_k_tendency", "opp_k_matchup_bonus", "own_bullpen_grade",
         "projected_k_floor", "projected_k_mid", "projected_k_ceiling", "max_playable_k_line",
         "k_value_tier", "recommended_k_action", "safest_pitching_play", "notes",
@@ -1692,6 +1542,7 @@ def build_pitcher_line_value(pitcher_metrics):
             "innings_pitched":ip,"strikeouts":ks,"earned_runs":r.get("earned_runs"),"hits_allowed":r.get("hits_allowed"),"walks":r.get("walks"),
             "pitcher_score_adj":r.get("pitcher_score_adj"),"avg_ip_per_start":avg_ip,"avg_k_per_start":avg_k,"k_per_inning":kpi,
             "last2_ip_avg":r.get("last2_ip_avg"),"last2_k_avg":r.get("last2_k_avg"),"last2_pitch_avg":r.get("last2_pitch_avg"),
+            "k5plus_last10_pct":r.get("k5plus_last10_pct"),"k6plus_last10_pct":r.get("k6plus_last10_pct"),"k7plus_last10_pct":r.get("k7plus_last10_pct"),
             "short_leash_flag":short_leash_flag,
             "opp_team_k_rate":r.get("opp_team_k_rate"),"opp_team_k_tendency":r.get("opp_team_k_tendency"),"opp_k_matchup_bonus":opp_k_bonus,
             "own_bullpen_grade":r.get("own_bullpen_grade"),
@@ -1905,6 +1756,122 @@ def apply_k_market_validation(pitcher_line_value: pd.DataFrame, target_date: str
     return df
 
 
+
+
+def build_plus_money_prop_sheet(player_rows: pd.DataFrame, pitcher_line_value: pd.DataFrame, game_rankings: pd.DataFrame) -> pd.DataFrame:
+    """Build a research-only prop finder for plus-money/alt props.
+
+    This does NOT assume odds are available. It flags candidates that fit the same kind
+    of profile as public hit sheets: 7/10+ recent cash rate, stable role, and +100-or-better
+    markets to check manually.
+    """
+    cols = [
+        "prop_type", "pick", "team", "opponent", "game", "confidence", "model_grade",
+        "recent_cash_rate", "season_rate", "lineup_status", "batting_order_slot",
+        "projected_edge_note", "market_check", "reason"
+    ]
+    rows = []
+
+    gr = game_rankings.copy() if game_rankings is not None and not game_rankings.empty else pd.DataFrame()
+    game_lookup = {}
+    if not gr.empty:
+        for _, r in gr.iterrows():
+            game_lookup[(r.get("teamName"), r.get("opponentTeam"))] = r.get("game")
+
+    if player_rows is not None and not player_rows.empty:
+        pr = player_rows.copy()
+        pr["slot_num"] = pd.to_numeric(pr.get("batting_order_slot"), errors="coerce").fillna(99)
+        pr["confirmed"] = pr.get("lineup_status", "Unknown").astype(str).eq("Confirmed Starter") if "lineup_status" in pr.columns else False
+        pr["opp_type"] = pr.get("opponent_pitcher_pick_type", "Neutral") if "opponent_pitcher_pick_type" in pr.columns else "Neutral"
+
+        for _, r in pr.iterrows():
+            team = r.get("teamName")
+            opp = r.get("opponentTeam") or r.get("opponent_pitcher_team")
+            game = r.get("game") or game_lookup.get((team, opp))
+            slot = nz(r.get("slot_num"), 99)
+            confirmed = bool(r.get("confirmed"))
+            opp_type = str(r.get("opp_type") or "Neutral")
+            hit_l10 = r.get("hit_pct_last_10")
+            hit_l5 = r.get("hit_pct_last_5")
+            season_hit = r.get("season_hit_pct")
+            tb10 = r.get("tb2plus_last10_pct")
+            tb5 = r.get("tb2plus_last5_pct")
+            run10 = r.get("run_last10_pct")
+            rbi10 = r.get("rbi_last10_pct")
+            hit_score = nz(r.get("Hit_score"))
+            hr_score = nz(r.get("HR_score"))
+            name = r.get("playerName")
+            lineup_ok = confirmed and slot <= 6
+            avoid_sp = opp_type == "Strong SP"
+
+            # 2+ Total Bases: best for hot hitters with power/contact and top/middle lineup role.
+            if tb10 is not None and tb10 >= 70 and lineup_ok and not avoid_sp:
+                conf = "A+" if tb10 >= 80 and (tb5 is None or tb5 >= 60) and (hr_score >= 3.8 or hit_score >= 4.2) else "A"
+                rows.append({
+                    "prop_type": "2+ Total Bases", "pick": name, "team": team, "opponent": opp, "game": game,
+                    "confidence": conf, "model_grade": round(hit_score + max(hr_score, 0) * 0.20, 3),
+                    "recent_cash_rate": tb10, "season_rate": season_hit,
+                    "lineup_status": r.get("lineup_status"), "batting_order_slot": r.get("batting_order_slot"),
+                    "projected_edge_note": "TB profile: recent 2+ TB rate plus contact/power support",
+                    "market_check": "Only play if +100 or better, or if model edge beats posted price",
+                    "reason": f"2+TB L10 {tb10}%; L5 {tb5}; Hit_score {hit_score:.3f}; HR_score {hr_score:.3f}; slot {slot}; opp {opp_type}",
+                })
+
+            # 1+ Run: top of order + strong hit form + team/game environment.
+            if run10 is not None and run10 >= 70 and confirmed and slot <= 3 and not avoid_sp:
+                rows.append({
+                    "prop_type": "1+ Run", "pick": name, "team": team, "opponent": opp, "game": game,
+                    "confidence": "A" if run10 >= 80 else "B", "model_grade": round(hit_score + (4 - min(slot, 4)) * 0.25, 3),
+                    "recent_cash_rate": run10, "season_rate": season_hit,
+                    "lineup_status": r.get("lineup_status"), "batting_order_slot": r.get("batting_order_slot"),
+                    "projected_edge_note": "Run prop profile: top-order PA volume + recent run cash rate",
+                    "market_check": "Best used for plus-money or SGP leg; verify lineup and team total",
+                    "reason": f"Run L10 {run10}%; slot {slot}; Hit_score {hit_score:.3f}; opp {opp_type}",
+                })
+
+            # 1+ RBI: middle-order bats with recent RBI conversion and power/contact support.
+            if rbi10 is not None and rbi10 >= 60 and confirmed and 3 <= slot <= 6 and not avoid_sp:
+                rows.append({
+                    "prop_type": "1+ RBI", "pick": name, "team": team, "opponent": opp, "game": game,
+                    "confidence": "A" if rbi10 >= 70 else "B", "model_grade": round(hit_score + hr_score * 0.15, 3),
+                    "recent_cash_rate": rbi10, "season_rate": season_hit,
+                    "lineup_status": r.get("lineup_status"), "batting_order_slot": r.get("batting_order_slot"),
+                    "projected_edge_note": "RBI profile: middle-order role + recent RBI rate + contact/power support",
+                    "market_check": "Only play if price is +100 or better and runners-ahead context is strong",
+                    "reason": f"RBI L10 {rbi10}%; slot {slot}; Hit_score {hit_score:.3f}; HR_score {hr_score:.3f}; opp {opp_type}",
+                })
+
+    if pitcher_line_value is not None and not pitcher_line_value.empty:
+        kdf = pitcher_line_value.copy()
+        for _, r in kdf.iterrows():
+            if str(r.get("short_leash_flag") or "").startswith("Yes"):
+                continue
+            k5 = r.get("k5plus_last10_pct")
+            k6 = r.get("k6plus_last10_pct")
+            mid = nz(r.get("projected_k_mid"))
+            opp_tendency = r.get("opp_team_k_tendency")
+            conf = None
+            if k5 is not None and k5 >= 70 and mid >= 5:
+                conf = "A+" if k5 >= 80 and mid >= 6 else "A"
+                rows.append({
+                    "prop_type": "5+ Strikeouts", "pick": r.get("pitcherName"), "team": r.get("teamName"), "opponent": r.get("opponentTeam"),
+                    "game": None, "confidence": conf, "model_grade": round(mid + nz(r.get("opp_k_matchup_bonus")), 3),
+                    "recent_cash_rate": k5, "season_rate": r.get("avg_k_per_start"),
+                    "lineup_status": "Confirmed Starter", "batting_order_slot": None,
+                    "projected_edge_note": "Alt-K profile: recent 5+ K cash rate + projected K mid + opponent K tendency",
+                    "market_check": "Only play if +100 or better; compare to current sportsbook alt-K price",
+                    "reason": f"5+K L10 {k5}%; 6+K L10 {k6}; projected mid {mid}; oppK {opp_tendency}; tier {r.get('k_value_tier')}",
+                })
+
+    if not rows:
+        return pd.DataFrame([{"prop_type":"Info", "pick":"No plus-money prop candidates", "reason":"No props met recent cash-rate and role filters"}], columns=cols)
+
+    out = pd.DataFrame(rows)
+    out["sort_rank"] = out["confidence"].map({"A+": 1, "A": 2, "B": 3}).fillna(9)
+    out = out.sort_values(["sort_rank", "recent_cash_rate", "model_grade"], ascending=[True, False, False])
+    out = out.drop(columns=["sort_rank"])
+    return out.head(30).reset_index(drop=True)[cols]
+
 def build_daily_card(game_rankings, refined_picks, pitcher_line_value, hr_drought):
     rows = []
     used_teams = set()
@@ -2041,26 +2008,13 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
     base["slot_num"] = pd.to_numeric(base.get("batting_order_slot"), errors="coerce").fillna(9)
     base["power_filter"] = (base["homeRuns"].fillna(0) >= 3) | (base["avg_games_between_hrs"].fillna(99) <= 2.5)
 
-    # Hits: elite-only Final Card gate.
-    # The audit showed Refined Picks were working but Final Card promotion was too loose.
-    # Final Card now requires confirmed lineup, top-5 slot, non-Strong-SP matchup, and recent contact/form support.
-    for c, default in [("hit_pct_last_5", 0), ("hit_pct_last_10", 0), ("hit_consistency_score", 0), ("zero_hit_games_last_10", 99), ("current_hit_streak", 0)]:
-        if c not in base.columns:
-            base[c] = default
-        base[c] = pd.to_numeric(base[c], errors="coerce").fillna(default)
-    if "hit_model_tier" not in base.columns:
-        base["hit_model_tier"] = base.apply(lambda r: classify_hit_model_tier(r), axis=1)
-    if "hit_form_label" not in base.columns:
-        base["hit_form_label"] = "Unknown"
-    base["hit_final_gate"] = base.apply(hit_final_card_gate, axis=1)
-    base["hit_tier_rank"] = base["hit_model_tier"].apply(hit_tier_rank)
-
+    # Hits: two strongest only
     hit_pool = base[
         (base["lineup_ok"] == True) &
-        (base["hit_final_gate"] == True) &
+        (base["Hit_score"].fillna(0) >= 4.0) &
         (base["opponent_pitcher_pick_type"].fillna("Neutral") != "Strong SP") &
         (base["slot_num"] <= 5)
-    ].copy().sort_values(["hit_tier_rank", "Hit_score", "hit_consistency_score", "slot_num", "totalHits"], ascending=[True, False, False, True, False])
+    ].copy().sort_values(["Hit_score","slot_num","totalHits"], ascending=[False, True, False])
 
     hit_added = 0
     for _, r in hit_pool.iterrows():
@@ -2068,10 +2022,9 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
             break
         if (r["teamName"], r["playerName"]) in used_players or not can_use_team(r["teamName"], 2):
             continue
-        conf = r.get("hit_model_tier") if r.get("hit_model_tier") in ("A+", "A") else "B"
         add_row(
-            f"Core {len(rows)+1}", "1+ Hit", r["playerName"], r["teamName"], r.get("opponentTeam"), conf,
-            f"Hit_score {r['Hit_score']:.3f}; tier {r.get('hit_model_tier')}; form {r.get('hit_form_label')}; L10 {r.get('hit_pct_last_10')}%; L5 {r.get('hit_pct_last_5')}%; consistency {r.get('hit_consistency_score')}; streak {r.get('current_hit_streak')}; slot {int(r['slot_num'])}; opp {r.get('opponent_pitcher_pick_type')}; park {r.get('park_favorability')}",
+            f"Core {len(rows)+1}", "1+ Hit", r["playerName"], r["teamName"], r.get("opponentTeam"), "A",
+            f"Hit_score {r['Hit_score']:.3f}; slot {int(r['slot_num'])}; opp {r.get('opponent_pitcher_pick_type')}; park {r.get('park_favorability')}",
             "Refined_Picks"
         )
         hit_added += 1
@@ -2225,6 +2178,7 @@ def main(season: int, target_date: str):
 
     daily_card = build_daily_card(pregame_game_rankings, refined_picks, pregame_pitcher_line_value, hr_drought)
     final_card = build_final_card(pregame_player_rows, pregame_game_rankings, pregame_pitcher_line_value)
+    plus_money_props = build_plus_money_prop_sheet(pregame_player_rows, pregame_pitcher_line_value, pregame_game_rankings)
 
     ts = dt.datetime.now().strftime("%Y-%m-%d_%H%M")
     outfile = OUTPUT_DIR / f"HR_Hit_Drought_v40_stats-{season}_{ts}.xlsx"
@@ -2234,7 +2188,7 @@ def main(season: int, target_date: str):
         pd.DataFrame([
             ("requested_season", season),
             ("target_game_date", target_date),
-            ("message", "v40 Hit-core rebuild: HR upside only, rolling refined max2/game, K market validation"),
+            ("message", "v40 Prop expansion: hit core + plus-money props + alt K/TB/run/RBI sheet"),
             ("locked_players_count", len(locked_players)),
             ("pregame_eligible_games_for_final_card", len(eligible_schedule_rows)),
             ("run_time_et", now_et.strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ")),
@@ -2250,14 +2204,14 @@ def main(season: int, target_date: str):
         refined_picks.to_excel(writer, sheet_name="Refined_Picks", index=False)
         daily_card.to_excel(writer, sheet_name="Daily_Card", index=False)
         final_card.to_excel(writer, sheet_name="Final_Card", index=False)
+        plus_money_props.to_excel(writer, sheet_name="Plus_Money_Props", index=False)
 
         top_hr = pd.DataFrame()
         top_hit = pd.DataFrame()
         if not player_rows.empty:
             top_hr = player_rows.nlargest(6, "HR_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","HR_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
             top_hr.insert(0, "type", "HR")
-            top_hit_cols = [c for c in ["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","Hit_score","hit_model_tier","hit_form_label","hit_pct_last_5","hit_pct_last_10","multi_hit_pct_last_10","zero_hit_games_last_10","current_hit_streak","hit_consistency_score","batting_order_slot","lineup_status","starter_only_flag"] if c in player_rows.columns]
-            top_hit = player_rows.nlargest(10, "Hit_score")[top_hit_cols].copy()
+            top_hit = player_rows.nlargest(6, "Hit_score")[["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","Hit_score","batting_order_slot","lineup_status","starter_only_flag"]].copy()
             top_hit.insert(0, "type", "HIT")
         top_picks = pd.concat([top_hr, top_hit], ignore_index=True)
         top_picks.to_excel(writer, sheet_name="Top_Picks", index=False)
@@ -2266,7 +2220,7 @@ def main(season: int, target_date: str):
     for s in ["HR_Drought","Hit_Drought"]:
         if s in wb.sheetnames:
             color_status_col(wb[s], "status")
-    for s in ["Pitcher_Metrics","Pitcher_Line_Value","Game_Rankings","Daily_Card","Final_Card","Top_Picks","Team_Context"]:
+    for s in ["Pitcher_Metrics","Pitcher_Line_Value","Game_Rankings","Daily_Card","Final_Card","Top_Picks","Team_Context","Plus_Money_Props"]:
         if s in wb.sheetnames:
             highlight_top_rows(wb[s], 10)
     wb.save(outfile)
@@ -2284,7 +2238,8 @@ def main(season: int, target_date: str):
         hr_drought=hr_drought,
         hit_drought=hit_drought,
         top_picks=top_picks,
-        refined_picks=refined_picks
+        refined_picks=refined_picks,
+        plus_money_props=plus_money_props
     )
 
     save_app_json(app_payload, json_output_path)
