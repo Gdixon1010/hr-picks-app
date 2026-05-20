@@ -91,19 +91,12 @@ def _is_placeholder(row: dict) -> bool:
     if not isinstance(row, dict):
         return True
     text = " ".join(str(v).lower() for v in row.values())
-    category = str(row.get("category") or "").strip().lower()
-    bet_type = str(row.get("bet_type") or row.get("prop_type") or "").strip().lower()
-    pick = str(row.get("pick") or row.get("playerName") or row.get("pitcherName") or "").strip().lower()
     return (
         "no plays" in text
         or "no qualified" in text
         or "no final card plays qualified" in text
-        or "no plus-money prop candidates" in text
-        or "no plus money prop candidates" in text
-        or "no candidates" in text
-        or category == "info"
-        or bet_type in {"no plays", "info", ""}
-        or pick.startswith("no plus")
+        or row.get("category") == "Info"
+        or row.get("bet_type") == "No Plays"
     )
 
 
@@ -112,23 +105,49 @@ def _rows(value) -> list:
 
 
 def _merge_rows(old_rows: list, new_rows: list, key_fields: list) -> list:
+    """Non-destructive same-slate merge.
+
+    Preserves old locked rows so refreshes never wipe the card, but also enriches
+    those rows with any newer fields from the latest model run, including
+    recent_cash_rate / recent_cash_record / recent_cash_sample / recent_cash_last_10.
+    """
     old_rows = _rows(old_rows)
     new_rows = _rows(new_rows)
     old_real = [r for r in old_rows if isinstance(r, dict) and not _is_placeholder(r)]
     new_real = [r for r in new_rows if isinstance(r, dict) and not _is_placeholder(r)]
     rows_to_merge = old_real + new_real
+
     if not rows_to_merge:
         return old_rows if old_rows else new_rows
 
     merged = []
-    seen = set()
+    index_by_key = {}
+
+    def has_value(v) -> bool:
+        if v is None:
+            return False
+        s = str(v).strip()
+        return s not in {"", "—", "None", "nan", "NaN"}
+
     for row in rows_to_merge:
         key = tuple(_norm(row.get(field)) for field in key_fields)
         if not any(key):
             key = tuple(sorted((str(k), _norm(v)) for k, v in row.items()))
-        if key not in seen:
-            seen.add(key)
-            merged.append(row)
+
+        if key not in index_by_key:
+            index_by_key[key] = len(merged)
+            merged.append(dict(row))
+            continue
+
+        # Duplicate row: keep the original locked row, but enrich it with
+        # newer non-empty fields so display/report upgrades show on preserved picks.
+        existing = merged[index_by_key[key]]
+        for k, v in row.items():
+            if k not in existing or not has_value(existing.get(k)):
+                existing[k] = v
+            elif k.startswith("recent_cash") and has_value(v):
+                existing[k] = v
+
     return merged
 
 
@@ -230,12 +249,6 @@ def main(season: int, target_date: str):
     old_refined_candidates.extend(_get_research_rows(old_data, "refined_picks"))
     old_refined_candidates.extend(_history_rows("refined_picks", target_date))
 
-    # Plus Money Props are a rolling same-slate research card just like Refined Picks.
-    # Do NOT let a later refresh wipe early-game plus-money props after games start.
-    old_plus_money_candidates = []
-    old_plus_money_candidates.extend(_get_research_rows(old_data, "plus_money_props"))
-    old_plus_money_candidates.extend(_history_rows("plus_money_props", target_date))
-
     merged_final = _merge_rows(
         old_final_candidates,
         _get_final_card_plays(new_data),
@@ -249,13 +262,6 @@ def main(season: int, target_date: str):
         ["category", "bet_type", "playerName", "teamName", "game", "opponent_pitcher"],
     )
     _set_research_rows(new_data, "refined_picks", merged_refined)
-
-    merged_plus_money = _merge_rows(
-        old_plus_money_candidates,
-        _get_research_rows(new_data, "plus_money_props"),
-        ["prop_type", "bet_type", "pick", "playerName", "team", "teamName", "opponent", "opponentTeam", "game"],
-    )
-    _set_research_rows(new_data, "plus_money_props", merged_plus_money)
 
     merged_top = _merge_rows(
         _get_research_rows(old_data, "top_picks"),
@@ -273,7 +279,6 @@ def main(season: int, target_date: str):
 
     _update_history("final_card", target_date, _get_final_card_plays(new_data))
     _update_history("refined_picks", target_date, _get_research_rows(new_data, "refined_picks"))
-    _update_history("plus_money_props", target_date, _get_research_rows(new_data, "plus_money_props"))
 
     v41_path = _write_v41_json(new_data, season, target_date)
 
@@ -281,7 +286,6 @@ def main(season: int, target_date: str):
     print(f"🔒 Active slate date: {target_date}")
     print(f"🔒 Final Card locked rows: {len(_get_final_card_plays(new_data))}")
     print(f"🔒 Refined Picks locked rows: {len(_get_research_rows(new_data, 'refined_picks'))}")
-    print(f"🔒 Plus Money Props locked rows: {len(_get_research_rows(new_data, 'plus_money_props'))}")
 
     return {
         "status": "success",
