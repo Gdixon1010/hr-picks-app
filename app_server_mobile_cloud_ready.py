@@ -148,61 +148,39 @@ def load_latest_data():
     data["results"] = read_json_file(history_dir / "performance_summary_latest.json", {"overall": {}, "by_bet_type": [], "by_confidence": [], "recent_results": []})
     data["results_latest"] = read_json_file(history_dir / "results_history_latest.json", {"graded_rows": 0, "rows": []})
     data["info"] = {
-        "purpose": "This app finds MLB betting edges by combining value-adjusted probability, recent form, player trends, drought logic, matchup strength, pitcher quality, lineup context, park factors, and results tracking. The goal is not to list the biggest names; it is to surface the strongest risk-adjusted value spots for today’s slate.",
+        "purpose": "This app finds MLB betting edges by combining player trends, drought logic, matchup strength, pitcher quality, lineup context, and park factors.",
         "how_to_use": [
-            "Start on Final Card for the most condensed plays. This card is designed to be selective and risk-adjusted, not a full list of every good-looking spot.",
-            "Use Research to review the deeper model tables: Refined Picks, Plus Money Props, HR Drought, HR Value Watch, Hit Drought, Pitcher Metrics, Pitcher Line Value, Game Rankings, and Top Picks.",
-            "Use Refined Picks as the broader hit-prop research pool. These are generally stronger for consistency than HRs or plus-money props.",
-            "Use Plus Money Props for higher-payout opportunities such as 5+ strikeouts, 2+ total bases, 1+ RBI, and 1+ run. These are more volatile and should be treated differently than standard 1+ hit plays.",
-            "Use HR Value Watch to look for underpriced HR candidates. The model dynamically calculates the average HR total from the current slate/player pool, excludes zero-HR players from that average, and favors players with enough power to matter without automatically chasing the most public sluggers.",
-            "Use filters to find overlapping signals: recent form, favorable park, non-Strong-SP matchup, strong lineup context, positive drought profile, and supportive game environment.",
-            "Treat Strong SP as a warning for hitter props. Short Leash Risk, Low Sample, Neutral, or K Upside environments may be more hitter-friendly depending on the full context.",
-            "The app locks and preserves same-day cards so refreshes do not erase earlier valid plays. Later refreshes may add qualifying late-game plays, but previously locked real plays should remain available for grading and review."
+            "Start on Final Card for the strongest condensed plays.",
+            "Use Games to see matchup context, start time, and top game-level picks.",
+            "Use Research to drill into HR drought, hit drought, pitcher metrics, and game rankings.",
+            "Filter for overdue players, favorable parks, and weaker pitcher types to isolate stronger spots.",
+            "Treat Strong SP as a warning for hitter props and Short Leash Risk or Attack With Hitters as friendlier hitting environments."
         ],
         "card_logic": [
-            {"label": "Final Card", "meaning": "The strongest condensed card. It prioritizes risk-adjusted value, recent form, matchup quality, volatility, and card discipline rather than simply picking the highest raw projection."},
-            {"label": "Core 1", "meaning": "Highest-priority main play on the card. Usually the cleanest overall combination of probability, matchup, recent form, and value."},
-            {"label": "Core 2", "meaning": "Strong playable edge that ranks just below Core 1. Still a main-card option, but usually with slightly less edge or slightly more volatility."},
-            {"label": "Core 3", "meaning": "Playable card pick with some edge, but less clean than the top two cores. Should usually be sized smaller than Core 1."},
-            {"label": "Pitch 1", "meaning": "Top strikeout prop based on projected strikeouts, opponent K tendency, pitcher workload/leash, recent form, and current line validation."},
-            {"label": "Plus Money Props", "meaning": "Higher-payout props such as 5+ Ks, 2+ total bases, 1+ run, and 1+ RBI. These are value opportunities, not guaranteed plays, and carry more variance."},
-            {"label": "HR Value Watch", "meaning": "A value-focused HR research pool that looks for players at or near the dynamic HR average with useful drought, power, park, and pitcher context."},
-            {"label": "Top Picks", "meaning": "A curated research card. HR rows should favor value-style HR profiles rather than only raw HR leaders, while hit rows should favor recent form and consistency."},
-            {"label": "Refined Picks", "meaning": "Broader model/research plays, especially for 1+ hit props. This pool can be larger than Final Card and is tracked separately in Results."}
+            {"label": "Core 1", "meaning": "Highest-priority main play on the card. Usually the cleanest overall edge among the non-HR hitter or ML plays."},
+            {"label": "Core 2", "meaning": "Strong play that ranks just below Core 1. Still a main card option, but slightly less clean than the top play."},
+            {"label": "Core 3", "meaning": "Solid playable pick that made the card, but with a little less edge or a little more volatility than the top two cores."},
+            {"label": "Pitch 1", "meaning": "Top strikeout prop on the card based on projected Ks versus the listed line and matchup context."},
+            {"label": "Power 1", "meaning": "Top home run upside play on the card. This is the highest-variance play type and should usually be bet smaller."}
         ],
         "unit_strategy": [
             "Use a consistent unit size instead of changing bet size emotionally. A common baseline is 1 unit = 1% of bankroll.",
-            "Suggested sizing: Core 1 = 1.0u, Core 2 = 0.75u, Core 3 = 0.5u to 0.75u, Pitch 1 = 0.5u to 1.0u depending on line confidence, Plus Money Props = 0.25u to 0.5u, HR Value plays = 0.25u to 0.5u.",
-            "Hit props have historically been the strongest and most stable part of the model, so they can be treated as the core engine when the context is clean.",
-            "HRs, total bases, runs, RBIs, and plus-money props are higher variance. They can be valuable, but they should generally be sized smaller than clean 1+ hit plays.",
-            "Do not chase losses, double units after a bad day, or force action on every pick. The model works best when the user respects card discipline and long-term tracking."
+            "Suggested sizing: Core 1 = 1.0u, Core 2 = 0.75u, Core 3 = 0.5u to 0.75u, Pitch 1 = 0.75u to 1.0u, Power 1 = 0.25u to 0.5u.",
+            "Treat HR picks as the most volatile part of the card. They can be valuable, but they should usually carry the smallest risk.",
+            "Do not chase losses, double units after a bad day, or force action on every pick. The card works best when sizing stays disciplined over time."
         ],
         "terms": [
-            {"term": "Value-Adjusted Probability", "meaning": "The model is looking for spots where the probability appears stronger than the market/public perception, not simply the most famous player or highest season total."},
-            {"term": "Recent Form", "meaning": "Rolling form signals such as last 5/last 10 hit rate, current streak, consistency, and contact momentum. Hot or stable hitters may be upgraded; cold or volatile hitters may be downgraded."},
-            {"term": "Hit Score", "meaning": "Composite score for 1+ hit probability using matchup, form, lineup opportunity, pitcher profile, park, and trend inputs. Higher is better, but context still matters."},
-            {"term": "Hit Quality Engine", "meaning": "The layer that rewards recent consistency and contact form while penalizing volatility or poor current form."},
-            {"term": "HR Score", "meaning": "Composite score for home run appeal using power, park, matchup, drought context, and pitcher vulnerability."},
-            {"term": "HR Value Profile", "meaning": "A value-focused HR concept that favors players with real but not fully obvious power. The model excludes 0-HR players from the average and dynamically compares each player’s HR total to the current pool average."},
-            {"term": "Dynamic League HR Average", "meaning": "The average home run total is recalculated from the current player pool each run. It is not hardcoded, so it moves as the season changes."},
-            {"term": "HR Value Watch", "meaning": "Research tab for HR candidates near the dynamic average with positive drought, park, and matchup context. This is meant to find underpriced HR upside, not just public sluggers."},
-            {"term": "Plus Money Props", "meaning": "Higher-payout props such as 5+ strikeouts, 2+ total bases, 1+ run, or 1+ RBI. These are graded separately and should be treated as higher-variance value plays."},
-            {"term": "5+ Strikeouts", "meaning": "Pitcher prop candidate based on strikeout projection, opponent K tendency, workload/leash, recent pitcher form, and current line context."},
-            {"term": "2+ Total Bases", "meaning": "Hitter prop candidate driven by extra-base ability, hard contact, matchup, park, and recent form. More volatile than 1+ hit props."},
-            {"term": "1+ RBI", "meaning": "Run-production prop that depends heavily on lineup slot, runners ahead, team scoring environment, pitcher traffic allowed, and game context."},
-            {"term": "1+ Run", "meaning": "Scoring prop that depends heavily on batting order, on-base ability, hitters behind the player, team implied offense, and bullpen quality."},
-            {"term": "Model Insight", "meaning": "A short plain-English explanation of why a pick made the card based on edge, matchup, form, and context signals."},
+            {"term": "Model Insight", "meaning": "A short plain-English explanation of why a pick made the card based on the model's edge, matchup, and context signals."},
             {"term": "Attack With Hitters", "meaning": "Pitcher or pitching environment is vulnerable enough to target hitters."},
-            {"term": "Strong SP", "meaning": "Strong starting pitcher. Usually a downgrade or exclusion warning for hitter props unless other signals are very strong."},
+            {"term": "Strong SP", "meaning": "Strong starting pitcher. Usually a downgrade for hitter props."},
             {"term": "Short Leash Risk", "meaning": "Pitcher may not work deep into the game, which can help hitters later against the bullpen."},
-            {"term": "K Upside", "meaning": "Pitcher has a favorable strikeout profile for K props. For hitters, this can be a caution depending on the rest of the matchup."},
+            {"term": "K Upside", "meaning": "Pitcher has a favorable strikeout profile for K props."},
             {"term": "On Pace", "meaning": "Current drought is normal relative to the player’s average pattern."},
             {"term": "Slightly Overdue", "meaning": "Player is running a bit longer than usual without the event."},
-            {"term": "Overdue", "meaning": "Player is well beyond normal drought range, but this is only useful when supported by matchup, form, and environment."},
-            {"term": "Environment Scoring", "meaning": "Daily adjustment for pitcher quality, bullpen risk, park, lineup slot, team scoring context, and game conditions."},
-            {"term": "Moneyline Lean", "meaning": "The model sees an edge on that team, but moneyline plays are more selective because earlier tracking showed ML performance needed tighter filters."},
-            {"term": "Lock / Preserve Logic", "meaning": "Same-day cards are preserved so valid earlier plays do not disappear after refresh. Later refreshes can add new qualifying late-game plays without wiping real locked plays."},
-            {"term": "Results Tracking", "meaning": "Final Card, Refined Picks, and Plus Money Props are tracked separately so the user can see which model areas are working and which need adjustment."}
+            {"term": "Overdue", "meaning": "Player is well beyond normal drought range and may be due for regression."},
+            {"term": "Hit Score", "meaning": "Composite score for hit probability using matchup, context, and trend inputs. Higher is better."},
+            {"term": "HR Score", "meaning": "Composite score for home run appeal using power, park, matchup, and drought context. Higher is better."},
+            {"term": "Moneyline Lean", "meaning": "The model sees an edge on that team, but size depends on edge strength and matchup quality."}
         ]
     }
     data["_meta"] = {
@@ -247,30 +225,18 @@ def _is_placeholder_pick(row: dict) -> bool:
     if not isinstance(row, dict):
         return True
     text = " ".join(str(v).lower() for v in row.values())
-    category = str(row.get("category") or "").strip().lower()
-    bet_type = str(row.get("bet_type") or row.get("prop_type") or "").strip().lower()
-    pick = str(row.get("pick") or row.get("playerName") or row.get("pitcherName") or "").strip().lower()
     return (
         "no plays" in text
         or "no qualified" in text
         or "no final card plays qualified" in text
-        or "no plus-money prop candidates" in text
-        or "no plus money prop candidates" in text
-        or "no candidates" in text
-        or category == "info"
-        or bet_type in {"no plays", "info", ""}
-        or pick.startswith("no plus")
+        or row.get("category") == "Info"
+        or row.get("bet_type") == "No Plays"
     )
 
 
 def _get_card_history(card_type: str) -> dict:
-    """card_type = final_card, refined_picks, or plus_money_props"""
-    filename_map = {
-        "final_card": "final_card_by_date.json",
-        "refined_picks": "refined_picks_by_date.json",
-        "plus_money_props": "plus_money_props_by_date.json",
-    }
-    filename = filename_map.get(card_type, f"{card_type}_by_date.json")
+    """card_type = final_card or refined_picks"""
+    filename = "final_card_by_date.json" if card_type == "final_card" else "refined_picks_by_date.json"
     return read_json_file(_history_dir() / filename, {})
 
 
@@ -305,8 +271,6 @@ def _extract_rows_from_appdata(payload: dict, card_type: str) -> list:
             rows = []
         if not rows:
             rows = (((payload.get("research") or {}).get("final_card")) or [])
-    elif card_type == "plus_money_props":
-        rows = (((payload.get("research") or {}).get("plus_money_props")) or payload.get("plus_money_props") or [])
     else:
         rows = (((payload.get("research") or {}).get("refined_picks")) or payload.get("refined_picks") or [])
     return [r for r in rows if isinstance(r, dict) and not _is_placeholder_pick(r)]
@@ -592,105 +556,17 @@ def _grade_k_prop(row: dict, target_date: str, season: int) -> tuple[str, str]:
     return ("Win" if ks > line else "Loss"), f"{player}: {ks} Ks vs line {line}"
 
 
-def _safe_int_stat(stat: dict, key: str, default: int = 0) -> int:
-    try:
-        return int(stat.get(key, default) or default)
-    except Exception:
-        return default
-
-
-def _total_bases_from_batting_stat(stat: dict) -> int:
-    if not stat:
-        return 0
-    if stat.get("totalBases") is not None:
-        return _safe_int_stat(stat, "totalBases")
-    hits = _safe_int_stat(stat, "hits")
-    doubles = _safe_int_stat(stat, "doubles")
-    triples = _safe_int_stat(stat, "triples")
-    hrs = _safe_int_stat(stat, "homeRuns")
-    singles = max(0, hits - doubles - triples - hrs)
-    return singles + (2 * doubles) + (3 * triples) + (4 * hrs)
-
-
-def _parse_plus_threshold(text: str, default: int = 1) -> int:
-    m = re.search(r"(\d+)\s*\+", str(text or ""))
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            pass
-    return default
-
-
-def _grade_batting_prop(row: dict, target_date: str, season: int, mode: str, threshold: int = 1) -> tuple[str, str]:
-    player = str(row.get("pick") or row.get("playerName") or "").strip()
-    team = str(row.get("team") or row.get("teamName") or "").strip()
-    if not player:
-        return "Unable to Grade", "Missing player"
-    pending, reason = _pending_if_game_not_final(row, target_date)
-    if pending:
-        return "Pending", reason
-    stat = _boxscore_player_stat_by_name(target_date, player, "batting", team_name=team)
-    if stat is None:
-        pid = row.get("playerId") or (_find_player_id_on_team(player, team, season) if team else None)
-        if pid:
-            stat = _player_game_log_for_date(int(pid), "hitting", season, target_date)
-    if not stat:
-        return "No Action", f"No batting boxscore/game log found for {player} on {target_date}"
-    hits = _safe_int_stat(stat, "hits")
-    hrs = _safe_int_stat(stat, "homeRuns")
-    runs = _safe_int_stat(stat, "runs")
-    rbi = _safe_int_stat(stat, "rbi")
-    tb = _total_bases_from_batting_stat(stat)
-    if mode == "total_bases":
-        return ("Win" if tb >= threshold else "Loss"), f"{player}: {tb} total base(s), {hits} hit(s), {hrs} HR"
-    if mode == "run":
-        return ("Win" if runs >= threshold else "Loss"), f"{player}: {runs} run(s), {hits} hit(s)"
-    if mode == "rbi":
-        return ("Win" if rbi >= threshold else "Loss"), f"{player}: {rbi} RBI, {hits} hit(s)"
-    return "Unable to Grade", f"Unsupported batting prop mode: {mode}"
-
-
-def _grade_alt_k_prop(row: dict, target_date: str, season: int, threshold: int = 5) -> tuple[str, str]:
-    player = str(row.get("pick") or row.get("pitcherName") or row.get("playerName") or "").strip()
-    team = str(row.get("team") or row.get("teamName") or "").strip()
-    if not player:
-        return "Unable to Grade", "Missing pitcher"
-    pending, reason = _pending_if_game_not_final(row, target_date)
-    if pending:
-        return "Pending", reason
-    stat = _boxscore_player_stat_by_name(target_date, player, "pitching", team_name=team)
-    if stat is None:
-        pid = row.get("playerId") or (_find_player_id_on_team(player, team, season) if team else None)
-        if pid:
-            stat = _player_game_log_for_date(int(pid), "pitching", season, target_date)
-    if not stat:
-        return "No Action", f"No pitching boxscore/game log found for {player} on {target_date}"
-    ks = _safe_int_stat(stat, "strikeOuts")
-    return ("Win" if ks >= threshold else "Loss"), f"{player}: {ks} Ks vs {threshold}+ target"
-
-
 def _grade_pick(row: dict, target_date: str, season: int = 2026, card_type: str = "Final Card") -> dict:
-    bet_type = str(row.get("bet_type") or row.get("play_type") or row.get("prop_type") or "").strip()
+    bet_type = str(row.get("bet_type") or row.get("play_type") or "").strip()
     lower = bet_type.lower()
     if "moneyline" in lower or lower == "ml":
         result, detail = _grade_moneyline(row, target_date)
-    elif "total bases" in lower or "total base" in lower:
-        result, detail = _grade_batting_prop(row, target_date, season, "total_bases", _parse_plus_threshold(bet_type, 2))
-    elif "rbi" in lower:
-        result, detail = _grade_batting_prop(row, target_date, season, "rbi", _parse_plus_threshold(bet_type, 1))
-    elif "run" in lower and "home run" not in lower:
-        result, detail = _grade_batting_prop(row, target_date, season, "run", _parse_plus_threshold(bet_type, 1))
     elif "hit" in lower and "hr" not in lower and "home" not in lower:
         result, detail = _grade_hitter(row, target_date, season, "hit")
     elif lower == "hr" or "home run" in lower:
         result, detail = _grade_hitter(row, target_date, season, "hr")
-    elif "strikeout" in lower or "k prop" in lower or lower in {"ks", "k"}:
-        # Alt-K props like 5+ Strikeouts are graded as >= threshold.
-        if "+" in lower:
-            result, detail = _grade_alt_k_prop(row, target_date, season, _parse_plus_threshold(bet_type, 5))
-        else:
-            result, detail = _grade_k_prop(row, target_date, season)
+    elif "k prop" in lower or "strikeout" in lower or lower in {"ks", "k"}:
+        result, detail = _grade_k_prop(row, target_date, season)
     else:
         result, detail = "Unable to Grade", f"Unsupported bet type: {bet_type}"
     return {
@@ -704,7 +580,7 @@ def _grade_pick(row: dict, target_date: str, season: int = 2026, card_type: str 
         "slot": row.get("slot") or row.get("play_type") or row.get("section") or row.get("category"),
         "result_status": result,
         "result_detail": detail,
-        "source_tab": row.get("source_tab") or ("Plus_Money_Props" if card_type == "Plus Money Props" else ("Refined_Picks" if card_type == "Refined Picks" else "Final_Card")),
+        "source_tab": row.get("source_tab") or ("Refined_Picks" if card_type == "Refined Picks" else "Final_Card"),
         "graded_at_et": dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " "),
     }
 
@@ -753,11 +629,9 @@ def grade_date_results(target_date: str, season: int = 2026, include_refined: bo
     hist = _history_dir()
     final_rows = _card_rows_for_date(target_date, "final_card")
     refined_rows = _card_rows_for_date(target_date, "refined_picks") if include_refined else []
-    plus_money_rows = _card_rows_for_date(target_date, "plus_money_props")
     new_rows = []
     new_rows.extend(_grade_pick(play, target_date, season, "Final Card") for play in final_rows)
     new_rows.extend(_grade_pick(play, target_date, season, "Refined Picks") for play in refined_rows)
-    new_rows.extend(_grade_pick(play, target_date, season, "Plus Money Props") for play in plus_money_rows)
     if not new_rows:
         return {"status": "no_plays", "date": target_date, "message": "No locked/appdata picks found to grade"}
     latest_path = hist / "results_history_latest.json"
@@ -773,7 +647,7 @@ def grade_date_results(target_date: str, season: int = 2026, include_refined: bo
     latest_path.write_text(json.dumps(latest_payload, indent=2, ensure_ascii=False), encoding="utf-8")
     (hist / "performance_summary_latest.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     (hist / "results_history.jsonl").write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in all_rows) + "\n", encoding="utf-8")
-    return {"status": "ok", "date": target_date, "final_card_rows": len(final_rows), "refined_rows": len(refined_rows), "plus_money_rows": len(plus_money_rows), "graded_new_rows": len(new_rows), "total_rows": len(all_rows), "summary": summary.get("overall")}
+    return {"status": "ok", "date": target_date, "final_card_rows": len(final_rows), "refined_rows": len(refined_rows), "graded_new_rows": len(new_rows), "total_rows": len(all_rows), "summary": summary.get("overall")}
 
 
 def grade_recent_slates_including_today(season: int = 2026, days_back: int = 4) -> dict:
@@ -1195,7 +1069,9 @@ function isStrictNumericColumn(col) {
     "projected_k_floor",
     "projected_k_mid",
     "projected_k_ceiling",
-    "max_playable_k_line"
+    "max_playable_k_line",
+    "recent_cash_rate",
+    "recent_cash_sample"
   ]);
   return numericCols.has(String(col || ""));
 }
@@ -1443,13 +1319,61 @@ function buildFacetBox(label, key, values) {
   `;
 }
 
+
+function displayColumnsForResearch(key, rows) {
+  const allColumns = rows.length ? Object.keys(rows[0]) : [];
+
+  const curated = {
+    top_picks: [
+      "type", "playerName", "teamName", "auto_pitcher_name", "opponent_pitcher",
+      "lineup_status", "batting_order_slot", "Hit_score", "HR_score",
+      "homeRuns", "league_avg_hr_excl_zero", "hr_value_score",
+      "recent_cash_rate", "recent_cash_record", "recent_cash_sample", "recent_cash_last_10",
+      "park_favorability", "opponent_pitcher_pick_type", "hr_value_profile", "reason", "hr_value_reason"
+    ],
+    refined_picks: [
+      "category", "bet_type", "playerName", "teamName", "game", "opponent_pitcher",
+      "opponent_pitcher_team", "opponent_pitcher_pick_type", "lineup_status",
+      "batting_order_slot", "Hit_score",
+      "recent_cash_rate", "recent_cash_record", "recent_cash_sample", "recent_cash_last_10",
+      "park_favorability", "stack_tag", "reason"
+    ],
+    plus_money_props: [
+      "prop_type", "bet_type", "pick", "playerName", "team", "teamName", "opponent", "game",
+      "confidence", "model_grade", "recent_cash_rate", "recent_cash_record",
+      "recent_cash_sample", "recent_cash_last_10", "season_rate",
+      "lineup_status", "batting_order_slot", "market_check", "reason"
+    ]
+  };
+
+  const preferred = curated[key] || allColumns;
+  const picked = preferred.filter(c => allColumns.includes(c));
+
+  // Add any remaining recent_cash fields even if the row order changes.
+  for (const c of allColumns) {
+    if (String(c).toLowerCase().includes("cash") && !picked.includes(c)) picked.push(c);
+  }
+
+  return picked.length ? picked : allColumns;
+}
+
+function formatResearchCell(col, value) {
+  if (value === null || value === undefined || value === "") return "—";
+  const key = String(col || "").toLowerCase();
+  if (key === "recent_cash_rate") {
+    const n = Number(value);
+    if (!Number.isNaN(n)) return (n * 100).toFixed(1) + "%";
+  }
+  return fmt(value);
+}
+
 function openResearchTable(key) {
   CURRENT_RESEARCH_KEY = key;
   CURRENT_RESEARCH_ROWS = APP_DATA?.research?.[key] || [];
 
   const rows = CURRENT_RESEARCH_ROWS;
   const mount = document.getElementById("view-research");
-  const columns = rows.length ? Object.keys(rows[0]) : [];
+  const columns = displayColumnsForResearch(key, rows);
   const options = columns.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
 
   const facets = [];
@@ -1510,7 +1434,7 @@ function openResearchTable(key) {
         <table id="researchTable">
           <thead><tr>${columns.map(c => `<th data-col="${esc(c)}" class="sortable ${String(c).length > 18 ? 'wrap' : ''}">${esc(c)}</th>`).join("")}</tr></thead>
           <tbody>
-            ${rows.map(r => `<tr>${columns.map(c => `<td class="${String(c).length > 18 ? 'wrap' : ''}">${esc(fmt(r[c]))}</td>`).join("")}</tr>`).join("")}
+            ${rows.map(r => `<tr>${columns.map(c => `<td class="${String(c).length > 18 ? 'wrap' : ''}">${esc(formatResearchCell(c, r[c]))}</td>`).join("")}</tr>`).join("")}
           </tbody>
         </table>
       </div>
@@ -1650,7 +1574,7 @@ function filterResearchTable() {
     rows.sort((a, b) => compareColumnValues(a?.[sortKey], b?.[sortKey], sortKey, sortValue));
   }
 
-  tbody.innerHTML = rows.map(r => `<tr>${headers.map(c => `<td class="${String(c).length > 18 ? 'wrap' : ''}">${esc(fmt(r[c]))}</td>`).join("")}</tr>`).join("");
+  tbody.innerHTML = rows.map(r => `<tr>${headers.map(c => `<td class="${String(c).length > 18 ? 'wrap' : ''}">${esc(formatResearchCell(c, r[c]))}</td>`).join("")}</tr>`).join("");
 
   document.querySelectorAll("thead th.sortable").forEach(th => {
     const col = th.dataset.col || "";
@@ -1719,11 +1643,20 @@ function renderResults() {
   }
 
   function cardSummary(cardType) {
-    const rows = recent.filter(r => String(r.card_type || '') === cardType && ['Win', 'Loss'].includes(String(r.result_status || '')));
-    const wins = rows.filter(r => r.result_status === 'Win').length;
-    const losses = rows.filter(r => r.result_status === 'Loss').length;
-    const total = wins + losses;
-    return { total, wins, losses, winRate: total ? wins / total : null };
+    // All-time summary from performance_summary_latest.json -> by_card_type.
+    // Do NOT use recent_results here because recent_results is capped/recent only.
+    const target = String(cardType || '').trim().toLowerCase();
+    const row = byCardType.find(r => String(r.card_type || r.cardType || r["Card Type"] || '').trim().toLowerCase() === target);
+
+    if (!row) return { total: 0, wins: 0, losses: 0, winRate: null };
+
+    const wins = Number(row.wins ?? row.Wins ?? 0);
+    const losses = Number(row.losses ?? row.Losses ?? 0);
+    const total = Number(row.graded_picks ?? row.graded ?? row.Graded ?? (wins + losses));
+    const rawRate = row.win_rate ?? row.winRate ?? row["Win Rate"];
+    const winRate = rawRate !== undefined && rawRate !== null ? Number(rawRate) : (total ? wins / total : null);
+
+    return { total, wins, losses, winRate };
   }
 
   function summaryCard(title, cardType, note) {
@@ -1770,7 +1703,6 @@ function renderResults() {
     <div class="cards" style="margin-top:18px;">
       ${summaryCard('Final Card Results', 'Final Card', 'Official card picks only.')}
       ${summaryCard('Refined Picks Results', 'Refined Picks', 'Broader research/model picks only.')}
-      ${summaryCard('Plus Money Props Results', 'Plus Money Props', 'Alt props/value props tracked separately.')}
     </div>
 
     <div class="cards" style="margin-top:18px;">
@@ -1796,7 +1728,6 @@ function renderResults() {
 
     ${resultsTable('Final Card Graded Picks', tableRowsFor('Final Card'))}
     ${resultsTable('Refined Picks Graded Picks', tableRowsFor('Refined Picks'))}
-    ${resultsTable('Plus Money Props Graded Picks', tableRowsFor('Plus Money Props'))}
     ${resultsTable('All Recent Graded Picks', recent)}
   `;
 }
