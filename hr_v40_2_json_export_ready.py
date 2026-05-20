@@ -292,6 +292,7 @@ def build_research_json(
         "top_picks": df_to_records(top_picks),
         "refined_picks": df_to_records(refined_picks),
         "plus_money_props": df_to_records(plus_money_props),
+        "hr_value_watch": df_to_records(hr_value_watch),
         "final_card": df_to_records(final_card_df),
     }
 
@@ -334,6 +335,108 @@ def save_app_json(payload, output_path):
     """Write JSON file to disk."""
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def _recent_cash_norm(value):
+    if value is None:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
+
+
+def _infer_cash_bet_type(row: dict) -> str:
+    """Map model rows to the graded bet_type used in results_history_latest.json."""
+    bet = str(row.get("bet_type") or "").strip()
+    if bet and bet.lower() not in {"", "nan", "none", "—"}:
+        return bet
+    typ = str(row.get("type") or row.get("category") or "").strip().upper()
+    if typ == "HIT" or "HIT" in typ:
+        return "1+ Hit"
+    if typ == "HR" or "HOME" in typ:
+        return "HR"
+    return bet or typ
+
+
+def _load_recent_cash_history(max_rows: int = 1000) -> list[dict]:
+    """Load graded result rows so research tables can show recent cash rates.
+
+    The results file is maintained by app_server_mobile_cloud_ready.py. This helper is read-only.
+    """
+    try:
+        path = OUTPUT_DIR / "history" / "results_history_latest.json"
+        if not path.exists():
+            return []
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        rows = raw.get("rows", []) if isinstance(raw, dict) else raw
+        if not isinstance(rows, list):
+            return []
+        out = []
+        for r in rows[:max_rows]:
+            if not isinstance(r, dict):
+                continue
+            if r.get("result_status") not in {"Win", "Loss"}:
+                continue
+            pick = r.get("pick") or r.get("playerName") or r.get("pitcherName")
+            bet = r.get("bet_type")
+            if not pick or not bet:
+                continue
+            out.append(r)
+        return out
+    except Exception:
+        return []
+
+
+def add_recent_cash_rate_columns(df: pd.DataFrame, history_rows: list[dict] | None = None, default_bet_type: str | None = None, window: int = 10) -> pd.DataFrame:
+    """Add recent result history to research/top-pick tables.
+
+    Columns added:
+    - recent_cash_rate: win percentage over the player's last N graded results for that bet type
+    - recent_cash_record: W-L record over that same window
+    - recent_cash_sample: number of graded results found in the window
+    - recent_cash_last_10: compact W/L string, newest first
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    rows = history_rows if history_rows is not None else _load_recent_cash_history()
+    if not rows:
+        out["recent_cash_rate"] = None
+        out["recent_cash_record"] = "—"
+        out["recent_cash_sample"] = 0
+        out["recent_cash_last_10"] = "—"
+        return out
+
+    by_key = {}
+    for r in rows:
+        pick_key = _recent_cash_norm(r.get("pick") or r.get("playerName") or r.get("pitcherName"))
+        bet_key = str(r.get("bet_type") or "").strip().lower()
+        if not pick_key or not bet_key:
+            continue
+        by_key.setdefault((pick_key, bet_key), []).append(r)
+
+    rates, records, samples, strings = [], [], [], []
+    for _, row in out.iterrows():
+        pick = row.get("playerName") or row.get("pick") or row.get("pitcherName")
+        bet = default_bet_type or _infer_cash_bet_type(row.to_dict())
+        key = (_recent_cash_norm(pick), str(bet or "").strip().lower())
+        recent = by_key.get(key, [])[:window]
+        wins = sum(1 for r in recent if r.get("result_status") == "Win")
+        losses = sum(1 for r in recent if r.get("result_status") == "Loss")
+        n = wins + losses
+        if n:
+            rates.append(round(wins / n, 3))
+            records.append(f"{wins}-{losses}")
+            samples.append(n)
+            strings.append("".join("W" if r.get("result_status") == "Win" else "L" for r in recent))
+        else:
+            rates.append(None)
+            records.append("—")
+            samples.append(0)
+            strings.append("—")
+    out["recent_cash_rate"] = rates
+    out["recent_cash_record"] = records
+    out["recent_cash_sample"] = samples
+    out["recent_cash_last_10"] = strings
+    return out
 
 
 DEFAULT_SEASON = 2026
@@ -2331,6 +2434,12 @@ def main(season: int, target_date: str):
     final_card = build_final_card(pregame_player_rows, pregame_game_rankings, pregame_pitcher_line_value)
     plus_money_props = build_plus_money_prop_sheet(pregame_player_rows, pregame_pitcher_line_value, pregame_game_rankings)
 
+    # Recent Cash Rate layer: adds player/bet-type history to the research tables.
+    # This is read-only and will not reset or overwrite result history.
+    recent_cash_history_rows = _load_recent_cash_history()
+    refined_picks = add_recent_cash_rate_columns(refined_picks, recent_cash_history_rows, window=10)
+    plus_money_props = add_recent_cash_rate_columns(plus_money_props, recent_cash_history_rows, window=10)
+
     ts = dt.datetime.now().strftime("%Y-%m-%d_%H%M")
     outfile = OUTPUT_DIR / f"HR_Hit_Drought_v40_stats-{season}_{ts}.xlsx"
 
@@ -2377,6 +2486,7 @@ def main(season: int, target_date: str):
             top_hit = player_rows.nlargest(10, "Hit_score")[hit_cols].copy()
             top_hit.insert(0, "type", "HIT")
         top_picks = pd.concat([top_hr, top_hit], ignore_index=True)
+        top_picks = add_recent_cash_rate_columns(top_picks, recent_cash_history_rows, window=10)
         top_picks.to_excel(writer, sheet_name="Top_Picks", index=False)
 
     wb = load_workbook(outfile)
