@@ -148,7 +148,7 @@ def load_latest_data():
     data["results"] = read_json_file(history_dir / "performance_summary_latest.json", {"overall": {}, "by_bet_type": [], "by_confidence": [], "recent_results": []})
     data["results_latest"] = read_json_file(history_dir / "results_history_latest.json", {"graded_rows": 0, "rows": []})
     data["info"] = {
-        "purpose": "This app finds MLB betting edges by combining player trends, drought logic, matchup strength, pitcher quality, lineup context, and park factors.",
+        "purpose": "This app finds MLB betting edges by combining value-adjusted probability, recent form, contact-quality proxies, player trends, drought logic, matchup strength, pitcher quality, bullpen context, lineup context, park factors, and results tracking.",
         "how_to_use": [
             "Start on Final Card for the strongest condensed plays.",
             "Use Games to see matchup context, start time, and top game-level picks.",
@@ -229,14 +229,21 @@ def _is_placeholder_pick(row: dict) -> bool:
         "no plays" in text
         or "no qualified" in text
         or "no final card plays qualified" in text
+        or "no plus-money prop candidates" in text
+        or "no plus money prop candidates" in text
         or row.get("category") == "Info"
         or row.get("bet_type") == "No Plays"
     )
 
 
 def _get_card_history(card_type: str) -> dict:
-    """card_type = final_card or refined_picks"""
-    filename = "final_card_by_date.json" if card_type == "final_card" else "refined_picks_by_date.json"
+    """card_type = final_card, refined_picks, or plus_money_props"""
+    filename_map = {
+        "final_card": "final_card_by_date.json",
+        "refined_picks": "refined_picks_by_date.json",
+        "plus_money_props": "plus_money_props_by_date.json",
+    }
+    filename = filename_map.get(card_type, f"{card_type}_by_date.json")
     return read_json_file(_history_dir() / filename, {})
 
 
@@ -271,6 +278,8 @@ def _extract_rows_from_appdata(payload: dict, card_type: str) -> list:
             rows = []
         if not rows:
             rows = (((payload.get("research") or {}).get("final_card")) or [])
+    elif card_type == "plus_money_props":
+        rows = (((payload.get("research") or {}).get("plus_money_props")) or payload.get("plus_money_props") or [])
     else:
         rows = (((payload.get("research") or {}).get("refined_picks")) or payload.get("refined_picks") or [])
     return [r for r in rows if isinstance(r, dict) and not _is_placeholder_pick(r)]
@@ -556,17 +565,105 @@ def _grade_k_prop(row: dict, target_date: str, season: int) -> tuple[str, str]:
     return ("Win" if ks > line else "Loss"), f"{player}: {ks} Ks vs line {line}"
 
 
+
+def _safe_int_stat(stat: dict, key: str, default: int = 0) -> int:
+    try:
+        return int(stat.get(key, default) or default)
+    except Exception:
+        return default
+
+
+def _total_bases_from_batting_stat(stat: dict) -> int:
+    if not stat:
+        return 0
+    if stat.get("totalBases") is not None:
+        return _safe_int_stat(stat, "totalBases")
+    hits = _safe_int_stat(stat, "hits")
+    doubles = _safe_int_stat(stat, "doubles")
+    triples = _safe_int_stat(stat, "triples")
+    hrs = _safe_int_stat(stat, "homeRuns")
+    singles = max(0, hits - doubles - triples - hrs)
+    return singles + (2 * doubles) + (3 * triples) + (4 * hrs)
+
+
+def _parse_plus_threshold(text: str, default: int = 1) -> int:
+    m = re.search(r"(\d+)\s*\+", str(text or ""))
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
+    return default
+
+
+def _grade_batting_prop(row: dict, target_date: str, season: int, mode: str, threshold: int = 1) -> tuple[str, str]:
+    player = str(row.get("pick") or row.get("playerName") or "").strip()
+    team = str(row.get("team") or row.get("teamName") or "").strip()
+    if not player:
+        return "Unable to Grade", "Missing player"
+    pending, reason = _pending_if_game_not_final(row, target_date)
+    if pending:
+        return "Pending", reason
+    stat = _boxscore_player_stat_by_name(target_date, player, "batting", team_name=team)
+    if stat is None:
+        pid = row.get("playerId") or (_find_player_id_on_team(player, team, season) if team else None)
+        if pid:
+            stat = _player_game_log_for_date(int(pid), "hitting", season, target_date)
+    if not stat:
+        return "No Action", f"No batting boxscore/game log found for {player} on {target_date}"
+    hits = _safe_int_stat(stat, "hits")
+    hrs = _safe_int_stat(stat, "homeRuns")
+    runs = _safe_int_stat(stat, "runs")
+    rbi = _safe_int_stat(stat, "rbi")
+    tb = _total_bases_from_batting_stat(stat)
+    if mode == "total_bases":
+        return ("Win" if tb >= threshold else "Loss"), f"{player}: {tb} total base(s), {hits} hit(s), {hrs} HR"
+    if mode == "run":
+        return ("Win" if runs >= threshold else "Loss"), f"{player}: {runs} run(s), {hits} hit(s)"
+    if mode == "rbi":
+        return ("Win" if rbi >= threshold else "Loss"), f"{player}: {rbi} RBI, {hits} hit(s)"
+    return "Unable to Grade", f"Unsupported batting prop mode: {mode}"
+
+
+def _grade_alt_k_prop(row: dict, target_date: str, season: int, threshold: int = 5) -> tuple[str, str]:
+    player = str(row.get("pick") or row.get("pitcherName") or row.get("playerName") or "").strip()
+    team = str(row.get("team") or row.get("teamName") or "").strip()
+    if not player:
+        return "Unable to Grade", "Missing pitcher"
+    pending, reason = _pending_if_game_not_final(row, target_date)
+    if pending:
+        return "Pending", reason
+    stat = _boxscore_player_stat_by_name(target_date, player, "pitching", team_name=team)
+    if stat is None:
+        pid = row.get("playerId") or (_find_player_id_on_team(player, team, season) if team else None)
+        if pid:
+            stat = _player_game_log_for_date(int(pid), "pitching", season, target_date)
+    if not stat:
+        return "No Action", f"No pitching boxscore/game log found for {player} on {target_date}"
+    ks = _safe_int_stat(stat, "strikeOuts")
+    return ("Win" if ks >= threshold else "Loss"), f"{player}: {ks} Ks vs {threshold}+ target"
+
+
 def _grade_pick(row: dict, target_date: str, season: int = 2026, card_type: str = "Final Card") -> dict:
     bet_type = str(row.get("bet_type") or row.get("play_type") or "").strip()
     lower = bet_type.lower()
     if "moneyline" in lower or lower == "ml":
         result, detail = _grade_moneyline(row, target_date)
+    elif "total bases" in lower or "total base" in lower:
+        result, detail = _grade_batting_prop(row, target_date, season, "total_bases", _parse_plus_threshold(bet_type, 2))
+    elif "rbi" in lower:
+        result, detail = _grade_batting_prop(row, target_date, season, "rbi", _parse_plus_threshold(bet_type, 1))
+    elif "run" in lower and "home run" not in lower:
+        result, detail = _grade_batting_prop(row, target_date, season, "run", _parse_plus_threshold(bet_type, 1))
     elif "hit" in lower and "hr" not in lower and "home" not in lower:
         result, detail = _grade_hitter(row, target_date, season, "hit")
     elif lower == "hr" or "home run" in lower:
         result, detail = _grade_hitter(row, target_date, season, "hr")
-    elif "k prop" in lower or "strikeout" in lower or lower in {"ks", "k"}:
-        result, detail = _grade_k_prop(row, target_date, season)
+    elif "strikeout" in lower or "k prop" in lower or lower in {"ks", "k"}:
+        if "+" in lower:
+            result, detail = _grade_alt_k_prop(row, target_date, season, _parse_plus_threshold(bet_type, 5))
+        else:
+            result, detail = _grade_k_prop(row, target_date, season)
     else:
         result, detail = "Unable to Grade", f"Unsupported bet type: {bet_type}"
     return {
@@ -580,7 +677,7 @@ def _grade_pick(row: dict, target_date: str, season: int = 2026, card_type: str 
         "slot": row.get("slot") or row.get("play_type") or row.get("section") or row.get("category"),
         "result_status": result,
         "result_detail": detail,
-        "source_tab": row.get("source_tab") or ("Refined_Picks" if card_type == "Refined Picks" else "Final_Card"),
+        "source_tab": row.get("source_tab") or ("Plus_Money_Props" if card_type == "Plus Money Props" else ("Refined_Picks" if card_type == "Refined Picks" else "Final_Card")),
         "graded_at_et": dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " "),
     }
 
@@ -629,9 +726,11 @@ def grade_date_results(target_date: str, season: int = 2026, include_refined: bo
     hist = _history_dir()
     final_rows = _card_rows_for_date(target_date, "final_card")
     refined_rows = _card_rows_for_date(target_date, "refined_picks") if include_refined else []
+    plus_money_rows = _card_rows_for_date(target_date, "plus_money_props")
     new_rows = []
     new_rows.extend(_grade_pick(play, target_date, season, "Final Card") for play in final_rows)
     new_rows.extend(_grade_pick(play, target_date, season, "Refined Picks") for play in refined_rows)
+    new_rows.extend(_grade_pick(play, target_date, season, "Plus Money Props") for play in plus_money_rows)
     if not new_rows:
         return {"status": "no_plays", "date": target_date, "message": "No locked/appdata picks found to grade"}
     latest_path = hist / "results_history_latest.json"
@@ -647,7 +746,7 @@ def grade_date_results(target_date: str, season: int = 2026, include_refined: bo
     latest_path.write_text(json.dumps(latest_payload, indent=2, ensure_ascii=False), encoding="utf-8")
     (hist / "performance_summary_latest.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     (hist / "results_history.jsonl").write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in all_rows) + "\n", encoding="utf-8")
-    return {"status": "ok", "date": target_date, "final_card_rows": len(final_rows), "refined_rows": len(refined_rows), "graded_new_rows": len(new_rows), "total_rows": len(all_rows), "summary": summary.get("overall")}
+    return {"status": "ok", "date": target_date, "final_card_rows": len(final_rows), "refined_rows": len(refined_rows), "plus_money_rows": len(plus_money_rows), "graded_new_rows": len(new_rows), "total_rows": len(all_rows), "summary": summary.get("overall")}
 
 
 def grade_recent_slates_including_today(season: int = 2026, days_back: int = 4) -> dict:
@@ -1071,7 +1170,9 @@ function isStrictNumericColumn(col) {
     "projected_k_ceiling",
     "max_playable_k_line",
     "recent_cash_rate",
-    "recent_cash_sample"
+    "recent_cash_sample",
+    "contact_quality_score",
+    "hr_contact_proxy"
   ]);
   return numericCols.has(String(col || ""));
 }
@@ -1322,19 +1423,19 @@ function buildFacetBox(label, key, values) {
 
 function displayColumnsForResearch(key, rows) {
   const allColumns = rows.length ? Object.keys(rows[0]) : [];
-
   const curated = {
     top_picks: [
       "type", "playerName", "teamName", "auto_pitcher_name", "opponent_pitcher",
-      "lineup_status", "batting_order_slot", "Hit_score", "HR_score",
-      "homeRuns", "league_avg_hr_excl_zero", "hr_value_score",
-      "recent_cash_rate", "recent_cash_record", "recent_cash_sample", "recent_cash_last_10",
+      "lineup_status", "batting_order_slot", "Hit_score", "contact_quality_score", "hit_quality_label",
+      "hit_pct_last_10", "HR_score", "hr_contact_proxy", "homeRuns", "league_avg_hr_excl_zero",
+      "hr_value_score", "recent_cash_rate", "recent_cash_record", "recent_cash_sample", "recent_cash_last_10",
       "park_favorability", "opponent_pitcher_pick_type", "hr_value_profile", "reason", "hr_value_reason"
     ],
     refined_picks: [
       "category", "bet_type", "playerName", "teamName", "game", "opponent_pitcher",
       "opponent_pitcher_team", "opponent_pitcher_pick_type", "lineup_status",
-      "batting_order_slot", "Hit_score",
+      "batting_order_slot", "Hit_score", "contact_quality_score", "hit_quality_label",
+      "hit_pct_last_10", "hit_pct_last_5", "current_hit_streak",
       "recent_cash_rate", "recent_cash_record", "recent_cash_sample", "recent_cash_last_10",
       "park_favorability", "stack_tag", "reason"
     ],
@@ -1343,17 +1444,21 @@ function displayColumnsForResearch(key, rows) {
       "confidence", "model_grade", "recent_cash_rate", "recent_cash_record",
       "recent_cash_sample", "recent_cash_last_10", "season_rate",
       "lineup_status", "batting_order_slot", "market_check", "reason"
+    ],
+    hr_value_watch: [
+      "playerName", "teamName", "homeRuns", "league_avg_hr_excl_zero", "hr_vs_league_avg",
+      "hr_value_score", "hr_contact_proxy", "hr_value_profile", "avg_games_between_hrs",
+      "current_games_without_hr", "hr_drought_over_avg", "hr_status", "last_hr_date",
+      "park_favorability", "opponent_pitcher", "opponent_pitcher_pick_type",
+      "lineup_status", "batting_order_slot", "hr_value_reason"
     ]
   };
-
   const preferred = curated[key] || allColumns;
   const picked = preferred.filter(c => allColumns.includes(c));
-
-  // Add any remaining recent_cash fields even if the row order changes.
   for (const c of allColumns) {
-    if (String(c).toLowerCase().includes("cash") && !picked.includes(c)) picked.push(c);
+    const lc = String(c).toLowerCase();
+    if ((lc.includes("cash") || lc.includes("contact_quality") || lc.includes("hr_contact")) && !picked.includes(c)) picked.push(c);
   }
-
   return picked.length ? picked : allColumns;
 }
 
@@ -1647,15 +1752,12 @@ function renderResults() {
     // Do NOT use recent_results here because recent_results is capped/recent only.
     const target = String(cardType || '').trim().toLowerCase();
     const row = byCardType.find(r => String(r.card_type || r.cardType || r["Card Type"] || '').trim().toLowerCase() === target);
-
     if (!row) return { total: 0, wins: 0, losses: 0, winRate: null };
-
     const wins = Number(row.wins ?? row.Wins ?? 0);
     const losses = Number(row.losses ?? row.Losses ?? 0);
     const total = Number(row.graded_picks ?? row.graded ?? row.Graded ?? (wins + losses));
     const rawRate = row.win_rate ?? row.winRate ?? row["Win Rate"];
     const winRate = rawRate !== undefined && rawRate !== null ? Number(rawRate) : (total ? wins / total : null);
-
     return { total, wins, losses, winRate };
   }
 
@@ -1703,6 +1805,7 @@ function renderResults() {
     <div class="cards" style="margin-top:18px;">
       ${summaryCard('Final Card Results', 'Final Card', 'Official card picks only.')}
       ${summaryCard('Refined Picks Results', 'Refined Picks', 'Broader research/model picks only.')}
+      ${summaryCard('Plus Money Props Results', 'Plus Money Props', 'Alt props/value props tracked separately.')}
     </div>
 
     <div class="cards" style="margin-top:18px;">
@@ -1728,6 +1831,7 @@ function renderResults() {
 
     ${resultsTable('Final Card Graded Picks', tableRowsFor('Final Card'))}
     ${resultsTable('Refined Picks Graded Picks', tableRowsFor('Refined Picks'))}
+    ${resultsTable('Plus Money Props Graded Picks', tableRowsFor('Plus Money Props'))}
     ${resultsTable('All Recent Graded Picks', recent)}
   `;
 }
