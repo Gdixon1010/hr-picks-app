@@ -1183,6 +1183,98 @@ def contact_momentum_bonus(hit_l5, hit_l10, streak) -> float:
     elif streak >= 3: bonus += 0.08
     return round(bonus, 3)
 
+
+def add_contact_quality_engine(player_rows: pd.DataFrame) -> pd.DataFrame:
+    """Add a process/form layer so picks are not only outcome/drought based.
+
+    This is a practical contact-quality proxy using data already available from MLB game logs:
+    - last 10 hit rate
+    - last 5 hit rate
+    - 2+ total-base rate
+    - current hit streak
+    - lineup slot
+    - opposing bullpen grade
+    - opponent pitcher label
+
+    It does not require Statcast, but it moves the model closer to a true
+    process-based projection instead of a coin-flip recent-result model.
+    """
+    if player_rows is None or player_rows.empty:
+        return player_rows
+
+    df = player_rows.copy()
+
+    def num(col, default=0.0):
+        if col not in df.columns:
+            return pd.Series([default] * len(df), index=df.index)
+        return pd.to_numeric(df[col], errors="coerce").fillna(default)
+
+    hit10 = num("hit_pct_last_10")
+    hit5 = num("hit_pct_last_5")
+    tb10 = num("tb2plus_last10_pct")
+    streak = num("current_hit_streak")
+    slot = num("batting_order_slot", 9)
+    hit_score = num("Hit_score")
+    hr_score = num("HR_score")
+
+    opp_type = df["opponent_pitcher_pick_type"].astype(str) if "opponent_pitcher_pick_type" in df.columns else pd.Series(["Neutral"] * len(df), index=df.index)
+    bullpen = df["opp_bullpen_grade"].astype(str) if "opp_bullpen_grade" in df.columns else pd.Series(["Unknown"] * len(df), index=df.index)
+    lineup_status = df["lineup_status"].astype(str) if "lineup_status" in df.columns else pd.Series(["Unknown"] * len(df), index=df.index)
+
+    contact_score = (
+        (hit10 / 100.0) * 2.20
+        + (hit5 / 100.0) * 1.05
+        + (tb10 / 100.0) * 0.80
+        + streak.clip(upper=6) * 0.10
+        + (10 - slot.clip(lower=1, upper=9)) * 0.08
+    )
+
+    contact_score += bullpen.map({"Weak": 0.35, "Neutral": 0.05, "Strong": -0.30, "Unknown": 0.0}).fillna(0.0)
+    contact_score += opp_type.map({
+        "Short Leash Risk": 0.25,
+        "Attack With Hitters": 0.35,
+        "Low Sample": 0.15,
+        "Neutral": 0.0,
+        "K Upside": -0.20,
+        "Strong SP": -0.75,
+    }).fillna(0.0)
+
+    # Penalize cold/volatile profiles so they do not feel random.
+    cold_penalty = ((hit10 < 60).astype(int) * 0.45) + ((hit5 <= 40).astype(int) * 0.35) + ((streak == 0).astype(int) * 0.15)
+    contact_score = (contact_score - cold_penalty).round(3)
+
+    df["contact_quality_score"] = contact_score
+    df["hit_quality_label"] = pd.cut(
+        contact_score,
+        bins=[-999, 1.35, 1.85, 2.35, 999],
+        labels=["Weak", "Playable", "Strong", "Elite"]
+    ).astype(str)
+
+    df["hit_quality_gate"] = (
+        lineup_status.eq("Confirmed Starter")
+        & (slot <= 6)
+        & (hit_score >= 3.75)
+        & (hit10 >= 60)
+        & (~opp_type.eq("Strong SP"))
+        & (contact_score >= 1.55)
+    )
+
+    # HR contact proxy: HRs should need power/contact support, not drought alone.
+    df["hr_contact_proxy"] = (
+        (tb10 / 100.0) * 1.60
+        + (hr_score / 5.0).clip(lower=0, upper=2.0) * 0.70
+        + (hit10 / 100.0) * 0.35
+        + bullpen.map({"Weak": 0.30, "Neutral": 0.05, "Strong": -0.20, "Unknown": 0.0}).fillna(0.0)
+        + opp_type.map({"Short Leash Risk": 0.20, "Attack With Hitters": 0.25, "Low Sample": 0.15, "Strong SP": -0.50}).fillna(0.0)
+    ).round(3)
+
+    # Apply small score adjustments after the proxy fields are created.
+    df["Hit_score"] = (hit_score + (df["contact_quality_score"] - 1.75).clip(lower=-0.60, upper=0.75)).round(3)
+    df["HR_score"] = (hr_score + (df["hr_contact_proxy"] - 1.25).clip(lower=-0.45, upper=0.55)).round(3)
+
+    return df
+
+
 def determine_status(current_gap, avg_gap):
     if avg_gap is None or current_gap is None:
         return "N/A"
@@ -1483,7 +1575,7 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
     - If lineups are confirmed, prioritizes confirmed starters in slots 1-6.
     - If lineups are not available yet, allows only stronger projected hitters.
     """
-    cols = ["category","bet_type","playerName","teamName","game","opponent_pitcher","opponent_pitcher_team","opponent_pitcher_pick_type","opponent_pitcher_sample","lineup_status","batting_order_slot","starter_only_flag","HR_score","Hit_score","park_favorability","stack_tag","reason"]
+    cols = ["category","bet_type","playerName","teamName","game","opponent_pitcher","opponent_pitcher_team","opponent_pitcher_pick_type","opponent_pitcher_sample","lineup_status","batting_order_slot","starter_only_flag","HR_score","Hit_score","contact_quality_score","hit_quality_label","hit_pct_last_10","hit_pct_last_5","current_hit_streak","park_favorability","stack_tag","reason"]
 
     if player_rows is None or player_rows.empty or pitcher_metrics is None or pitcher_metrics.empty:
         return pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No refined picks met today’s filters"}], columns=cols)
@@ -1507,7 +1599,7 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
     rows = rows.merge(ctx, on=merge_keys, how="left")
 
     # Defensive defaults
-    for c, default in [("Hit_score", 0), ("HR_score", 0), ("batting_order_slot", 99), ("offense_score", 0), ("edge_vs_opponent", 0)]:
+    for c, default in [("Hit_score", 0), ("HR_score", 0), ("contact_quality_score", 0), ("hit_pct_last_10", 0), ("hit_pct_last_5", 0), ("current_hit_streak", 0), ("batting_order_slot", 99), ("offense_score", 0), ("edge_vs_opponent", 0)]:
         if c not in rows.columns:
             rows[c] = default
         rows[c] = pd.to_numeric(rows[c], errors="coerce").fillna(default)
@@ -1528,13 +1620,13 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
     confirmed = rows["lineup_status"].astype(str).eq("Confirmed Starter")
 
     if use_confirmed_only:
-        quality_mask = confirmed & (rows["slot_num"] <= 6) & (rows["Hit_score"] >= 3.75)
+        quality_mask = confirmed & (rows["slot_num"] <= 6) & (rows["Hit_score"] >= 3.85) & (rows["contact_quality_score"] >= 1.55) & (rows["hit_pct_last_10"] >= 60)
         mode_label = "confirmed-only"
     else:
         # Pregame mode: avoid flooding. Unknowns need a higher score because lineups are not locked yet.
         quality_mask = (
             (confirmed & (rows["Hit_score"] >= 3.75)) |
-            ((~confirmed) & (rows["Hit_score"] >= 4.25))
+            ((~confirmed) & (rows["Hit_score"] >= 4.45) & (rows["contact_quality_score"] >= 1.85) & (rows["hit_pct_last_10"] >= 70))
         )
         mode_label = "pregame-projected"
 
@@ -1553,7 +1645,7 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
     # - max 2 per team, to avoid one offense flooding the refined card
     # - max 10 total refined picks, so this remains a true refined list rather than a research dump
     hit_pool["lineup_rank"] = hit_pool["lineup_status"].astype(str).eq("Confirmed Starter").astype(int)
-    hit_pool = hit_pool.sort_values(["Hit_score", "lineup_rank", "edge_vs_opponent", "slot_num"], ascending=[False, False, False, True])
+    hit_pool = hit_pool.sort_values(["Hit_score", "contact_quality_score", "lineup_rank", "edge_vs_opponent", "slot_num"], ascending=[False, False, False, False, True])
     hit_pool = hit_pool.drop_duplicates(subset=["playerName", "teamName", "game"], keep="first")
 
     selected_rows = []
@@ -1595,9 +1687,14 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
             "starter_only_flag":r.get("starter_only_flag"),
             "HR_score":r.get("HR_score"),
             "Hit_score":score,
+            "contact_quality_score":r.get("contact_quality_score"),
+            "hit_quality_label":r.get("hit_quality_label"),
+            "hit_pct_last_10":r.get("hit_pct_last_10"),
+            "hit_pct_last_5":r.get("hit_pct_last_5"),
+            "current_hit_streak":r.get("current_hit_streak"),
             "park_favorability":r.get("park_favorability"),
             "stack_tag":"Rolling refined",
-            "reason":f"Rolling refined max2/game max10 {mode_label}; Hit_score {score:.3f}; slot {r.get('batting_order_slot')}; opp {r.get('opponent_pitcher_pick_type')}; edge {r.get('edge_vs_opponent')}",
+            "reason":f"Rolling refined max2/game max10 {mode_label}; Hit_score {score:.3f}; contact {r.get('contact_quality_score')}; L10 hit {r.get('hit_pct_last_10')}%; slot {r.get('batting_order_slot')}; opp {r.get('opponent_pitcher_pick_type')}; edge {r.get('edge_vs_opponent')}",
         })
 
     return pd.DataFrame(picks, columns=cols)
@@ -1941,6 +2038,8 @@ def add_hr_value_profile(player_rows: pd.DataFrame) -> pd.DataFrame:
     elite_price_penalty = (hr_numeric > (league_avg_hr + 4.0)).astype(int) * -1.10
 
     # Controlled score: value range + overdue timing + environment. Not raw HR leader ranking.
+    contact_proxy = pd.to_numeric(df.get("hr_contact_proxy"), errors="coerce").fillna(0)
+
     df["hr_value_score"] = (
         value_band_adj
         + low_power_penalty
@@ -1949,6 +2048,7 @@ def add_hr_value_profile(player_rows: pd.DataFrame) -> pd.DataFrame:
         + park_adj
         + pitcher_adj
         + slot_adj
+        + contact_proxy.clip(upper=2.5) * 0.35
     ).round(3)
 
     def _profile(row):
@@ -1981,7 +2081,7 @@ def build_hr_value_watch(player_rows: pd.DataFrame) -> pd.DataFrame:
     """Research tab for the exact HR value profile the user wants."""
     cols = [
         "playerName", "teamName", "homeRuns", "league_avg_hr_excl_zero", "hr_vs_league_avg",
-        "hr_value_bucket", "hr_value_target_flag", "hr_value_score", "hr_value_profile",
+        "hr_value_bucket", "hr_value_target_flag", "hr_value_score", "hr_contact_proxy", "hr_value_profile",
         "avg_games_between_hrs", "current_games_without_hr", "hr_drought_over_avg", "hr_status",
         "last_hr_date", "gamesPlayed", "park_favorability", "opponent_pitcher", "opponent_pitcher_pick_type",
         "lineup_status", "batting_order_slot", "starter_only_flag", "hr_value_reason"
@@ -2257,23 +2357,30 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
     base["slot_num"] = pd.to_numeric(base.get("batting_order_slot"), errors="coerce").fillna(9)
     base["power_filter"] = (base["homeRuns"].fillna(0) >= 3) | (base["avg_games_between_hrs"].fillna(99) <= 2.5)
 
-    # Hits: two strongest only
+    # Hits: elite contact-quality only. This protects the Final Card from cold/volatile hitters.
+    for c, default in [("contact_quality_score", 0), ("hit_pct_last_10", 0), ("hit_pct_last_5", 0), ("current_hit_streak", 0)]:
+        if c not in base.columns:
+            base[c] = default
+        base[c] = pd.to_numeric(base[c], errors="coerce").fillna(default)
+
     hit_pool = base[
         (base["lineup_ok"] == True) &
-        (base["Hit_score"].fillna(0) >= 4.0) &
+        (base["Hit_score"].fillna(0) >= 4.05) &
+        (base["contact_quality_score"].fillna(0) >= 1.75) &
+        (base["hit_pct_last_10"].fillna(0) >= 70) &
         (base["opponent_pitcher_pick_type"].fillna("Neutral") != "Strong SP") &
         (base["slot_num"] <= 5)
-    ].copy().sort_values(["Hit_score","slot_num","totalHits"], ascending=[False, True, False])
+    ].copy().sort_values(["Hit_score","contact_quality_score","hit_pct_last_10","slot_num","totalHits"], ascending=[False, False, False, True, False])
 
     hit_added = 0
     for _, r in hit_pool.iterrows():
-        if hit_added >= 2:
+        if hit_added >= 3:
             break
         if (r["teamName"], r["playerName"]) in used_players or not can_use_team(r["teamName"], 2):
             continue
         add_row(
             f"Core {len(rows)+1}", "1+ Hit", r["playerName"], r["teamName"], r.get("opponentTeam"), "A",
-            f"Hit_score {r['Hit_score']:.3f}; slot {int(r['slot_num'])}; opp {r.get('opponent_pitcher_pick_type')}; park {r.get('park_favorability')}",
+            f"Hit_score {r['Hit_score']:.3f}; contact {r.get('contact_quality_score')}; L10 hit {r.get('hit_pct_last_10')}%; slot {int(r['slot_num'])}; opp {r.get('opponent_pitcher_pick_type')}; park {r.get('park_favorability')}",
             "Refined_Picks"
         )
         hit_added += 1
@@ -2381,6 +2488,7 @@ def main(season: int, target_date: str):
     pitcher_metrics = build_pitcher_metrics(schedule_rows, season)
     team_context_df = build_team_context_df(schedule_rows, season)
     player_rows = enrich_player_rows_with_team_context(player_rows, pitcher_metrics, team_context_df)
+    player_rows = add_contact_quality_engine(player_rows)
     pitcher_metrics = enrich_pitcher_metrics_with_team_context(pitcher_metrics, team_context_df)
     pitcher_line_value = build_pitcher_line_value(pitcher_metrics)
     pitcher_line_value = apply_k_market_validation(pitcher_line_value, target_date)
@@ -2478,11 +2586,11 @@ def main(season: int, target_date: str):
             preferred_hr = hr_pool[hr_pool.get("hr_value_target_flag", False).astype(bool)].copy() if "hr_value_target_flag" in hr_pool.columns else hr_pool.iloc[0:0].copy()
             if preferred_hr.empty:
                 preferred_hr = hr_pool.copy()
-            hr_cols = [c for c in ["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","homeRuns","league_avg_hr_excl_zero","hr_vs_league_avg","hr_value_bucket","hr_value_target_flag","hr_value_score","hr_value_profile","HR_score","current_games_without_hr","avg_games_between_hrs","hr_drought_over_avg","park_favorability","opponent_pitcher_pick_type","batting_order_slot","lineup_status","starter_only_flag","hr_value_reason"] if c in preferred_hr.columns]
+            hr_cols = [c for c in ["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","homeRuns","league_avg_hr_excl_zero","hr_vs_league_avg","hr_value_bucket","hr_value_target_flag","hr_value_score","hr_contact_proxy","hr_value_profile","HR_score","current_games_without_hr","avg_games_between_hrs","hr_drought_over_avg","park_favorability","opponent_pitcher_pick_type","batting_order_slot","lineup_status","starter_only_flag","hr_value_reason"] if c in preferred_hr.columns]
             top_hr = preferred_hr.sort_values(["hr_value_score","hr_drought_over_avg","HR_score"], ascending=[False, False, False]).head(10)[hr_cols].copy()
             top_hr.insert(0, "type", "HR")
 
-            hit_cols = [c for c in ["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","Hit_score","hit_pct_last_10","hit_pct_last_5","current_hit_streak","contact_momentum_bonus","batting_order_slot","lineup_status","starter_only_flag"] if c in player_rows.columns]
+            hit_cols = [c for c in ["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","Hit_score","contact_quality_score","hit_quality_label","hit_pct_last_10","hit_pct_last_5","current_hit_streak","contact_momentum_bonus","batting_order_slot","lineup_status","starter_only_flag"] if c in player_rows.columns]
             top_hit = player_rows.nlargest(10, "Hit_score")[hit_cols].copy()
             top_hit.insert(0, "type", "HIT")
         top_picks = pd.concat([top_hr, top_hit], ignore_index=True)
