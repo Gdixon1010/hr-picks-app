@@ -163,6 +163,27 @@ def _normalize_plus_money_rows(rows: list) -> list:
         out.append(row)
     return out
 
+
+
+def _elite_final_rows(rows: list) -> list:
+    """Final Card reset filter for elite-only mode.
+
+    Same-day Final Card is allowed to tighten/remove old Core rows when the
+    model rules change. This prevents old locked Moneyline/Core picks from
+    surviving after the user switches to elite-only Final Card logic.
+    """
+    out = []
+    for r in _rows(rows):
+        if not isinstance(r, dict) or _is_placeholder(r):
+            continue
+        bet = str(r.get("bet_type") or "").strip()
+        slot = str(r.get("slot") or "").strip()
+        conf = str(r.get("confidence") or "").strip()
+        # Official Final Card now only accepts explicitly elite rows created by v40.
+        if slot.startswith("Elite") and conf == "A+" and bet in {"1+ Hit", "K Prop"}:
+            out.append(dict(r))
+    return out
+
 def _get_final_card_plays(data: dict) -> list:
     fc = data.get("final_card")
     if isinstance(fc, dict):
@@ -267,11 +288,10 @@ def main(season: int, target_date: str):
     old_plus_money_candidates.extend(_normalize_plus_money_rows(_get_research_rows(old_data, "plus_money_props")))
     old_plus_money_candidates.extend(_normalize_plus_money_rows(_history_rows("plus_money_props", target_date)))
 
-    merged_final = _merge_rows(
-        old_final_candidates,
-        _get_final_card_plays(new_data),
-        ["bet_type", "pick", "playerName", "team", "teamName", "opponent", "opponentTeam"],
-    )
+    # Elite Final Card mode: do NOT carry old same-day Core/Moneyline rows forward.
+    # The Final Card is the official card and should reflect only the latest elite-only gate.
+    # Refined Picks / Plus Money still preserve same-day rows; Final Card is re-filtered.
+    merged_final = _elite_final_rows(_get_final_card_plays(new_data))
     _set_final_card_plays(new_data, merged_final)
 
     merged_refined = _merge_rows(
