@@ -107,25 +107,61 @@ def _rows(value) -> list:
 
 
 def _merge_rows(old_rows: list, new_rows: list, key_fields: list) -> list:
+    """Non-destructive same-slate merge.
+
+    Preserves locked rows during refresh, but enriches them with new fields when the
+    model adds fields later. This is important for recent_cash_* and plus-money
+    bet_type/prop_type fixes.
+    """
     old_rows = _rows(old_rows)
     new_rows = _rows(new_rows)
-    old_real = [r for r in old_rows if isinstance(r, dict) and not _is_placeholder(r)]
-    new_real = [r for r in new_rows if isinstance(r, dict) and not _is_placeholder(r)]
+    old_real = [dict(r) for r in old_rows if isinstance(r, dict) and not _is_placeholder(r)]
+    new_real = [dict(r) for r in new_rows if isinstance(r, dict) and not _is_placeholder(r)]
     rows_to_merge = old_real + new_real
     if not rows_to_merge:
         return old_rows if old_rows else new_rows
 
+    def has_value(v) -> bool:
+        if v is None:
+            return False
+        return str(v).strip() not in {"", "—", "None", "nan", "NaN"}
+
     merged = []
-    seen = set()
+    index_by_key = {}
     for row in rows_to_merge:
         key = tuple(_norm(row.get(field)) for field in key_fields)
         if not any(key):
             key = tuple(sorted((str(k), _norm(v)) for k, v in row.items()))
-        if key not in seen:
-            seen.add(key)
-            merged.append(row)
+        if key not in index_by_key:
+            index_by_key[key] = len(merged)
+            merged.append(dict(row))
+            continue
+
+        existing = merged[index_by_key[key]]
+        for k, v in row.items():
+            if not has_value(existing.get(k)) and has_value(v):
+                existing[k] = v
+            elif k.startswith("recent_cash") and has_value(v):
+                existing[k] = v
+            elif k in {"bet_type", "prop_type"} and has_value(v):
+                existing[k] = v
+
     return merged
 
+
+def _normalize_plus_money_rows(rows: list) -> list:
+    """Guarantee Plus Money Props always carry a gradeable bet_type."""
+    out = []
+    for r in _rows(rows):
+        if not isinstance(r, dict):
+            continue
+        row = dict(r)
+        prop = row.get("prop_type")
+        bet = row.get("bet_type")
+        if (bet is None or str(bet).strip() in {"", "—", "None", "nan"}) and prop not in (None, "", "—"):
+            row["bet_type"] = prop
+        out.append(row)
+    return out
 
 def _get_final_card_plays(data: dict) -> list:
     fc = data.get("final_card")
@@ -207,6 +243,8 @@ def main(season: int, target_date: str):
     with open(latest_v40, "r", encoding="utf-8") as f:
         new_data = json.load(f)
 
+    _set_research_rows(new_data, "plus_money_props", _normalize_plus_money_rows(_get_research_rows(new_data, "plus_money_props")))
+
     prev_file = _latest_v41_json_for_date(target_date)
     old_data = {}
     if prev_file:
@@ -226,8 +264,8 @@ def main(season: int, target_date: str):
     old_refined_candidates.extend(_history_rows("refined_picks", target_date))
 
     old_plus_money_candidates = []
-    old_plus_money_candidates.extend(_get_research_rows(old_data, "plus_money_props"))
-    old_plus_money_candidates.extend(_history_rows("plus_money_props", target_date))
+    old_plus_money_candidates.extend(_normalize_plus_money_rows(_get_research_rows(old_data, "plus_money_props")))
+    old_plus_money_candidates.extend(_normalize_plus_money_rows(_history_rows("plus_money_props", target_date)))
 
     merged_final = _merge_rows(
         old_final_candidates,
@@ -267,6 +305,7 @@ def main(season: int, target_date: str):
 
     _update_history("final_card", target_date, _get_final_card_plays(new_data))
     _update_history("refined_picks", target_date, _get_research_rows(new_data, "refined_picks"))
+    _set_research_rows(new_data, "plus_money_props", _normalize_plus_money_rows(_get_research_rows(new_data, "plus_money_props")))
     _update_history("plus_money_props", target_date, _get_research_rows(new_data, "plus_money_props"))
 
     v41_path = _write_v41_json(new_data, season, target_date)
