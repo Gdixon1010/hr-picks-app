@@ -439,6 +439,66 @@ def add_recent_cash_rate_columns(df: pd.DataFrame, history_rows: list[dict] | No
     return out
 
 
+def _confidence_existing_value(value):
+    if value is None:
+        return ""
+    s = str(value).strip()
+    return "" if s in {"", "—", "None", "nan", "NaN"} else s
+
+
+def _rate_to_unit(value):
+    try:
+        if value is None or pd.isna(value):
+            return None
+        n = float(value)
+        return n / 100.0 if n > 1.0 else n
+    except Exception:
+        return None
+
+
+def assign_refined_pick_confidence(df: pd.DataFrame) -> pd.DataFrame:
+    """Assign A+/A/B/C to Refined Picks so Results no longer groups them as Unknown.
+
+    Uses model score first, then recent result history/current form as confirmation.
+    This does not remove any picks; it only labels them for performance tracking.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+
+    for c in ["Hit_score", "contact_quality_score", "hit_pct_last_10", "recent_cash_rate"]:
+        if c not in out.columns:
+            out[c] = None
+
+    def _grade(row):
+        existing = _confidence_existing_value(row.get("confidence"))
+        if existing:
+            return existing
+        if str(row.get("category") or "").lower() == "info" or str(row.get("bet_type") or "").lower() == "no plays":
+            return "Research"
+
+        score = nz(row.get("Hit_score"), 0)
+        contact = nz(row.get("contact_quality_score"), 0)
+        cash = _rate_to_unit(row.get("recent_cash_rate"))
+        l10 = _rate_to_unit(row.get("hit_pct_last_10"))
+        sample = nz(row.get("recent_cash_sample"), 0)
+
+        # Recent cash gets priority once there is enough sample. Otherwise use current hit form.
+        support = cash if sample >= 3 and cash is not None else l10
+        support = support if support is not None else 0
+
+        if score >= 4.75 and (support >= 0.80 or contact >= 2.20):
+            return "A+"
+        if score >= 4.35 and (support >= 0.70 or contact >= 1.85):
+            return "A"
+        if score >= 4.00 or support >= 0.60:
+            return "B"
+        return "C"
+
+    out["confidence"] = out.apply(_grade, axis=1)
+    return out
+
+
 DEFAULT_SEASON = 2026
 
 def resolve_storage_dir() -> Path:
@@ -1575,7 +1635,7 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
     - If lineups are confirmed, prioritizes confirmed starters in slots 1-6.
     - If lineups are not available yet, allows only stronger projected hitters.
     """
-    cols = ["category","bet_type","playerName","teamName","game","opponent_pitcher","opponent_pitcher_team","opponent_pitcher_pick_type","opponent_pitcher_sample","lineup_status","batting_order_slot","starter_only_flag","HR_score","Hit_score","contact_quality_score","hit_quality_label","hit_pct_last_10","hit_pct_last_5","current_hit_streak","park_favorability","stack_tag","reason"]
+    cols = ["category","bet_type","playerName","teamName","game","opponent_pitcher","opponent_pitcher_team","opponent_pitcher_pick_type","opponent_pitcher_sample","lineup_status","batting_order_slot","starter_only_flag","HR_score","Hit_score","contact_quality_score","hit_quality_label","hit_pct_last_10","hit_pct_last_5","current_hit_streak","recent_cash_rate","recent_cash_record","recent_cash_sample","recent_cash_last_10","confidence","park_favorability","stack_tag","reason"]
 
     if player_rows is None or player_rows.empty or pitcher_metrics is None or pitcher_metrics.empty:
         return pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No refined picks met today’s filters"}], columns=cols)
@@ -1692,6 +1752,11 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
             "hit_pct_last_10":r.get("hit_pct_last_10"),
             "hit_pct_last_5":r.get("hit_pct_last_5"),
             "current_hit_streak":r.get("current_hit_streak"),
+            "recent_cash_rate":r.get("recent_cash_rate"),
+            "recent_cash_record":r.get("recent_cash_record"),
+            "recent_cash_sample":r.get("recent_cash_sample"),
+            "recent_cash_last_10":r.get("recent_cash_last_10"),
+            "confidence":r.get("confidence"),
             "park_favorability":r.get("park_favorability"),
             "stack_tag":"Rolling refined",
             "reason":f"Rolling refined max2/game max10 {mode_label}; Hit_score {score:.3f}; contact {r.get('contact_quality_score')}; L10 hit {r.get('hit_pct_last_10')}%; slot {r.get('batting_order_slot')}; opp {r.get('opponent_pitcher_pick_type')}; edge {r.get('edge_vs_opponent')}",
@@ -2575,6 +2640,7 @@ def main(season: int, target_date: str):
     # This is read-only and will not reset or overwrite result history.
     recent_cash_history_rows = _load_recent_cash_history()
     refined_picks = add_recent_cash_rate_columns(refined_picks, recent_cash_history_rows, window=10)
+    refined_picks = assign_refined_pick_confidence(refined_picks)
     plus_money_props = add_recent_cash_rate_columns(plus_money_props, recent_cash_history_rows, window=10)
 
     ts = dt.datetime.now().strftime("%Y-%m-%d_%H%M")
