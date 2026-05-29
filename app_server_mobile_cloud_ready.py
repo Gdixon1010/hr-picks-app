@@ -829,6 +829,7 @@ def _build_performance_summary(rows: list) -> dict:
         "by_bet_type": group_summary("bet_type"),
         "by_confidence": group_summary("confidence"),
         "by_card_type": group_summary("card_type"),
+        "by_slot": group_summary("slot"),
         "recent_results": recent,
     }
 
@@ -1852,6 +1853,7 @@ function renderResults() {
   const byType = Array.isArray(results.by_bet_type) ? results.by_bet_type : [];
   const byConf = Array.isArray(results.by_confidence) ? results.by_confidence : [];
   const byCardType = Array.isArray(results.by_card_type) ? results.by_card_type : [];
+  const bySlot = Array.isArray(results.by_slot) ? results.by_slot : [];
   const recent = Array.isArray(results.recent_results) ? results.recent_results : [];
 
   function pctText(v) {
@@ -1909,7 +1911,7 @@ function renderResults() {
         <div class="line"><span class="label">Win Rate:</span> ${overall.win_rate !== undefined && overall.win_rate !== null ? esc((overall.win_rate * 100).toFixed(1) + '%') : '—'}</div>
       </div>
       <div class="card"><h2>What This Is For</h2>
-        <div class="line">Final Card = official top-card plays. Refined Picks = broader model/research plays. They are now tracked separately.</div>
+        <div class="line">Final Card = elite-only official plays. Refined Picks = broader model/research plays. They are tracked separately.</div>
       </div>
     </div>
 
@@ -1936,6 +1938,12 @@ function renderResults() {
         <h2 style="margin-top:0;">By Confidence</h2>
         <div class="table-wrap"><table><thead><tr><th>Confidence</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
         ${byConf.map(r => `<tr><td>${esc(fmt(r.confidence))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${pctText(r.win_rate)}</td></tr>`).join("") || '<tr><td colspan="5">No confidence-level results yet.</td></tr>'}
+        </tbody></table></div>
+      </div>
+      <div class="table-shell">
+        <h2 style="margin-top:0;">By Card Slot</h2>
+        <div class="table-wrap"><table><thead><tr><th>Slot</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
+        ${bySlot.map(r => `<tr><td>${esc(fmt(r.slot))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${pctText(r.win_rate)}</td></tr>`).join("") || '<tr><td colspan="5">No slot results yet.</td></tr>'}
         </tbody></table></div>
       </div>
     </div>
