@@ -487,11 +487,31 @@ def assign_refined_pick_confidence(df: pd.DataFrame) -> pd.DataFrame:
         support = cash if sample >= 3 and cash is not None else l10
         support = support if support is not None else 0
 
-        if score >= 4.75 and (support >= 0.80 or contact >= 2.20):
+        slot = nz(row.get("batting_order_slot"), 99)
+        confirmed = str(row.get("lineup_status") or "").eq("Confirmed Starter") if hasattr(str(row.get("lineup_status") or ""), "eq") else (str(row.get("lineup_status") or "") == "Confirmed Starter")
+        opp_type = str(row.get("opponent_pitcher_pick_type") or "Neutral")
+
+        # Stricter confidence buckets based on the actual results audit:
+        # A+ must be a truly elite hit profile, not just a generally good model play.
+        if (
+            confirmed
+            and slot <= 5
+            and opp_type != "Strong SP"
+            and score >= 5.30
+            and contact >= 3.70
+            and support >= 0.80
+        ):
             return "A+"
-        if score >= 4.35 and (support >= 0.70 or contact >= 1.85):
+        if (
+            confirmed
+            and slot <= 6
+            and opp_type != "Strong SP"
+            and score >= 4.75
+            and contact >= 2.75
+            and support >= 0.70
+        ):
             return "A"
-        if score >= 4.00 or support >= 0.60:
+        if score >= 4.20 or support >= 0.60:
             return "B"
         return "C"
 
@@ -2212,9 +2232,25 @@ def build_plus_money_prop_sheet(player_rows: pd.DataFrame, pitcher_line_value: p
 
     gr = game_rankings.copy() if game_rankings is not None and not game_rankings.empty else pd.DataFrame()
     game_lookup = {}
+    team_run_projection_lookup = {}
     if not gr.empty:
+        run_cols = ["projected_team_runs", "team_projected_runs", "implied_team_total", "team_total", "projected_runs"]
         for _, r in gr.iterrows():
-            game_lookup[(r.get("teamName"), r.get("opponentTeam"))] = r.get("game")
+            team = r.get("teamName")
+            opp = r.get("opponentTeam")
+            game_lookup[(team, opp)] = r.get("game")
+            # Strict RBI gate support: only accept true/projected team run fields when present.
+            # If no projected run field exists, RBI props are blocked instead of guessed.
+            for rc in run_cols:
+                if rc in gr.columns:
+                    try:
+                        val = float(r.get(rc))
+                        if pd.notna(val):
+                            team_run_projection_lookup[(team, opp)] = val
+                            team_run_projection_lookup[team] = val
+                            break
+                    except Exception:
+                        pass
 
     if player_rows is not None and not player_rows.empty:
         pr = player_rows.copy()
@@ -2267,16 +2303,38 @@ def build_plus_money_prop_sheet(player_rows: pd.DataFrame, pitcher_line_value: p
                     "reason": f"Run L10 {run10}%; slot {slot}; Hit_score {hit_score:.3f}; opp {opp_type}",
                 })
 
-            # 1+ RBI: middle-order bats with recent RBI conversion and power/contact support.
-            if rbi10 is not None and rbi10 >= 60 and confirmed and 3 <= slot <= 6 and not avoid_sp:
+            # 1+ RBI: HARD Option-B gate from results audit.
+            # Require ALL:
+            # - batting 1-5
+            # - team projected runs >= 4.8
+            # - opposing pitcher not Strong SP
+            # - recent RBI cash >= 70%
+            # - confirmed starter
+            # If projected team runs are unavailable, reject instead of guessing.
+            projected_team_runs = team_run_projection_lookup.get((team, opp), team_run_projection_lookup.get(team))
+            try:
+                projected_team_runs_num = float(projected_team_runs) if projected_team_runs is not None else None
+            except Exception:
+                projected_team_runs_num = None
+
+            rbi_gate_ok = (
+                rbi10 is not None
+                and rbi10 >= 70
+                and confirmed
+                and slot <= 5
+                and not avoid_sp
+                and projected_team_runs_num is not None
+                and projected_team_runs_num >= 4.8
+            )
+            if rbi_gate_ok:
                 rows.append({
                     "prop_type": "1+ RBI", "bet_type": "1+ RBI", "pick": name, "team": team, "opponent": opp, "game": game,
-                    "confidence": "A" if rbi10 >= 70 else "B", "model_grade": round(hit_score + hr_score * 0.15, 3),
+                    "confidence": "A" if rbi10 >= 80 else "B", "model_grade": round(hit_score + hr_score * 0.15 + projected_team_runs_num * 0.10, 3),
                     "recent_cash_rate": rbi10, "season_rate": season_hit,
                     "lineup_status": r.get("lineup_status"), "batting_order_slot": r.get("batting_order_slot"),
-                    "projected_edge_note": "RBI profile: middle-order role + recent RBI rate + contact/power support",
+                    "projected_edge_note": "RBI Option-B gate: top-5 bat, team runs >=4.8, non-Strong-SP, 70%+ recent RBI cash, confirmed starter",
                     "market_check": "Only play if price is +100 or better and runners-ahead context is strong",
-                    "reason": f"RBI L10 {rbi10}%; slot {slot}; Hit_score {hit_score:.3f}; HR_score {hr_score:.3f}; opp {opp_type}",
+                    "reason": f"RBI L10 {rbi10}%; slot {slot}; team projected runs {projected_team_runs_num}; Hit_score {hit_score:.3f}; HR_score {hr_score:.3f}; opp {opp_type}",
                 })
 
     if pitcher_line_value is not None and not pitcher_line_value.empty:
@@ -2443,24 +2501,20 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
         base["recent_cash_num"] = pd.to_numeric(base.get("recent_cash_rate"), errors="coerce")
         base["recent_cash_for_sort"] = base["recent_cash_num"].fillna(0)
 
-        # Elite-only hit gate. This is intentionally tight.
-        # A hitter must be confirmed, top/middle order, hot recently, and show quality contact.
+        # Elite-only hit gate. This is intentionally tight after the results audit.
+        # Final Card should be the best-of-best only:
+        # confirmed starter, top-5 lineup slot, strong hit/contact score,
+        # 80%+ last-10 hit form, 70%+ recent model cash rate, and no Strong SP.
         hit_pool = base[
             (base["lineup_ok"] == True) &
-            (base["slot_num"] <= 4) &
-            (base["Hit_score_num"] >= 5.00) &
-            (base["contact_quality_num"] >= 3.50) &
+            (base["slot_num"] <= 5) &
+            (base["Hit_score_num"] >= 5.30) &
+            (base["contact_quality_num"] >= 3.70) &
             (base["hit_l10_num"] >= 80) &
+            (base["recent_cash_num"].notna()) &
+            (base["recent_cash_num"] >= 0.70) &
             (base["opponent_pitcher_pick_type"].fillna("Neutral") != "Strong SP")
         ].copy()
-
-        # If recent result history exists, require at least a solid recent cash profile.
-        # Missing recent cash does not block brand-new players, but low recent cash does.
-        if "recent_cash_num" in hit_pool.columns:
-            hit_pool = hit_pool[
-                hit_pool["recent_cash_num"].isna() |
-                (hit_pool["recent_cash_num"] >= 0.60)
-            ].copy()
 
         if not hit_pool.empty:
             hit_pool["elite_sort_score"] = (
@@ -2495,7 +2549,7 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
                     (
                         f"Elite hit gate; Hit_score {r.get('Hit_score_num'):.3f}; contact {r.get('contact_quality_num'):.2f}; "
                         f"L10 hit {r.get('hit_l10_num')}%; slot {int(r.get('slot_num'))}; "
-                        f"recent cash {round(float(r.get('recent_cash_for_sort') or 0)*100,1)}%; "
+                        f"recent cash {round(float(r.get('recent_cash_num') or 0)*100,1)}%; "
                         f"opp {r.get('opponent_pitcher_pick_type')}; park {r.get('park_favorability')}"
                     ),
                     "Elite_Final_Hit_Model",
