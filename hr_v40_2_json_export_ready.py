@@ -1967,7 +1967,13 @@ def apply_k_market_validation(pitcher_line_value: pd.DataFrame, target_date: str
 # HR VALUE PROFILE ENGINE V1
 # ------------------------------
 def hr_value_bucket(home_runs, league_avg_hr=None):
-    """Bucket HR totals into value-focused groups. Excludes 0-HR players from target logic."""
+    """Bucket HR totals into value-focused groups. Excludes 0-HR players from target logic.
+
+    The HR Value Watch target is NOT low-power longshots. It is the near-average
+    value band: players close to the dynamic league average, slightly below it,
+    at it, or just above it. Someone way below average is excluded from the
+    primary value bucket even if they are overdue.
+    """
     hrs = nz(home_runs, 0)
     avg = nz(league_avg_hr, 0)
     try:
@@ -1979,11 +1985,15 @@ def hr_value_bucket(home_runs, league_avg_hr=None):
         return "No HR profile"
     if hrs <= 2:
         return "Low Power"
-    # Dynamic value band: at/below league average, with a small cushion so the pool adjusts as the season grows.
-    if avg and hrs <= avg + 1:
-        return "HR Value Range"
-    if avg and hrs <= avg + 4:
-        return "Above Average Power"
+    if avg:
+        lower = max(3.0, avg - 2.0)
+        upper = avg + 1.0
+        if lower <= hrs <= upper:
+            return "Near Avg HR Value Range"
+        if hrs < lower:
+            return "Below Value Band"
+        if hrs <= avg + 4:
+            return "Above Average Power"
     return "Elite / Priced-Up Power"
 
 
@@ -2010,9 +2020,17 @@ def add_hr_value_profile(player_rows: pd.DataFrame) -> pd.DataFrame:
     df["hr_vs_league_avg"] = (hr_numeric - league_avg_hr).round(2)
     df["hr_value_bucket"] = hr_numeric.apply(lambda x: hr_value_bucket(x, league_avg_hr))
 
-    # Dynamic sweet spot: real HR ability, but not over the market's obvious power bucket.
-    # The +1 cushion avoids overly strict cutoffs when average is 5.6/6.1/etc.
-    df["hr_value_target_flag"] = (hr_numeric >= 3) & (hr_numeric <= (league_avg_hr + 1.0))
+    # Dynamic sweet spot: close to league average, not way below it.
+    # Example: if today's average is 6.44 HR, the value watch target is roughly 5-7 HR.
+    # This avoids 3-HR/low-power names showing as Primary HR Value Targets when the league average is ~6+.
+    hr_value_lower_bound = max(3.0, league_avg_hr - 2.0) if league_avg_hr else 3.0
+    hr_value_upper_bound = (league_avg_hr + 1.0) if league_avg_hr else 99.0
+    df["hr_value_lower_bound"] = round(hr_value_lower_bound, 2)
+    df["hr_value_upper_bound"] = round(hr_value_upper_bound, 2)
+    df["hr_value_band_distance"] = 0.0
+    df.loc[hr_numeric < hr_value_lower_bound, "hr_value_band_distance"] = (hr_value_lower_bound - hr_numeric).round(2)
+    df.loc[hr_numeric > hr_value_upper_bound, "hr_value_band_distance"] = (hr_numeric - hr_value_upper_bound).round(2)
+    df["hr_value_target_flag"] = (hr_numeric >= hr_value_lower_bound) & (hr_numeric <= hr_value_upper_bound)
 
     drought = pd.to_numeric(df.get("current_games_without_hr"), errors="coerce").fillna(0)
     avg_gap = pd.to_numeric(df.get("avg_games_between_hrs"), errors="coerce").fillna(0)
@@ -2035,6 +2053,7 @@ def add_hr_value_profile(player_rows: pd.DataFrame) -> pd.DataFrame:
     slot_adj = slot.apply(lambda s: max(0.0, 7 - float(s)) * 0.18 if s <= 9 else 0.0)
     value_band_adj = df["hr_value_target_flag"].astype(int) * 1.65
     low_power_penalty = (hr_numeric <= 2).astype(int) * -2.25
+    below_value_band_penalty = (hr_numeric < hr_value_lower_bound).astype(int) * -2.00
     elite_price_penalty = (hr_numeric > (league_avg_hr + 4.0)).astype(int) * -1.10
 
     # Controlled score: value range + overdue timing + environment. Not raw HR leader ranking.
@@ -2043,6 +2062,7 @@ def add_hr_value_profile(player_rows: pd.DataFrame) -> pd.DataFrame:
     df["hr_value_score"] = (
         value_band_adj
         + low_power_penalty
+        + below_value_band_penalty
         + elite_price_penalty
         + drought_over_avg.clip(upper=18) * 0.16
         + park_adj
@@ -2058,6 +2078,8 @@ def add_hr_value_profile(player_rows: pd.DataFrame) -> pd.DataFrame:
             return "Primary HR Value Target"
         if row.get("hr_value_target_flag"):
             return "Secondary HR Value Watch"
+        if row.get("hr_value_bucket") == "Below Value Band":
+            return "Exclude - below HR value band"
         if row.get("hr_value_bucket") == "Elite / Priced-Up Power":
             return "Priced-Up Power / Upside Only"
         if row.get("hr_value_bucket") == "Low Power":
@@ -2067,7 +2089,8 @@ def add_hr_value_profile(player_rows: pd.DataFrame) -> pd.DataFrame:
     df["hr_value_profile"] = df.apply(_profile, axis=1)
     df["hr_value_reason"] = df.apply(
         lambda r: (
-            f"HRs {r.get('homeRuns')} vs dynamic avg {r.get('league_avg_hr_excl_zero')}; "
+            f"HRs {r.get('homeRuns')} vs dynamic avg {r.get('league_avg_hr_excl_zero')} "
+            f"target band {r.get('hr_value_lower_bound')}-{r.get('hr_value_upper_bound')}; "
             f"bucket {r.get('hr_value_bucket')}; drought over avg {r.get('hr_drought_over_avg')}; "
             f"park {r.get('park_favorability')}; opp {r.get('opponent_pitcher_pick_type')}; "
             f"score {r.get('hr_value_score')}"
@@ -2081,6 +2104,7 @@ def build_hr_value_watch(player_rows: pd.DataFrame) -> pd.DataFrame:
     """Research tab for the exact HR value profile the user wants."""
     cols = [
         "playerName", "teamName", "homeRuns", "league_avg_hr_excl_zero", "hr_vs_league_avg",
+        "hr_value_lower_bound", "hr_value_upper_bound", "hr_value_band_distance",
         "hr_value_bucket", "hr_value_target_flag", "hr_value_score", "hr_contact_proxy", "hr_value_profile",
         "avg_games_between_hrs", "current_games_without_hr", "hr_drought_over_avg", "hr_status",
         "last_hr_date", "gamesPlayed", "park_favorability", "opponent_pitcher", "opponent_pitcher_pick_type",
@@ -2099,8 +2123,8 @@ def build_hr_value_watch(player_rows: pd.DataFrame) -> pd.DataFrame:
         (pd.to_numeric(df.get("homeRuns"), errors="coerce").fillna(0) > 0)
         & (df.get("hr_value_target_flag", False).astype(bool))
     ].copy()
-    if pool.empty:
-        pool = df[pd.to_numeric(df.get("homeRuns"), errors="coerce").fillna(0) > 0].copy()
+    # Do not fall back to low-power/way-below-average players. If nobody fits the
+    # near-average value band, show an empty watch table rather than noisy longshots.
     pool = pool.sort_values(["hr_value_score", "hr_drought_over_avg", "HR_score"], ascending=[False, False, False])
     for c in cols:
         if c not in pool.columns:
