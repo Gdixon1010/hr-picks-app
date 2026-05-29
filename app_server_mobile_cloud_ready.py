@@ -788,10 +788,32 @@ def _build_performance_summary(rows: list) -> dict:
     wins = sum(1 for r in graded if r.get("result_status") == "Win")
     losses = sum(1 for r in graded if r.get("result_status") == "Loss")
     total = wins + losses
+    def _summary_group_key(r, field):
+        value = r.get(field)
+        s = str(value).strip() if value is not None else ""
+        missing = s in {"", "—", "None", "nan", "NaN", "Unknown"}
+
+        if field == "confidence" and missing:
+            # Older result-history rows were saved before Refined/Prop confidence existed.
+            # Keep them in the data, but do not group them as vague "Unknown".
+            card = str(r.get("card_type") or "").strip()
+            if card == "Refined Picks":
+                return "Legacy Refined"
+            if card == "Plus Money Props":
+                return "Legacy Props"
+            if card == "Final Card":
+                return "Legacy Final Card"
+            return "Legacy Unrated"
+
+        if field == "card_type" and missing:
+            return "Legacy Unknown"
+
+        return s if s else "Unknown"
+
     def group_summary(field):
         groups = {}
         for r in graded:
-            k = str(r.get(field) or "Unknown")
+            k = _summary_group_key(r, field)
             groups.setdefault(k, {"graded_picks": 0, "wins": 0, "losses": 0})
             groups[k]["graded_picks"] += 1
             if r.get("result_status") == "Win": groups[k]["wins"] += 1
