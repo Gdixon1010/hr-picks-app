@@ -2115,7 +2115,7 @@ def build_plus_money_prop_sheet(player_rows: pd.DataFrame, pitcher_line_value: p
     markets to check manually.
     """
     cols = [
-        "prop_type", "pick", "team", "opponent", "game", "confidence", "model_grade",
+        "prop_type", "bet_type", "pick", "team", "opponent", "game", "confidence", "model_grade",
         "recent_cash_rate", "season_rate", "lineup_status", "batting_order_slot",
         "projected_edge_note", "market_check", "reason"
     ]
@@ -2157,7 +2157,7 @@ def build_plus_money_prop_sheet(player_rows: pd.DataFrame, pitcher_line_value: p
             if tb10 is not None and tb10 >= 70 and lineup_ok and not avoid_sp:
                 conf = "A+" if tb10 >= 80 and (tb5 is None or tb5 >= 60) and (hr_score >= 3.8 or hit_score >= 4.2) else "A"
                 rows.append({
-                    "prop_type": "2+ Total Bases", "pick": name, "team": team, "opponent": opp, "game": game,
+                    "prop_type": "2+ Total Bases", "bet_type": "2+ Total Bases", "pick": name, "team": team, "opponent": opp, "game": game,
                     "confidence": conf, "model_grade": round(hit_score + max(hr_score, 0) * 0.20, 3),
                     "recent_cash_rate": tb10, "season_rate": season_hit,
                     "lineup_status": r.get("lineup_status"), "batting_order_slot": r.get("batting_order_slot"),
@@ -2169,7 +2169,7 @@ def build_plus_money_prop_sheet(player_rows: pd.DataFrame, pitcher_line_value: p
             # 1+ Run: top of order + strong hit form + team/game environment.
             if run10 is not None and run10 >= 70 and confirmed and slot <= 3 and not avoid_sp:
                 rows.append({
-                    "prop_type": "1+ Run", "pick": name, "team": team, "opponent": opp, "game": game,
+                    "prop_type": "1+ Run", "bet_type": "1+ Run", "pick": name, "team": team, "opponent": opp, "game": game,
                     "confidence": "A" if run10 >= 80 else "B", "model_grade": round(hit_score + (4 - min(slot, 4)) * 0.25, 3),
                     "recent_cash_rate": run10, "season_rate": season_hit,
                     "lineup_status": r.get("lineup_status"), "batting_order_slot": r.get("batting_order_slot"),
@@ -2181,7 +2181,7 @@ def build_plus_money_prop_sheet(player_rows: pd.DataFrame, pitcher_line_value: p
             # 1+ RBI: middle-order bats with recent RBI conversion and power/contact support.
             if rbi10 is not None and rbi10 >= 60 and confirmed and 3 <= slot <= 6 and not avoid_sp:
                 rows.append({
-                    "prop_type": "1+ RBI", "pick": name, "team": team, "opponent": opp, "game": game,
+                    "prop_type": "1+ RBI", "bet_type": "1+ RBI", "pick": name, "team": team, "opponent": opp, "game": game,
                     "confidence": "A" if rbi10 >= 70 else "B", "model_grade": round(hit_score + hr_score * 0.15, 3),
                     "recent_cash_rate": rbi10, "season_rate": season_hit,
                     "lineup_status": r.get("lineup_status"), "batting_order_slot": r.get("batting_order_slot"),
@@ -2203,7 +2203,7 @@ def build_plus_money_prop_sheet(player_rows: pd.DataFrame, pitcher_line_value: p
             if k5 is not None and k5 >= 70 and mid >= 5:
                 conf = "A+" if k5 >= 80 and mid >= 6 else "A"
                 rows.append({
-                    "prop_type": "5+ Strikeouts", "pick": r.get("pitcherName"), "team": r.get("teamName"), "opponent": r.get("opponentTeam"),
+                    "prop_type": "5+ Strikeouts", "bet_type": "5+ Strikeouts", "pick": r.get("pitcherName"), "team": r.get("teamName"), "opponent": r.get("opponentTeam"),
                     "game": None, "confidence": conf, "model_grade": round(mid + nz(r.get("opp_k_matchup_bonus")), 3),
                     "recent_cash_rate": k5, "season_rate": r.get("avg_k_per_start"),
                     "lineup_status": "Confirmed Starter", "batting_order_slot": None,
@@ -2213,9 +2213,14 @@ def build_plus_money_prop_sheet(player_rows: pd.DataFrame, pitcher_line_value: p
                 })
 
     if not rows:
-        return pd.DataFrame([{"prop_type":"Info", "pick":"No plus-money prop candidates", "reason":"No props met recent cash-rate and role filters"}], columns=cols)
+        return pd.DataFrame([{"prop_type":"Info", "bet_type":"Info", "pick":"No plus-money prop candidates", "reason":"No props met recent cash-rate and role filters"}], columns=cols)
 
     out = pd.DataFrame(rows)
+    if "bet_type" not in out.columns:
+        out["bet_type"] = out.get("prop_type")
+    else:
+        out["bet_type"] = out["bet_type"].fillna(out.get("prop_type"))
+        out.loc[out["bet_type"].astype(str).str.strip().isin(["", "—", "None", "nan"]), "bet_type"] = out.get("prop_type")
     out["sort_rank"] = out["confidence"].map({"A+": 1, "A": 2, "B": 3}).fillna(9)
     out = out.sort_values(["sort_rank", "recent_cash_rate", "model_grade"], ascending=[True, False, False])
     out = out.drop(columns=["sort_rank"])
