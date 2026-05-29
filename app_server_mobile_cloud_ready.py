@@ -661,6 +661,67 @@ def _infer_grade_bet_type(row: dict) -> str:
     return ""
 
 
+
+
+def _result_confidence_value(value):
+    if value is None:
+        return ""
+    s = str(value).strip()
+    return "" if s in {"", "—", "None", "nan", "NaN"} else s
+
+
+def _rate_to_unit_result(value):
+    try:
+        if value is None:
+            return None
+        n = float(value)
+        return n / 100.0 if n > 1.0 else n
+    except Exception:
+        return None
+
+
+def _infer_result_confidence(row: dict, card_type: str) -> str:
+    """Backfill confidence for rows that were saved before confidence existed.
+
+    This prevents Refined Picks from being grouped as Unknown in Results.
+    """
+    existing = _result_confidence_value(row.get("confidence"))
+    if existing:
+        return existing
+
+    if card_type == "Refined Picks":
+        try:
+            score = float(row.get("Hit_score") or 0)
+        except Exception:
+            score = 0.0
+        try:
+            contact = float(row.get("contact_quality_score") or 0)
+        except Exception:
+            contact = 0.0
+        cash = _rate_to_unit_result(row.get("recent_cash_rate"))
+        l10 = _rate_to_unit_result(row.get("hit_pct_last_10"))
+        try:
+            sample = float(row.get("recent_cash_sample") or 0)
+        except Exception:
+            sample = 0.0
+        support = cash if sample >= 3 and cash is not None else l10
+        support = support if support is not None else 0.0
+
+        if score >= 4.75 and (support >= 0.80 or contact >= 2.20):
+            return "A+"
+        if score >= 4.35 and (support >= 0.70 or contact >= 1.85):
+            return "A"
+        if score >= 4.00 or support >= 0.60:
+            return "B"
+        return "C"
+
+    # Historical rows from older builds may be missing card type/confidence.
+    if card_type == "Plus Money Props":
+        prop = str(row.get("prop_type") or row.get("bet_type") or "")
+        if "5+ Strikeouts" in prop and str(row.get("confidence") or "") == "":
+            return "A"
+    return "Unknown"
+
 def _grade_pick(row: dict, target_date: str, season: int = 2026, card_type: str = "Final Card") -> dict:
     bet_type = _infer_grade_bet_type(row)
     lower = bet_type.lower()
@@ -690,7 +751,7 @@ def _grade_pick(row: dict, target_date: str, season: int = 2026, card_type: str 
         "pick": row.get("pick") or row.get("playerName") or row.get("pitcherName"),
         "team": row.get("team") or row.get("teamName"),
         "opponent": row.get("opponent") or row.get("opponentTeam") or row.get("opponent_pitcher_team"),
-        "confidence": row.get("confidence"),
+        "confidence": _infer_result_confidence(row, card_type),
         "slot": row.get("slot") or row.get("play_type") or row.get("section") or row.get("category"),
         "result_status": result,
         "result_detail": detail,
@@ -713,7 +774,9 @@ def _dedupe_result_rows(rows: list) -> list:
             and str(r.get("bet_type") or "").strip() in {"", "—", "None", "nan"}):
             continue
 
-        key = (r.get("target_date"), r.get("card_type"), str(r.get("bet_type") or "").lower(), _norm_name(r.get("pick")), _norm_name(r.get("team")), _norm_name(r.get("opponent")), str(r.get("confidence") or ""))
+        # Do not include confidence in the dedupe key. Older rows may have blank/Unknown confidence,
+        # and newer regraded rows may have A+/A/B/C. We want the newer row to replace the old one.
+        key = (r.get("target_date"), r.get("card_type"), str(r.get("bet_type") or "").lower(), _norm_name(r.get("pick")), _norm_name(r.get("team")), _norm_name(r.get("opponent")))
         if key in seen:
             continue
         seen.add(key); out.append(r)
