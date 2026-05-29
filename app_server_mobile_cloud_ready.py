@@ -644,8 +644,25 @@ def _grade_alt_k_prop(row: dict, target_date: str, season: int, threshold: int =
     return ("Win" if ks >= threshold else "Loss"), f"{player}: {ks} Ks vs {threshold}+ target"
 
 
+def _infer_grade_bet_type(row: dict) -> str:
+    """Return the bet type the grader should use.
+
+    Plus Money Props are generated with prop_type; older locked rows may have
+    blank bet_type, which caused Unsupported bet type / Unable to Grade.
+    """
+    for key in ["bet_type", "prop_type", "play_type", "recommended_k_action", "category"]:
+        val = str(row.get(key) or "").strip()
+        if val and val not in {"—", "None", "nan", "No Plays", "Info"}:
+            # recommended_k_action may look like "Bet over up to 5.5"; do not use that
+            # unless nothing else is available.
+            if key == "recommended_k_action" and "strikeout" not in val.lower() and "+" not in val:
+                continue
+            return val
+    return ""
+
+
 def _grade_pick(row: dict, target_date: str, season: int = 2026, card_type: str = "Final Card") -> dict:
-    bet_type = str(row.get("bet_type") or row.get("play_type") or "").strip()
+    bet_type = _infer_grade_bet_type(row)
     lower = bet_type.lower()
     if "moneyline" in lower or lower == "ml":
         result, detail = _grade_moneyline(row, target_date)
@@ -669,7 +686,7 @@ def _grade_pick(row: dict, target_date: str, season: int = 2026, card_type: str 
     return {
         "target_date": target_date,
         "card_type": card_type,
-        "bet_type": bet_type,
+        "bet_type": bet_type or row.get("prop_type") or row.get("play_type"),
         "pick": row.get("pick") or row.get("playerName") or row.get("pitcherName"),
         "team": row.get("team") or row.get("teamName"),
         "opponent": row.get("opponent") or row.get("opponentTeam") or row.get("opponent_pitcher_team"),
@@ -687,6 +704,15 @@ def _dedupe_result_rows(rows: list) -> list:
     for r in rows:
         if not isinstance(r, dict):
             continue
+
+        # Remove old broken Plus Money Prop result rows created before bet_type fallback.
+        # They were all "Unable to Grade / Unsupported bet type:" and do not provide usable data.
+        if (str(r.get("card_type") or "") == "Plus Money Props"
+            and str(r.get("result_status") or "") == "Unable to Grade"
+            and str(r.get("result_detail") or "").startswith("Unsupported bet type")
+            and str(r.get("bet_type") or "").strip() in {"", "—", "None", "nan"}):
+            continue
+
         key = (r.get("target_date"), r.get("card_type"), str(r.get("bet_type") or "").lower(), _norm_name(r.get("pick")), _norm_name(r.get("team")), _norm_name(r.get("opponent")), str(r.get("confidence") or ""))
         if key in seen:
             continue
