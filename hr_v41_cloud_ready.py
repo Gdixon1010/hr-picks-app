@@ -229,20 +229,39 @@ def _history_rows(kind: str, target_date: str) -> list:
 
 def _update_history(kind: str, target_date: str, rows: list) -> None:
     real_rows = [r for r in _rows(rows) if isinstance(r, dict) and not _is_placeholder(r)]
+    by_date_path = HISTORY_DIR / f"{kind}_by_date.json"
+    latest_path = HISTORY_DIR / f"{kind}_by_date_latest.json"
+    by_date = _read_json(by_date_path, {})
+    if not isinstance(by_date, dict):
+        by_date = {}
+
+    # HARD SAFETY: Final Card must never be overwritten with an empty list
+    # during the same active slate. It can reset naturally after the 4 AM slate rollover.
+    if kind == "final_card" and not real_rows:
+        existing_payload = by_date.get(target_date) if isinstance(by_date.get(target_date), dict) else {}
+        existing_rows = _rows(existing_payload.get("rows"))
+        if existing_rows:
+            print(f"🔒 Final Card overwrite blocked: keeping {len(existing_rows)} locked rows for {target_date}")
+            _write_json(latest_path, existing_payload)
+            return
+        latest_payload = _read_json(latest_path, {})
+        if isinstance(latest_payload, dict) and latest_payload.get("target_date") == target_date:
+            latest_rows = _rows(latest_payload.get("rows"))
+            if latest_rows:
+                print(f"🔒 Final Card empty overwrite blocked from latest file: keeping {len(latest_rows)} rows for {target_date}")
+                by_date[target_date] = latest_payload
+                _write_json(by_date_path, by_date)
+                return
+
     payload = {
         "target_date": target_date,
         "saved_at_et": datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " "),
         "locked_until_et": f"{(datetime.strptime(target_date, '%Y-%m-%d').date() + timedelta(days=1)).strftime('%Y-%m-%d')} 04:00 AM ET",
         "rows": real_rows,
     }
-    by_date_path = HISTORY_DIR / f"{kind}_by_date.json"
-    by_date = _read_json(by_date_path, {})
-    if not isinstance(by_date, dict):
-        by_date = {}
     by_date[target_date] = payload
     _write_json(by_date_path, by_date)
-    _write_json(HISTORY_DIR / f"{kind}_by_date_latest.json", payload)
-
+    _write_json(latest_path, payload)
 
 def main(season: int, target_date: str):
     """Build V41 payload with non-destructive 4AM slate locking.
@@ -288,38 +307,21 @@ def main(season: int, target_date: str):
     old_plus_money_candidates.extend(_normalize_plus_money_rows(_get_research_rows(old_data, "plus_money_props")))
     old_plus_money_candidates.extend(_normalize_plus_money_rows(_history_rows("plus_money_props", target_date)))
 
-    # Elite Final Card lock rule:
-    # Once an Elite Final Card pick exists for the active slate, it must NEVER be removed
-    # by a same-day refresh. A refresh may only add new qualifying Elite plays.
+    # Elite Final Card mode with TRUE same-day lock:
+    # Once an Elite play hits the Final Card, it must NEVER be removed before 4 AM ET.
+    # New refreshes may only ADD new Elite plays if room remains.
     old_elite_final = _elite_final_rows(old_final_candidates)
     new_elite_final = _elite_final_rows(_get_final_card_plays(new_data))
-
     merged_final = _merge_rows(
         old_elite_final,
         new_elite_final,
-        ["slot", "bet_type", "pick", "playerName", "team", "teamName", "opponent", "opponentTeam"],
+        ["slot", "bet_type", "pick", "team", "opponent"],
     )
-
-    # Safety guard: never let an empty generated card wipe an existing locked Elite card.
-    if old_elite_final and not merged_final:
-        print("🛡️ Final Card safety guard: preserving existing Elite locked rows because new merge was empty.")
-        merged_final = old_elite_final
-
-    # Keep only the first 3 Elite rows and renumber cleanly.
-    slot_rank = {"Elite 1": 1, "Elite 2": 2, "Elite 3": 3}
-    merged_final = sorted(
-        merged_final,
-        key=lambda r: (
-            slot_rank.get(str(r.get("slot") or ""), 99),
-            str(r.get("pick") or r.get("playerName") or "")
-        )
-    )[:3]
-
-    for i, row in enumerate(merged_final, 1):
-        row["slot"] = f"Elite {i}"
-        row["confidence"] = "A+"
-        row["bet_type"] = row.get("bet_type") or "1+ Hit"
-
+    merged_final = [r for r in merged_final if isinstance(r, dict) and not _is_placeholder(r)][:3]
+    for i, r in enumerate(merged_final, 1):
+        r["slot"] = f"Elite {i}"
+        r["confidence"] = "A+"
+        r["final_card_tier"] = r.get("final_card_tier") or "Elite"
     _set_final_card_plays(new_data, merged_final)
 
     merged_refined = _merge_rows(
