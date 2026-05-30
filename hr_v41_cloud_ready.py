@@ -288,10 +288,38 @@ def main(season: int, target_date: str):
     old_plus_money_candidates.extend(_normalize_plus_money_rows(_get_research_rows(old_data, "plus_money_props")))
     old_plus_money_candidates.extend(_normalize_plus_money_rows(_history_rows("plus_money_props", target_date)))
 
-    # Elite Final Card mode: do NOT carry old same-day Core/Moneyline rows forward.
-    # The Final Card is the official card and should reflect only the latest elite-only gate.
-    # Refined Picks / Plus Money still preserve same-day rows; Final Card is re-filtered.
-    merged_final = _elite_final_rows(_get_final_card_plays(new_data))
+    # Elite Final Card lock rule:
+    # Once an Elite Final Card pick exists for the active slate, it must NEVER be removed
+    # by a same-day refresh. A refresh may only add new qualifying Elite plays.
+    old_elite_final = _elite_final_rows(old_final_candidates)
+    new_elite_final = _elite_final_rows(_get_final_card_plays(new_data))
+
+    merged_final = _merge_rows(
+        old_elite_final,
+        new_elite_final,
+        ["slot", "bet_type", "pick", "playerName", "team", "teamName", "opponent", "opponentTeam"],
+    )
+
+    # Safety guard: never let an empty generated card wipe an existing locked Elite card.
+    if old_elite_final and not merged_final:
+        print("🛡️ Final Card safety guard: preserving existing Elite locked rows because new merge was empty.")
+        merged_final = old_elite_final
+
+    # Keep only the first 3 Elite rows and renumber cleanly.
+    slot_rank = {"Elite 1": 1, "Elite 2": 2, "Elite 3": 3}
+    merged_final = sorted(
+        merged_final,
+        key=lambda r: (
+            slot_rank.get(str(r.get("slot") or ""), 99),
+            str(r.get("pick") or r.get("playerName") or "")
+        )
+    )[:3]
+
+    for i, row in enumerate(merged_final, 1):
+        row["slot"] = f"Elite {i}"
+        row["confidence"] = "A+"
+        row["bet_type"] = row.get("bet_type") or "1+ Hit"
+
     _set_final_card_plays(new_data, merged_final)
 
     merged_refined = _merge_rows(
