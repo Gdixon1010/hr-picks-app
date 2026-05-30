@@ -492,13 +492,13 @@ def assign_refined_pick_confidence(df: pd.DataFrame) -> pd.DataFrame:
         opp_type = str(row.get("opponent_pitcher_pick_type") or "Neutral")
 
         # Stricter confidence buckets based on the actual results audit:
-        # A+ must be a truly elite hit profile, not just a generally good model play.
+        # A+ must be elite, but not so tight that every strong slate produces zero official plays.
         if (
             confirmed
             and slot <= 5
             and opp_type != "Strong SP"
-            and score >= 5.30
-            and contact >= 3.70
+            and score >= 5.00
+            and contact >= 3.40
             and support >= 0.80
         ):
             return "A+"
@@ -2508,8 +2508,8 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
         hit_pool = base[
             (base["lineup_ok"] == True) &
             (base["slot_num"] <= 5) &
-            (base["Hit_score_num"] >= 5.30) &
-            (base["contact_quality_num"] >= 3.70) &
+            (base["Hit_score_num"] >= 5.00) &
+            (base["contact_quality_num"] >= 3.40) &
             (base["hit_l10_num"] >= 80) &
             (base["recent_cash_num"].notna()) &
             (base["recent_cash_num"] >= 0.70) &
