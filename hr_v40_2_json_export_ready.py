@@ -492,7 +492,7 @@ def assign_refined_pick_confidence(df: pd.DataFrame) -> pd.DataFrame:
         opp_type = str(row.get("opponent_pitcher_pick_type") or "Neutral")
 
         # Stricter confidence buckets based on the actual results audit:
-        # A+ must be elite, but not so tight that every strong slate produces zero official plays.
+        # A+ must be a truly elite hit profile, not just a generally good model play.
         if (
             confirmed
             and slot <= 5
@@ -2491,7 +2491,10 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
             if c not in base.columns:
                 base[c] = default
 
-        base["lineup_ok"] = base["starter_only_flag"].fillna(False)
+        base["lineup_ok"] = (
+            base["starter_only_flag"].fillna(False).astype(bool)
+            | base["lineup_status"].astype(str).eq("Confirmed Starter")
+        )
         base["slot_num"] = pd.to_numeric(base.get("batting_order_slot"), errors="coerce").fillna(99)
         base["Hit_score_num"] = pd.to_numeric(base.get("Hit_score"), errors="coerce").fillna(0)
         base["contact_quality_num"] = pd.to_numeric(base.get("contact_quality_score"), errors="coerce").fillna(0)
