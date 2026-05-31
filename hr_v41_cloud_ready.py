@@ -204,6 +204,82 @@ def _set_final_card_plays(data: dict, rows: list) -> None:
         data["research"]["final_card"] = rows
 
 
+def _refined_to_elite_final_rows(data: dict) -> list:
+    """Promote qualified Refined Picks into Elite Final Card when v40 final_card is empty/placeholder."""
+    rows = _get_research_rows(data, "refined_picks")
+    out = []
+
+    def num(v, default=0.0):
+        try:
+            if v is None:
+                return default
+            return float(v)
+        except Exception:
+            return default
+
+    candidates = []
+    for r in _rows(rows):
+        if not isinstance(r, dict) or _is_placeholder(r):
+            continue
+        if str(r.get("bet_type") or "") != "1+ Hit":
+            continue
+        lineup = str(r.get("lineup_status") or "")
+        slot = num(r.get("batting_order_slot"), 99)
+        if lineup != "Confirmed Starter" or slot > 5:
+            continue
+        if num(r.get("Hit_score")) < 5.00:
+            continue
+        if num(r.get("contact_quality_score")) < 3.40:
+            continue
+        if num(r.get("hit_pct_last_10")) < 80:
+            continue
+        if num(r.get("recent_cash_rate"), -1) < 0.70:
+            continue
+        if str(r.get("opponent_pitcher_pick_type") or "Neutral") == "Strong SP":
+            continue
+        candidates.append(r)
+
+    candidates = sorted(
+        candidates,
+        key=lambda r: (
+            num(r.get("Hit_score")),
+            num(r.get("contact_quality_score")),
+            num(r.get("hit_pct_last_10")),
+            num(r.get("recent_cash_rate")),
+            -num(r.get("batting_order_slot"), 99),
+        ),
+        reverse=True,
+    )
+
+    used_teams = set()
+    for r in candidates:
+        team = r.get("teamName")
+        if team in used_teams:
+            continue
+        used_teams.add(team)
+        out.append({
+            "slot": f"Elite {len(out) + 1}",
+            "bet_type": "1+ Hit",
+            "pick": r.get("playerName"),
+            "team": team,
+            "opponent": r.get("opponentTeam") or r.get("opponent_pitcher_team"),
+            "confidence": "A+",
+            "why_it_made_the_card": (
+                f"Elite refined fallback; Hit_score {r.get('Hit_score')}; "
+                f"contact {r.get('contact_quality_score')}; "
+                f"L10 hit {r.get('hit_pct_last_10')}%; "
+                f"slot {r.get('batting_order_slot')}; "
+                f"recent cash {r.get('recent_cash_rate')}; "
+                f"opp {r.get('opponent_pitcher_pick_type')}"
+            ),
+            "source_tab": "Refined_Picks",
+            "final_card_tier": "Elite",
+        })
+        if len(out) >= 3:
+            break
+    return out
+
+
 def _get_research_rows(data: dict, key: str) -> list:
     research = data.get("research") if isinstance(data.get("research"), dict) else {}
     rows = _rows(research.get(key))
@@ -229,50 +305,19 @@ def _history_rows(kind: str, target_date: str) -> list:
 
 def _update_history(kind: str, target_date: str, rows: list) -> None:
     real_rows = [r for r in _rows(rows) if isinstance(r, dict) and not _is_placeholder(r)]
-    by_date_path = HISTORY_DIR / f"{kind}_by_date.json"
-    latest_path = HISTORY_DIR / f"{kind}_by_date_latest.json"
-
-    by_date = _read_json(by_date_path, {})
-    if not isinstance(by_date, dict):
-        by_date = {}
-
-    existing_payload = by_date.get(target_date) if isinstance(by_date.get(target_date), dict) else {}
-    existing_rows = _rows(existing_payload.get("rows"))
-
-    latest_payload = _read_json(latest_path, {})
-    latest_rows = []
-    if isinstance(latest_payload, dict) and latest_payload.get("target_date") == target_date:
-        latest_rows = _rows(latest_payload.get("rows"))
-
-    # HARD SAFETY: Final Card must never be overwritten with an empty or smaller
-    # list during the same active slate. It can reset naturally after the 4 AM slate rollover.
-    if kind == "final_card":
-        protected_rows = existing_rows or latest_rows
-        if protected_rows and not real_rows:
-            print(f"🔒 Final Card overwrite blocked: keeping {len(protected_rows)} locked rows for {target_date}")
-            payload_to_keep = existing_payload if existing_rows else latest_payload
-            by_date[target_date] = payload_to_keep
-            _write_json(by_date_path, by_date)
-            _write_json(latest_path, payload_to_keep)
-            return
-
-        if protected_rows and real_rows and len(real_rows) < len(protected_rows):
-            print(f"🔒 Final Card shrink blocked: keeping {len(protected_rows)} locked rows for {target_date}")
-            payload_to_keep = existing_payload if existing_rows else latest_payload
-            by_date[target_date] = payload_to_keep
-            _write_json(by_date_path, by_date)
-            _write_json(latest_path, payload_to_keep)
-            return
-
     payload = {
         "target_date": target_date,
         "saved_at_et": datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " "),
         "locked_until_et": f"{(datetime.strptime(target_date, '%Y-%m-%d').date() + timedelta(days=1)).strftime('%Y-%m-%d')} 04:00 AM ET",
         "rows": real_rows,
     }
+    by_date_path = HISTORY_DIR / f"{kind}_by_date.json"
+    by_date = _read_json(by_date_path, {})
+    if not isinstance(by_date, dict):
+        by_date = {}
     by_date[target_date] = payload
     _write_json(by_date_path, by_date)
-    _write_json(latest_path, payload)
+    _write_json(HISTORY_DIR / f"{kind}_by_date_latest.json", payload)
 
 
 def main(season: int, target_date: str):
@@ -319,21 +364,10 @@ def main(season: int, target_date: str):
     old_plus_money_candidates.extend(_normalize_plus_money_rows(_get_research_rows(old_data, "plus_money_props")))
     old_plus_money_candidates.extend(_normalize_plus_money_rows(_history_rows("plus_money_props", target_date)))
 
-    # Elite Final Card TRUE same-day lock:
-    # Once an Elite play hits the Final Card, it must never be removed before 4 AM ET.
-    # New refreshes may only add new Elite plays if room remains.
-    old_elite_final = _elite_final_rows(old_final_candidates)
-    new_elite_final = _elite_final_rows(_get_final_card_plays(new_data))
-    merged_final = _merge_rows(
-        old_elite_final,
-        new_elite_final,
-        ["slot", "bet_type", "pick", "team", "opponent"],
-    )
-    merged_final = [r for r in merged_final if isinstance(r, dict) and not _is_placeholder(r)][:3]
-    for i, r in enumerate(merged_final, 1):
-        r["slot"] = f"Elite {i}"
-        r["confidence"] = "A+"
-        r["final_card_tier"] = r.get("final_card_tier") or "Elite"
+    # Elite Final Card mode: do NOT carry old same-day Core/Moneyline rows forward.
+    # The Final Card is the official card and should reflect only the latest elite-only gate.
+    # Refined Picks / Plus Money still preserve same-day rows; Final Card is re-filtered.
+    merged_final = _elite_final_rows(_get_final_card_plays(new_data))
     _set_final_card_plays(new_data, merged_final)
 
     merged_refined = _merge_rows(
