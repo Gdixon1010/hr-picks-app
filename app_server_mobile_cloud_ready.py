@@ -969,18 +969,41 @@ def refresh_data():
         today = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
         try:
-            # SAFE APP REFRESH:
-            # Do NOT rebuild picks from the Reload App button.
-            # This endpoint only updates/grades results so an already-locked Final Card
-            # cannot be overwritten by a later empty model run after games have started.
+            # Smart refresh behavior:
+            # - If no Elite Final Card is locked for today, run the model so the phone/app button can create picks.
+            # - If Elite Final Card rows already exist, DO NOT rebuild the model because a late rebuild can wipe the card.
+            # - Always run grading so Results can update safely.
+            history_dir = OUTPUT_DIR / "history"
+            lock_file = history_dir / "final_card_by_date_latest.json"
+            lock_data = read_json_file(lock_file, {})
+            locked_rows = lock_data.get("rows") or []
+            locked_date = str(lock_data.get("target_date") or "")
+
+            has_locked_final_card = (
+                locked_date == today
+                and any(
+                    isinstance(r, dict)
+                    and str(r.get("slot", "")).startswith("Elite")
+                    and str(r.get("confidence", "")) == "A+"
+                    for r in locked_rows
+                )
+            )
+
+            model_ran = False
+            if not has_locked_final_card:
+                run_model_main(2026, today)
+                model_ran = True
+
             auto_grade_result = grade_recent_slates_including_today(season=2026, days_back=4)
             duration = round(time.time() - start_time, 2)
             return JSONResponse({
                 "status": "ok",
-                "message": "Results refreshed. Final Card was not regenerated or overwritten.",
+                "message": "Data refreshed safely. Model only ran if no locked Final Card existed.",
                 "date": today,
                 "timezone": "America/New_York",
                 "duration_seconds": duration,
+                "model_ran": model_ran,
+                "final_card_was_locked": has_locked_final_card,
                 "auto_grade": auto_grade_result,
             })
         except Exception as e:
@@ -1983,7 +2006,7 @@ document.querySelectorAll(".tab").forEach(btn => {
 document.getElementById("reloadBtn").addEventListener("click", async () => {
   const btn = document.getElementById("reloadBtn");
   const old = btn.textContent;
-  btn.textContent = "Updating results...";
+  btn.textContent = "Running model...";
   btn.disabled = true;
   try {
     const res = await fetch("/refresh-data?t=" + Date.now(), { cache: "no-store" });
