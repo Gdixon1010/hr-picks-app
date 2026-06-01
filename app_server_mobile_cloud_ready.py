@@ -969,23 +969,41 @@ def refresh_data():
         today = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
         try:
-            # Phone-safe refresh:
-            # Always run the model so later posted lineups can ADD new Elite plays.
-            # hr_v41_cloud_ready.py now handles the Final Card as append-only:
-            # old Elite rows are preserved, new Elite rows are added if room remains,
-            # and an empty/new placeholder output can never wipe a locked card.
-            run_model_main(2026, today)
+            # Smart refresh behavior:
+            # - If no Elite Final Card is locked for today, run the model so the phone/app button can create picks.
+            # - If Elite Final Card rows already exist, DO NOT rebuild the model because a late rebuild can wipe the card.
+            # - Always run grading so Results can update safely.
+            history_dir = OUTPUT_DIR / "history"
+            lock_file = history_dir / "final_card_by_date_latest.json"
+            lock_data = read_json_file(lock_file, {})
+            locked_rows = lock_data.get("rows") or []
+            locked_date = str(lock_data.get("target_date") or "")
+
+            has_locked_final_card = (
+                locked_date == today
+                and any(
+                    isinstance(r, dict)
+                    and str(r.get("slot", "")).startswith("Elite")
+                    and str(r.get("confidence", "")) == "A+"
+                    for r in locked_rows
+                )
+            )
+
+            model_ran = False
+            if not has_locked_final_card:
+                run_model_main(2026, today)
+                model_ran = True
 
             auto_grade_result = grade_recent_slates_including_today(season=2026, days_back=4)
             duration = round(time.time() - start_time, 2)
             return JSONResponse({
                 "status": "ok",
-                "message": "Data refreshed safely. Model ran and Final Card was protected by append-only v41 lock.",
+                "message": "Data refreshed safely. Model only ran if no locked Final Card existed.",
                 "date": today,
                 "timezone": "America/New_York",
                 "duration_seconds": duration,
-                "model_ran": True,
-                "final_card_protection": "append_only_until_4am",
+                "model_ran": model_ran,
+                "final_card_was_locked": has_locked_final_card,
                 "auto_grade": auto_grade_result,
             })
         except Exception as e:
@@ -1000,6 +1018,7 @@ def refresh_data():
             )
         finally:
             is_refreshing = False
+
 
 
 @app.get("/")
@@ -1289,7 +1308,9 @@ function isStrictNumericColumn(col) {
     "recent_cash_rate",
     "recent_cash_sample",
     "contact_quality_score",
-    "hr_contact_proxy"
+    "hr_contact_proxy",
+    "hr_value_score",
+    "hr_drought_over_avg"
   ]);
   return numericCols.has(String(col || ""));
 }
@@ -1563,15 +1584,30 @@ function displayColumnsForResearch(key, rows) {
       "lineup_status", "batting_order_slot", "market_check", "reason"
     ],
     hr_value_watch: [
-      "playerName", "teamName", "homeRuns", "league_avg_hr_excl_zero", "hr_vs_league_avg",
-      "hr_value_score", "hr_contact_proxy", "hr_value_profile", "avg_games_between_hrs",
-      "current_games_without_hr", "hr_drought_over_avg", "hr_status", "last_hr_date",
-      "park_favorability", "opponent_pitcher", "opponent_pitcher_pick_type",
-      "lineup_status", "batting_order_slot", "hr_value_reason"
+      "hr_watch_tier",
+      "playerName",
+      "teamName",
+      "hr_value_score",
+      "hr_status",
+      "hr_drought_over_avg",
+      "current_games_without_hr",
+      "avg_games_between_hrs",
+      "hr_contact_proxy",
+      "park_favorability",
+      "opponent_pitcher_pick_type",
+      "lineup_status",
+      "batting_order_slot",
+      "last_hr_date",
+      "homeRuns",
+      "hr_value_profile",
+      "opponent_pitcher",
+      "hr_value_reason",
+      "league_avg_hr_excl_zero",
+      "hr_vs_league_avg"
     ]
   };
   const preferred = curated[key] || allColumns;
-  const picked = preferred.filter(c => allColumns.includes(c));
+  const picked = preferred.filter(c => allColumns.includes(c) || (key === "hr_value_watch" && c === "hr_watch_tier"));
   for (const c of allColumns) {
     const lc = String(c).toLowerCase();
     if ((lc.includes("cash") || lc.includes("contact_quality") || lc.includes("hr_contact")) && !picked.includes(c)) picked.push(c);
@@ -1589,9 +1625,69 @@ function formatResearchCell(col, value) {
   return fmt(value);
 }
 
+
+function addHrWatchTier(row) {
+  const score = Number(row?.hr_value_score ?? 0);
+  const overdue = Number(row?.hr_drought_over_avg ?? 0);
+  const park = String(row?.park_favorability ?? "");
+  const pitcher = String(row?.opponent_pitcher_pick_type ?? "");
+  const profile = String(row?.hr_value_profile ?? "");
+
+  let tier = "";
+  let rank = 0;
+
+  if (
+    score >= 5.0 &&
+    overdue >= 5 &&
+    (park === "Favorable" || pitcher === "Short Leash Risk")
+  ) {
+    tier = "🔥 Elite";
+    rank = 3;
+  } else if (
+    score >= 4.5 &&
+    overdue >= 3 &&
+    pitcher !== "Strong SP"
+  ) {
+    tier = "⭐ Strong";
+    rank = 2;
+  } else if (
+    score >= 4.0 &&
+    profile.toLowerCase().includes("value")
+  ) {
+    tier = "✓ Watch";
+    rank = 1;
+  }
+
+  return { ...row, hr_watch_tier: tier, _hr_watch_rank: rank };
+}
+
+function sortHrWatchRows(rows) {
+  return [...rows].sort((a, b) => {
+    const ar = Number(a?._hr_watch_rank ?? 0);
+    const br = Number(b?._hr_watch_rank ?? 0);
+    if (br !== ar) return br - ar;
+
+    const as = Number(a?.hr_value_score ?? 0);
+    const bs = Number(b?.hr_value_score ?? 0);
+    if (bs !== as) return bs - as;
+
+    const ao = Number(a?.hr_drought_over_avg ?? 0);
+    const bo = Number(b?.hr_drought_over_avg ?? 0);
+    if (bo !== ao) return bo - ao;
+
+    return String(a?.playerName || "").localeCompare(String(b?.playerName || ""));
+  });
+}
+
 function openResearchTable(key) {
   CURRENT_RESEARCH_KEY = key;
+  CURRENT_SORT_COLUMN = "";
+  CURRENT_SORT_DIR = "asc";
   CURRENT_RESEARCH_ROWS = APP_DATA?.research?.[key] || [];
+
+  if (key === "hr_value_watch") {
+    CURRENT_RESEARCH_ROWS = sortHrWatchRows(CURRENT_RESEARCH_ROWS.map(addHrWatchTier));
+  }
 
   const rows = CURRENT_RESEARCH_ROWS;
   const mount = document.getElementById("view-research");
@@ -1601,7 +1697,9 @@ function openResearchTable(key) {
   const facets = [];
   const facetColumns = [
     ["Teams", "teamName"],
+    ["Tier", "hr_watch_tier"],
     ["Status", "status"],
+    ["HR Status", "hr_status"],
     ["Park", "park_favorability"],
     ["Opponent Pitcher Type", "opponent_pitcher_pick_type"],
     ["Lineup Status", "lineup_status"]
