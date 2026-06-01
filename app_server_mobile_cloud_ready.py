@@ -969,14 +969,15 @@ def refresh_data():
         today = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
         try:
-            # First build/lock today's latest cards.
-            # Then grade today + recent slates so completed games immediately appear in Results.
-            run_model_main(2026, today)
+            # SAFE APP REFRESH:
+            # Do NOT rebuild picks from the Reload App button.
+            # This endpoint only updates/grades results so an already-locked Final Card
+            # cannot be overwritten by a later empty model run after games have started.
             auto_grade_result = grade_recent_slates_including_today(season=2026, days_back=4)
             duration = round(time.time() - start_time, 2)
             return JSONResponse({
                 "status": "ok",
-                "message": "Data refreshed and results checked",
+                "message": "Results refreshed. Final Card was not regenerated or overwritten.",
                 "date": today,
                 "timezone": "America/New_York",
                 "duration_seconds": duration,
@@ -1982,7 +1983,7 @@ document.querySelectorAll(".tab").forEach(btn => {
 document.getElementById("reloadBtn").addEventListener("click", async () => {
   const btn = document.getElementById("reloadBtn");
   const old = btn.textContent;
-  btn.textContent = "Running model...";
+  btn.textContent = "Updating results...";
   btn.disabled = true;
   try {
     const res = await fetch("/refresh-data?t=" + Date.now(), { cache: "no-store" });
