@@ -969,41 +969,23 @@ def refresh_data():
         today = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
         try:
-            # Smart refresh behavior:
-            # - If no Elite Final Card is locked for today, run the model so the phone/app button can create picks.
-            # - If Elite Final Card rows already exist, DO NOT rebuild the model because a late rebuild can wipe the card.
-            # - Always run grading so Results can update safely.
-            history_dir = OUTPUT_DIR / "history"
-            lock_file = history_dir / "final_card_by_date_latest.json"
-            lock_data = read_json_file(lock_file, {})
-            locked_rows = lock_data.get("rows") or []
-            locked_date = str(lock_data.get("target_date") or "")
-
-            has_locked_final_card = (
-                locked_date == today
-                and any(
-                    isinstance(r, dict)
-                    and str(r.get("slot", "")).startswith("Elite")
-                    and str(r.get("confidence", "")) == "A+"
-                    for r in locked_rows
-                )
-            )
-
-            model_ran = False
-            if not has_locked_final_card:
-                run_model_main(2026, today)
-                model_ran = True
+            # Phone-safe refresh:
+            # Always run the model so later posted lineups can ADD new Elite plays.
+            # hr_v41_cloud_ready.py now handles the Final Card as append-only:
+            # old Elite rows are preserved, new Elite rows are added if room remains,
+            # and an empty/new placeholder output can never wipe a locked card.
+            run_model_main(2026, today)
 
             auto_grade_result = grade_recent_slates_including_today(season=2026, days_back=4)
             duration = round(time.time() - start_time, 2)
             return JSONResponse({
                 "status": "ok",
-                "message": "Data refreshed safely. Model only ran if no locked Final Card existed.",
+                "message": "Data refreshed safely. Model ran and Final Card was protected by append-only v41 lock.",
                 "date": today,
                 "timezone": "America/New_York",
                 "duration_seconds": duration,
-                "model_ran": model_ran,
-                "final_card_was_locked": has_locked_final_card,
+                "model_ran": True,
+                "final_card_protection": "append_only_until_4am",
                 "auto_grade": auto_grade_result,
             })
         except Exception as e:
@@ -1018,7 +1000,6 @@ def refresh_data():
             )
         finally:
             is_refreshing = False
-
 
 
 @app.get("/")
