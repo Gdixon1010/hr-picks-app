@@ -625,6 +625,156 @@ def pct(h, ab):
     except Exception:
         return None
 
+# ------------------------------
+# HITTER HANDEDNESS SPLIT ENGINE V1
+# ------------------------------
+_PLAYER_SPLIT_CACHE = {}
+
+def _safe_float_or_none(value):
+    try:
+        if value is None or pd.isna(value):
+            return None
+        s = str(value).strip()
+        if s in ("", "-", "—", ".---", "nan", "None"):
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+def _parse_avg_value(value):
+    n = _safe_float_or_none(value)
+    if n is None:
+        return None
+    # MLB avg fields usually arrive as ".289" or "0.289". Keep as decimal.
+    if n > 1.0:
+        return round(n / 1000.0, 3) if n > 10 else round(n / 100.0, 3)
+    return round(n, 3)
+
+def _parse_stat_int(stat, key, default=0):
+    try:
+        return int(float(stat.get(key, default) or default))
+    except Exception:
+        return default
+
+def get_hitter_split_vs_pitcher_hand(player_id: int, season: int, pitcher_hand: str | None) -> dict:
+    """Return hitter split stats vs the opposing starter hand.
+
+    Uses MLB Stats API statSplits with sitCodes:
+      - vr = batter vs right-handed pitchers
+      - vl = batter vs left-handed pitchers
+
+    This is used as a small scoring adjustment, not as a hard filter.
+    """
+    safe_pid = safe_int_value(player_id)
+    hand = str(pitcher_hand or "").upper()[:1]
+    if safe_pid is None or hand not in {"R", "L"}:
+        return {
+            "split_pitcher_hand": hand or None,
+            "split_sit_code": None,
+            "split_avg": None,
+            "split_obp": None,
+            "split_slg": None,
+            "split_ops": None,
+            "split_hits": None,
+            "split_at_bats": None,
+            "split_plate_appearances": None,
+            "split_sample_label": "Missing pitcher hand",
+            "split_advantage_label": "Unknown",
+            "split_bonus": 0.0,
+        }
+
+    cache_key = (safe_pid, int(season), hand)
+    if cache_key in _PLAYER_SPLIT_CACHE:
+        return dict(_PLAYER_SPLIT_CACHE[cache_key])
+
+    sit_code = "vr" if hand == "R" else "vl"
+    try:
+        data = get_json(
+            f"https://statsapi.mlb.com/api/v1/people/{safe_pid}/stats",
+            params={
+                "stats": "statSplits",
+                "group": "hitting",
+                "season": season,
+                "gameType": "R",
+                "sitCodes": sit_code,
+            },
+        )
+        stats = data.get("stats") or []
+        splits = stats[0].get("splits", []) if stats else []
+        stat = splits[0].get("stat") if splits else {}
+    except Exception:
+        stat = {}
+
+    hits = _parse_stat_int(stat, "hits", 0)
+    ab = _parse_stat_int(stat, "atBats", 0)
+    walks = _parse_stat_int(stat, "baseOnBalls", 0)
+    hbp = _parse_stat_int(stat, "hitByPitch", 0)
+    sf = _parse_stat_int(stat, "sacFlies", 0)
+    pa = ab + walks + hbp + sf
+
+    split_avg = _parse_avg_value(stat.get("avg"))
+    if split_avg is None and ab > 0:
+        split_avg = round(hits / ab, 3)
+
+    split_obp = _parse_avg_value(stat.get("obp"))
+    split_slg = _parse_avg_value(stat.get("slg"))
+    split_ops = _parse_avg_value(stat.get("ops"))
+    if split_ops is None and split_obp is not None and split_slg is not None:
+        split_ops = round(split_obp + split_slg, 3)
+
+    # Conservative sample-aware bonus. This is intentionally small so it refines
+    # the existing model instead of overpowering recent form/lineup/contact.
+    bonus = 0.0
+    if pa < 20 or split_avg is None:
+        sample_label = "Low/No split sample"
+        adv = "Unknown"
+    else:
+        sample_label = "Usable split sample" if pa >= 40 else "Small split sample"
+        if split_avg >= 0.300:
+            bonus += 0.35
+            adv = "Strong advantage"
+        elif split_avg >= 0.275:
+            bonus += 0.22
+            adv = "Advantage"
+        elif split_avg >= 0.250:
+            bonus += 0.08
+            adv = "Slight advantage"
+        elif split_avg < 0.200:
+            bonus -= 0.30
+            adv = "Disadvantage"
+        elif split_avg < 0.225:
+            bonus -= 0.15
+            adv = "Slight disadvantage"
+        else:
+            adv = "Neutral"
+
+        if split_ops is not None:
+            if split_ops >= 0.850:
+                bonus += 0.12
+            elif split_ops < 0.650:
+                bonus -= 0.10
+
+        if pa < 40:
+            bonus *= 0.60
+
+    result = {
+        "split_pitcher_hand": hand,
+        "split_sit_code": sit_code,
+        "split_avg": split_avg,
+        "split_obp": split_obp,
+        "split_slg": split_slg,
+        "split_ops": split_ops,
+        "split_hits": hits if stat else None,
+        "split_at_bats": ab if stat else None,
+        "split_plate_appearances": pa if stat else None,
+        "split_sample_label": sample_label,
+        "split_advantage_label": adv,
+        "split_bonus": round(max(min(bonus, 0.45), -0.35), 3),
+    }
+    _PLAYER_SPLIT_CACHE[cache_key] = dict(result)
+    return result
+
+
 def normalize_name(v: str) -> str:
     if v is None:
         return ""
@@ -1319,6 +1469,10 @@ def add_contact_quality_engine(player_rows: pd.DataFrame) -> pd.DataFrame:
         "Strong SP": -0.75,
     }).fillna(0.0)
 
+    # Handedness split is a precision layer, not a main driver.
+    split_bonus = num("split_bonus")
+    contact_score += split_bonus.clip(lower=-0.25, upper=0.30) * 0.40
+
     # Penalize cold/volatile profiles so they do not feel random.
     cold_penalty = ((hit10 < 60).astype(int) * 0.45) + ((hit5 <= 40).astype(int) * 0.35) + ((streak == 0).astype(int) * 0.15)
     contact_score = (contact_score - cold_penalty).round(3)
@@ -1543,6 +1697,7 @@ def build_hit_hr_rows(pool_df: pd.DataFrame, season: int, sched_ctx: dict) -> pd
         contact_momentum = contact_momentum_bonus(hit_pct_last_5, hit_pct_last_10, current_hit_streak)
         ctx = sched_ctx.get(row["teamName"], {})
         season_hit_pct = pct(row["hits"], row.get("atBats", 0))
+        split_ctx = get_hitter_split_vs_pitcher_hand(row["playerId"], season, ctx.get("opp_pitcher_hand"))
         slot_raw = row.get("batting_order_slot")
         slot = 9 if pd.isna(slot_raw) else int(slot_raw)
         lineup_bonus = max(0, 10 - slot) * 0.12
@@ -1552,9 +1707,10 @@ def build_hit_hr_rows(pool_df: pd.DataFrame, season: int, sched_ctx: dict) -> pd
         hr_vol_penalty = get_volatility_penalty(row["teamName"], "hr")
         hr_public_penalty = get_public_bias_penalty(row["teamName"], "hr")
         hr_score_raw = (row["homeRuns"] / max(row["gamesPlayed"], 1) * 10 * 0.40) + (overdue_value(hr_status) * 0.25) + (park_value(ctx.get("park_favorability")) * 0.20) + lineup_bonus
+        split_bonus = nz(split_ctx.get("split_bonus"), 0.0)
         hit_score_raw = (nz(season_hit_pct) / 10.0 * 0.40) + (nz(hit_pct_last_10) / 10.0 * 0.20) + (park_value(ctx.get("park_favorability")) * 0.05) + lineup_bonus + contact_momentum
         hr_score = round(hr_score_raw - hr_vol_penalty - hr_public_penalty, 3)
-        hit_score = round(hit_score_raw - hit_vol_penalty, 3)
+        hit_score = round(hit_score_raw - hit_vol_penalty + split_bonus, 3)
         rows.append({
             "season": season, "teamName": row["teamName"], "playerName": row["playerName"], "playerId": row["playerId"],
             "homeRuns": row["homeRuns"], "gamesPlayed": row["gamesPlayed"], "totalHits": row["hits"],
@@ -1568,6 +1724,17 @@ def build_hit_hr_rows(pool_df: pd.DataFrame, season: int, sched_ctx: dict) -> pd
             "run_last10_pct": run_last10_pct, "rbi_last10_pct": rbi_last10_pct,
             "season_hit_pct": season_hit_pct,
             "auto_pitcher_name": ctx.get("opp_pitcher_name"), "auto_pitcher_hand": ctx.get("opp_pitcher_hand"),
+            "split_pitcher_hand": split_ctx.get("split_pitcher_hand"),
+            "split_avg": split_ctx.get("split_avg"),
+            "split_obp": split_ctx.get("split_obp"),
+            "split_slg": split_ctx.get("split_slg"),
+            "split_ops": split_ctx.get("split_ops"),
+            "split_hits": split_ctx.get("split_hits"),
+            "split_at_bats": split_ctx.get("split_at_bats"),
+            "split_plate_appearances": split_ctx.get("split_plate_appearances"),
+            "split_sample_label": split_ctx.get("split_sample_label"),
+            "split_advantage_label": split_ctx.get("split_advantage_label"),
+            "split_bonus": split_ctx.get("split_bonus"),
             "park_favorability": ctx.get("park_favorability"), "game_park_team": ctx.get("game_park_team"),
             "game_park_name": ctx.get("game_park_name"),
             "HR_score_raw": round(hr_score_raw, 3), "Hit_score_raw": round(hit_score_raw, 3),
@@ -1655,7 +1822,7 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
     - If lineups are confirmed, prioritizes confirmed starters in slots 1-6.
     - If lineups are not available yet, allows only stronger projected hitters.
     """
-    cols = ["category","bet_type","playerName","teamName","game","opponent_pitcher","opponent_pitcher_team","opponent_pitcher_pick_type","opponent_pitcher_sample","lineup_status","batting_order_slot","starter_only_flag","HR_score","Hit_score","contact_quality_score","hit_quality_label","hit_pct_last_10","hit_pct_last_5","current_hit_streak","recent_cash_rate","recent_cash_record","recent_cash_sample","recent_cash_last_10","confidence","park_favorability","stack_tag","reason"]
+    cols = ["category","bet_type","playerName","teamName","game","opponent_pitcher","opponent_pitcher_team","opponent_pitcher_pick_type","opponent_pitcher_sample","lineup_status","batting_order_slot","starter_only_flag","HR_score","Hit_score","contact_quality_score","hit_quality_label","hit_pct_last_10","hit_pct_last_5","current_hit_streak","split_pitcher_hand","split_avg","split_ops","split_plate_appearances","split_advantage_label","split_bonus","recent_cash_rate","recent_cash_record","recent_cash_sample","recent_cash_last_10","confidence","park_favorability","stack_tag","reason"]
 
     if player_rows is None or player_rows.empty or pitcher_metrics is None or pitcher_metrics.empty:
         return pd.DataFrame([{"category":"Info","bet_type":"No Plays","reason":"No refined picks met today’s filters"}], columns=cols)
@@ -1772,6 +1939,12 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
             "hit_pct_last_10":r.get("hit_pct_last_10"),
             "hit_pct_last_5":r.get("hit_pct_last_5"),
             "current_hit_streak":r.get("current_hit_streak"),
+            "split_pitcher_hand":r.get("split_pitcher_hand"),
+            "split_avg":r.get("split_avg"),
+            "split_ops":r.get("split_ops"),
+            "split_plate_appearances":r.get("split_plate_appearances"),
+            "split_advantage_label":r.get("split_advantage_label"),
+            "split_bonus":r.get("split_bonus"),
             "recent_cash_rate":r.get("recent_cash_rate"),
             "recent_cash_record":r.get("recent_cash_record"),
             "recent_cash_sample":r.get("recent_cash_sample"),
@@ -1779,7 +1952,7 @@ def build_refined_picks(player_rows, pitcher_metrics, game_rankings):
             "confidence":r.get("confidence"),
             "park_favorability":r.get("park_favorability"),
             "stack_tag":"Rolling refined",
-            "reason":f"Rolling refined max2/game max10 {mode_label}; Hit_score {score:.3f}; contact {r.get('contact_quality_score')}; L10 hit {r.get('hit_pct_last_10')}%; slot {r.get('batting_order_slot')}; opp {r.get('opponent_pitcher_pick_type')}; edge {r.get('edge_vs_opponent')}",
+            "reason":f"Rolling refined max2/game max10 {mode_label}; Hit_score {score:.3f}; contact {r.get('contact_quality_score')}; L10 hit {r.get('hit_pct_last_10')}%; slot {r.get('batting_order_slot')}; split vs {r.get('split_pitcher_hand')}HP avg {r.get('split_avg')} ({r.get('split_advantage_label')}, bonus {r.get('split_bonus')}); opp {r.get('opponent_pitcher_pick_type')}; edge {r.get('edge_vs_opponent')}",
         })
 
     return pd.DataFrame(picks, columns=cols)
@@ -2487,6 +2660,12 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
             ("recent_cash_rate", None),
             ("park_favorability", "Neutral"),
             ("totalHits", 0),
+            ("split_pitcher_hand", None),
+            ("split_avg", None),
+            ("split_ops", None),
+            ("split_plate_appearances", None),
+            ("split_advantage_label", "Unknown"),
+            ("split_bonus", 0),
         ]:
             if c not in base.columns:
                 base[c] = default
@@ -2525,6 +2704,7 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
                 + hit_pool["contact_quality_num"] * 0.35
                 + (hit_pool["hit_l10_num"] / 100.0) * 0.80
                 + hit_pool["recent_cash_for_sort"] * 0.60
+                + pd.to_numeric(hit_pool.get("split_bonus"), errors="coerce").fillna(0) * 0.75
                 + hit_pool["streak_num"].clip(upper=5) * 0.08
                 - hit_pool["slot_num"] * 0.05
             ).round(3)
@@ -2553,6 +2733,8 @@ def build_final_card(player_rows, game_rankings, pitcher_line_value):
                         f"Elite hit gate; Hit_score {r.get('Hit_score_num'):.3f}; contact {r.get('contact_quality_num'):.2f}; "
                         f"L10 hit {r.get('hit_l10_num')}%; slot {int(r.get('slot_num'))}; "
                         f"recent cash {round(float(r.get('recent_cash_num') or 0)*100,1)}%; "
+                        f"split vs {r.get('split_pitcher_hand')}HP avg {r.get('split_avg')} "
+                        f"({r.get('split_advantage_label')}, bonus {r.get('split_bonus')}); "
                         f"opp {r.get('opponent_pitcher_pick_type')}; park {r.get('park_favorability')}"
                     ),
                     "Elite_Final_Hit_Model",
@@ -2774,7 +2956,7 @@ def main(season: int, target_date: str):
             top_hr = preferred_hr.sort_values(["hr_value_score","hr_drought_over_avg","HR_score"], ascending=[False, False, False]).head(10)[hr_cols].copy()
             top_hr.insert(0, "type", "HR")
 
-            hit_cols = [c for c in ["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","Hit_score","contact_quality_score","hit_quality_label","hit_pct_last_10","hit_pct_last_5","current_hit_streak","contact_momentum_bonus","batting_order_slot","lineup_status","starter_only_flag"] if c in player_rows.columns]
+            hit_cols = [c for c in ["playerName","teamName","auto_pitcher_name","auto_pitcher_hand","split_avg","split_ops","split_plate_appearances","split_advantage_label","split_bonus","Hit_score","contact_quality_score","hit_quality_label","hit_pct_last_10","hit_pct_last_5","current_hit_streak","contact_momentum_bonus","batting_order_slot","lineup_status","starter_only_flag"] if c in player_rows.columns]
             top_hit = player_rows.nlargest(10, "Hit_score")[hit_cols].copy()
             top_hit.insert(0, "type", "HIT")
         top_picks = pd.concat([top_hr, top_hit], ignore_index=True)
