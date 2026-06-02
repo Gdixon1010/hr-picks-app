@@ -274,9 +274,13 @@ def _merge_final_card_append_only(old_rows: list, new_rows: list, max_rows: int 
 def _refined_to_elite_final_rows(data: dict) -> list:
     """Promote qualified Refined Picks into Elite Final Card when v40 final_card is empty/placeholder.
 
-    This is a fallback only. It uses the same strict Elite hit gate:
-    Confirmed Starter, batting 1-5, Hit_score >= 5.00, contact >= 3.40,
-    L10 hit >= 80%, recent cash >= 70%, and opponent is not Strong SP.
+    Recalibrated from results audit:
+    - Refined 1+ Hit confidence A has outperformed A+ historically.
+    - B has also performed strongly.
+    - Therefore fallback ranking prioritizes A first, then B, then A+.
+
+    Still keeps a strict safety gate: 1+ Hit only, confirmed top-5 starter,
+    strong contact/form, 70%+ recent cash rate, and no Strong SP.
     """
     rows = _get_research_rows(data, "refined_picks")
     out = []
@@ -289,17 +293,27 @@ def _refined_to_elite_final_rows(data: dict) -> list:
         except Exception:
             return default
 
+    def confidence_rank(row: dict) -> int:
+        # Results audit showed Refined 1+ Hit A > B > A+ for consistency.
+        conf = str(row.get("confidence") or "").strip()
+        return {"A": 0, "B": 1, "A+": 2}.get(conf, 9)
+
     candidates = []
     for r in _rows(rows):
         if not isinstance(r, dict) or _is_placeholder(r):
             continue
         if str(r.get("bet_type") or "") != "1+ Hit":
             continue
+
+        conf = str(r.get("confidence") or "").strip()
+        if conf not in {"A", "B", "A+"}:
+            continue
+
         lineup = str(r.get("lineup_status") or "")
         slot = num(r.get("batting_order_slot"), 99)
         if lineup != "Confirmed Starter" or slot > 5:
             continue
-        if num(r.get("Hit_score")) < 5.00:
+        if num(r.get("Hit_score")) < 4.50:
             continue
         if num(r.get("contact_quality_score")) < 3.40:
             continue
@@ -314,37 +328,45 @@ def _refined_to_elite_final_rows(data: dict) -> list:
     candidates = sorted(
         candidates,
         key=lambda r: (
-            num(r.get("Hit_score")),
-            num(r.get("contact_quality_score")),
-            num(r.get("hit_pct_last_10")),
-            num(r.get("recent_cash_rate")),
-            -num(r.get("batting_order_slot"), 99),
+            confidence_rank(r),                 # A first, then B, then A+
+            -num(r.get("recent_cash_rate")),
+            -num(r.get("hit_pct_last_10")),
+            -num(r.get("contact_quality_score")),
+            -num(r.get("Hit_score")),
+            num(r.get("batting_order_slot"), 99),
         ),
-        reverse=True,
     )
 
     used_teams = set()
+    used_players = set()
     for r in candidates:
         team = r.get("teamName")
-        if team in used_teams:
+        player = r.get("playerName")
+        player_key = (_norm(team), _norm(player))
+        if team in used_teams or player_key in used_players:
             continue
         used_teams.add(team)
+        used_players.add(player_key)
+
+        original_conf = str(r.get("confidence") or "").strip() or "Unknown"
         out.append({
             "slot": f"Elite {len(out) + 1}",
             "bet_type": "1+ Hit",
-            "pick": r.get("playerName"),
+            "pick": player,
             "team": team,
             "opponent": r.get("opponentTeam") or r.get("opponent_pitcher_team"),
             "confidence": "A+",
+            "model_profile_confidence": original_conf,
             "why_it_made_the_card": (
-                f"Elite refined fallback; Hit_score {r.get('Hit_score')}; "
+                f"Recalibrated elite refined fallback; profile confidence {original_conf}; "
+                f"Hit_score {r.get('Hit_score')}; "
                 f"contact {r.get('contact_quality_score')}; "
                 f"L10 hit {r.get('hit_pct_last_10')}%; "
                 f"slot {r.get('batting_order_slot')}; "
                 f"recent cash {r.get('recent_cash_rate')}; "
                 f"opp {r.get('opponent_pitcher_pick_type')}"
             ),
-            "source_tab": "Refined_Picks",
+            "source_tab": "Refined_Picks_Recalibrated",
             "final_card_tier": "Elite",
         })
         if len(out) >= 3:
