@@ -17,7 +17,6 @@ app = FastAPI()
 # Server-side refresh lock: prevents multiple users from running the model at the same time.
 refresh_lock = Lock()
 is_refreshing = False
-refresh_started_at = None
 
 
 def resolve_storage_dir() -> Path:
@@ -948,75 +947,39 @@ def grade_results(date: str | None = None):
 
 @app.get("/refresh-data")
 def refresh_data():
-    global is_refreshing, refresh_started_at
-
-    now_ts = time.time()
-    stale_after_seconds = 20 * 60  # 20 minutes
-
-    # If a prior refresh got stuck, release the in-memory lock so the phone button works again.
-    if is_refreshing and refresh_started_at:
-        age = now_ts - refresh_started_at
-        if age > stale_after_seconds:
-            print(f"⚠️ Stale refresh lock cleared after {round(age, 1)} seconds")
-            is_refreshing = False
-            refresh_started_at = None
+    global is_refreshing
 
     if is_refreshing:
-        age = round(now_ts - refresh_started_at, 1) if refresh_started_at else None
         return JSONResponse({
             "status": "busy",
             "message": "Refresh already in progress. Please wait a few minutes, then click Reload App again.",
             "timezone": "America/New_York",
-            "refresh_age_seconds": age,
         })
 
     with refresh_lock:
-        now_ts = time.time()
-        if is_refreshing and refresh_started_at:
-            age = now_ts - refresh_started_at
-            if age > stale_after_seconds:
-                print(f"⚠️ Stale refresh lock cleared inside lock after {round(age, 1)} seconds")
-                is_refreshing = False
-                refresh_started_at = None
-
         if is_refreshing:
-            age = round(now_ts - refresh_started_at, 1) if refresh_started_at else None
             return JSONResponse({
                 "status": "busy",
                 "message": "Refresh already in progress. Please wait a few minutes, then click Reload App again.",
                 "timezone": "America/New_York",
-                "refresh_age_seconds": age,
             })
 
         is_refreshing = True
         start_time = time.time()
-        refresh_started_at = start_time
         today = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
-        started_at_et = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ")
 
         try:
-            print(f"🔄 App refresh started at {started_at_et}")
-            # Phone-safe refresh:
-            # Always run the model so later posted lineups can ADD new Elite plays.
-            # hr_v41_cloud_ready.py handles the Final Card as append-only:
-            # old Elite rows are preserved, new Elite rows are added if room remains,
-            # and an empty/new placeholder output can never wipe a locked card.
+            # First build/lock today's latest cards.
+            # Then grade today + recent slates so completed games immediately appear in Results.
             run_model_main(2026, today)
-
             auto_grade_result = grade_recent_slates_including_today(season=2026, days_back=4)
             duration = round(time.time() - start_time, 2)
-            finished_at_et = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ")
-            print(f"✅ App refresh finished at {finished_at_et} in {duration}s")
             return JSONResponse({
                 "status": "ok",
-                "message": "Data refreshed safely. Model ran and Final Card was protected by append-only v41 lock.",
+                "message": "Data refreshed and results checked",
                 "date": today,
                 "timezone": "America/New_York",
-                "started_at_et": started_at_et,
-                "finished_at_et": finished_at_et,
                 "duration_seconds": duration,
-                "model_ran": True,
-                "final_card_protection": "append_only_until_4am",
                 "auto_grade": auto_grade_result,
             })
         except Exception as e:
@@ -1027,12 +990,10 @@ def refresh_data():
                     "message": str(e),
                     "date": today,
                     "timezone": "America/New_York",
-                    "started_at_et": started_at_et,
                 },
             )
         finally:
             is_refreshing = False
-            refresh_started_at = None
 
 
 
@@ -1323,7 +1284,11 @@ function isStrictNumericColumn(col) {
     "recent_cash_rate",
     "recent_cash_sample",
     "contact_quality_score",
-    "hr_contact_proxy"
+    "hr_contact_proxy",
+    "split_avg",
+    "split_ops",
+    "split_plate_appearances",
+    "split_bonus"
   ]);
   return numericCols.has(String(col || ""));
 }
@@ -1576,8 +1541,9 @@ function displayColumnsForResearch(key, rows) {
   const allColumns = rows.length ? Object.keys(rows[0]) : [];
   const curated = {
     top_picks: [
-      "type", "playerName", "teamName", "auto_pitcher_name", "opponent_pitcher",
+      "type", "playerName", "teamName", "auto_pitcher_name", "auto_pitcher_hand", "opponent_pitcher",
       "lineup_status", "batting_order_slot", "Hit_score", "contact_quality_score", "hit_quality_label",
+      "split_avg", "split_ops", "split_plate_appearances", "split_advantage_label", "split_bonus",
       "hit_pct_last_10", "HR_score", "hr_contact_proxy", "homeRuns", "league_avg_hr_excl_zero",
       "hr_value_score", "recent_cash_rate", "recent_cash_record", "recent_cash_sample", "recent_cash_last_10",
       "park_favorability", "opponent_pitcher_pick_type", "hr_value_profile", "reason", "hr_value_reason"
@@ -1586,6 +1552,7 @@ function displayColumnsForResearch(key, rows) {
       "category", "bet_type", "playerName", "teamName", "game", "opponent_pitcher",
       "opponent_pitcher_team", "opponent_pitcher_pick_type", "lineup_status",
       "batting_order_slot", "Hit_score", "contact_quality_score", "hit_quality_label",
+      "split_pitcher_hand", "split_avg", "split_ops", "split_plate_appearances", "split_advantage_label", "split_bonus",
       "hit_pct_last_10", "hit_pct_last_5", "current_hit_streak",
       "recent_cash_rate", "recent_cash_record", "recent_cash_sample", "recent_cash_last_10",
       "park_favorability", "stack_tag", "reason"
