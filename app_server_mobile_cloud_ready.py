@@ -1985,28 +1985,64 @@ document.querySelectorAll(".tab").forEach(btn => {
   btn.addEventListener("click", () => switchView(btn.dataset.view));
 });
 
+async function fetchJsonWithTimeout(url, timeoutMs = 900000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { cache: "no-store", signal: controller.signal });
+    const payload = await res.json().catch(() => ({}));
+    return { res, payload };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function refreshLatestAfterModel(btn) {
+  btn.textContent = "Loading latest picks...";
+
+  // Give Render/disk a brief moment to expose the newly-written JSON,
+  // then retry /latest a few times so the phone app updates without a manual page refresh.
+  for (let i = 0; i < 6; i++) {
+    try {
+      await loadData();
+      return true;
+    } catch (err) {
+      console.warn("/latest reload attempt failed", i + 1, err);
+      await new Promise(resolve => setTimeout(resolve, 1500));
+    }
+  }
+  return false;
+}
+
 document.getElementById("reloadBtn").addEventListener("click", async () => {
   const btn = document.getElementById("reloadBtn");
-  const old = btn.textContent;
+  const old = "Reload App";
   btn.textContent = "Running model...";
   btn.disabled = true;
+
   try {
-    const res = await fetch("/refresh-data?t=" + Date.now(), { cache: "no-store" });
-    const payload = await res.json().catch(() => ({}));
+    const { res, payload } = await fetchJsonWithTimeout("/refresh-data?t=" + Date.now(), 900000);
+
     if (payload.status === "busy") {
-      alert(payload.message || "Refresh already in progress. Please wait a few minutes.");
-      btn.textContent = "Loading app...";
-      await loadData();
+      btn.textContent = "Refresh already running...";
+      await refreshLatestAfterModel(btn);
+      alert(payload.message || "Refresh already in progress. The app has reloaded the latest available picks.");
       return;
     }
+
     if (!res.ok || payload.status === "error") {
       throw new Error(payload.message || `Refresh failed: ${res.status}`);
     }
-    btn.textContent = "Loading app...";
-    await loadData();
+
+    await refreshLatestAfterModel(btn);
   } catch (err) {
     console.error(err);
-    alert("Refresh failed. Check Render logs for details. " + (err?.message || err));
+    if (err?.name === "AbortError") {
+      alert("Refresh is taking longer than expected. The model may still be running on Render. The app will reload the latest available data now.");
+      await refreshLatestAfterModel(btn);
+    } else {
+      alert("Refresh failed. Check Render logs for details. " + (err?.message || err));
+    }
   } finally {
     btn.textContent = old;
     btn.disabled = false;
