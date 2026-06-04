@@ -17,6 +17,7 @@ app = FastAPI()
 # Server-side refresh lock: prevents multiple users from running the model at the same time.
 refresh_lock = Lock()
 is_refreshing = False
+refresh_started_at = None
 
 
 def resolve_storage_dir() -> Path:
@@ -947,39 +948,75 @@ def grade_results(date: str | None = None):
 
 @app.get("/refresh-data")
 def refresh_data():
-    global is_refreshing
+    global is_refreshing, refresh_started_at
+
+    now_ts = time.time()
+    stale_after_seconds = 20 * 60  # 20 minutes
+
+    # If a prior refresh got stuck, release the in-memory lock so the phone button works again.
+    if is_refreshing and refresh_started_at:
+        age = now_ts - refresh_started_at
+        if age > stale_after_seconds:
+            print(f"⚠️ Stale refresh lock cleared after {round(age, 1)} seconds")
+            is_refreshing = False
+            refresh_started_at = None
 
     if is_refreshing:
+        age = round(now_ts - refresh_started_at, 1) if refresh_started_at else None
         return JSONResponse({
             "status": "busy",
             "message": "Refresh already in progress. Please wait a few minutes, then click Reload App again.",
             "timezone": "America/New_York",
+            "refresh_age_seconds": age,
         })
 
     with refresh_lock:
+        now_ts = time.time()
+        if is_refreshing and refresh_started_at:
+            age = now_ts - refresh_started_at
+            if age > stale_after_seconds:
+                print(f"⚠️ Stale refresh lock cleared inside lock after {round(age, 1)} seconds")
+                is_refreshing = False
+                refresh_started_at = None
+
         if is_refreshing:
+            age = round(now_ts - refresh_started_at, 1) if refresh_started_at else None
             return JSONResponse({
                 "status": "busy",
                 "message": "Refresh already in progress. Please wait a few minutes, then click Reload App again.",
                 "timezone": "America/New_York",
+                "refresh_age_seconds": age,
             })
 
         is_refreshing = True
         start_time = time.time()
+        refresh_started_at = start_time
         today = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+        started_at_et = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ")
 
         try:
-            # First build/lock today's latest cards.
-            # Then grade today + recent slates so completed games immediately appear in Results.
+            print(f"🔄 App refresh started at {started_at_et}")
+            # Phone-safe refresh:
+            # Always run the model so later posted lineups can ADD new Elite plays.
+            # hr_v41_cloud_ready.py handles the Final Card as append-only:
+            # old Elite rows are preserved, new Elite rows are added if room remains,
+            # and an empty/new placeholder output can never wipe a locked card.
             run_model_main(2026, today)
+
             auto_grade_result = grade_recent_slates_including_today(season=2026, days_back=4)
             duration = round(time.time() - start_time, 2)
+            finished_at_et = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ")
+            print(f"✅ App refresh finished at {finished_at_et} in {duration}s")
             return JSONResponse({
                 "status": "ok",
-                "message": "Data refreshed and results checked",
+                "message": "Data refreshed safely. Model ran and Final Card was protected by append-only v41 lock.",
                 "date": today,
                 "timezone": "America/New_York",
+                "started_at_et": started_at_et,
+                "finished_at_et": finished_at_et,
                 "duration_seconds": duration,
+                "model_ran": True,
+                "final_card_protection": "append_only_until_4am",
                 "auto_grade": auto_grade_result,
             })
         except Exception as e:
@@ -990,10 +1027,12 @@ def refresh_data():
                     "message": str(e),
                     "date": today,
                     "timezone": "America/New_York",
+                    "started_at_et": started_at_et,
                 },
             )
         finally:
             is_refreshing = False
+            refresh_started_at = None
 
 
 
@@ -1284,11 +1323,7 @@ function isStrictNumericColumn(col) {
     "recent_cash_rate",
     "recent_cash_sample",
     "contact_quality_score",
-    "hr_contact_proxy",
-    "split_avg",
-    "split_ops",
-    "split_plate_appearances",
-    "split_bonus"
+    "hr_contact_proxy"
   ]);
   return numericCols.has(String(col || ""));
 }
@@ -1427,6 +1462,9 @@ function renderFinal() {
   }
   mount.innerHTML = '<div class="cards">' + plays.map(p => {
     const insight = buildModelInsight(p);
+    const slotText = String(p.slot || p.play_type || p.section || "");
+    const cardTier = p.final_card_tier || (slotText.startsWith("Elite") ? "Elite" : (p.confidence || "—"));
+    const profileGrade = p.model_profile_confidence || p.profile_confidence || p.confidence || "—";
     return `
     <div class="card">
       <div class="pill">${esc(fmt(p.slot || p.play_type || p.section || "Play"))}</div>
@@ -1434,7 +1472,7 @@ function renderFinal() {
       <div class="line"><span class="label">Bet Type:</span> ${esc(fmt(p.bet_type))}</div>
       <div class="line"><span class="label">Team:</span> ${esc(fmt(p.team || p.teamName))}</div>
       <div class="line"><span class="label">Opponent:</span> ${esc(fmt(p.opponent || p.opponentTeam))}</div>
-      <div class="line"><span class="label">Confidence:</span> ${esc(fmt(p.confidence))}</div>
+      <div class="line"><span class="label">Card Tier:</span> ${esc(fmt(cardTier))}</div>\n      <div class="line"><span class="label">Profile Grade:</span> ${esc(fmt(profileGrade))}</div>
       <div class="kicker">${esc(fmt(p.why_it_made_the_card || p.reason))}</div>
       <div class="line"><span class="label">Model Insight:</span> ${esc(fmt(insight))}</div>
       <div class="muted">Source: ${esc(fmt(p.source_tab))}</div>
@@ -1541,9 +1579,8 @@ function displayColumnsForResearch(key, rows) {
   const allColumns = rows.length ? Object.keys(rows[0]) : [];
   const curated = {
     top_picks: [
-      "type", "playerName", "teamName", "auto_pitcher_name", "auto_pitcher_hand", "opponent_pitcher",
+      "type", "playerName", "teamName", "auto_pitcher_name", "opponent_pitcher",
       "lineup_status", "batting_order_slot", "Hit_score", "contact_quality_score", "hit_quality_label",
-      "split_avg", "split_ops", "split_plate_appearances", "split_advantage_label", "split_bonus",
       "hit_pct_last_10", "HR_score", "hr_contact_proxy", "homeRuns", "league_avg_hr_excl_zero",
       "hr_value_score", "recent_cash_rate", "recent_cash_record", "recent_cash_sample", "recent_cash_last_10",
       "park_favorability", "opponent_pitcher_pick_type", "hr_value_profile", "reason", "hr_value_reason"
@@ -1552,7 +1589,6 @@ function displayColumnsForResearch(key, rows) {
       "category", "bet_type", "playerName", "teamName", "game", "opponent_pitcher",
       "opponent_pitcher_team", "opponent_pitcher_pick_type", "lineup_status",
       "batting_order_slot", "Hit_score", "contact_quality_score", "hit_quality_label",
-      "split_pitcher_hand", "split_avg", "split_ops", "split_plate_appearances", "split_advantage_label", "split_bonus",
       "hit_pct_last_10", "hit_pct_last_5", "current_hit_streak",
       "recent_cash_rate", "recent_cash_record", "recent_cash_sample", "recent_cash_last_10",
       "park_favorability", "stack_tag", "reason"
@@ -1985,64 +2021,28 @@ document.querySelectorAll(".tab").forEach(btn => {
   btn.addEventListener("click", () => switchView(btn.dataset.view));
 });
 
-async function fetchJsonWithTimeout(url, timeoutMs = 900000) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { cache: "no-store", signal: controller.signal });
-    const payload = await res.json().catch(() => ({}));
-    return { res, payload };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function refreshLatestAfterModel(btn) {
-  btn.textContent = "Loading latest picks...";
-
-  // Give Render/disk a brief moment to expose the newly-written JSON,
-  // then retry /latest a few times so the phone app updates without a manual page refresh.
-  for (let i = 0; i < 6; i++) {
-    try {
-      await loadData();
-      return true;
-    } catch (err) {
-      console.warn("/latest reload attempt failed", i + 1, err);
-      await new Promise(resolve => setTimeout(resolve, 1500));
-    }
-  }
-  return false;
-}
-
 document.getElementById("reloadBtn").addEventListener("click", async () => {
   const btn = document.getElementById("reloadBtn");
-  const old = "Reload App";
+  const old = btn.textContent;
   btn.textContent = "Running model...";
   btn.disabled = true;
-
   try {
-    const { res, payload } = await fetchJsonWithTimeout("/refresh-data?t=" + Date.now(), 900000);
-
+    const res = await fetch("/refresh-data?t=" + Date.now(), { cache: "no-store" });
+    const payload = await res.json().catch(() => ({}));
     if (payload.status === "busy") {
-      btn.textContent = "Refresh already running...";
-      await refreshLatestAfterModel(btn);
-      alert(payload.message || "Refresh already in progress. The app has reloaded the latest available picks.");
+      alert(payload.message || "Refresh already in progress. Please wait a few minutes.");
+      btn.textContent = "Loading app...";
+      await loadData();
       return;
     }
-
     if (!res.ok || payload.status === "error") {
       throw new Error(payload.message || `Refresh failed: ${res.status}`);
     }
-
-    await refreshLatestAfterModel(btn);
+    btn.textContent = "Loading app...";
+    await loadData();
   } catch (err) {
     console.error(err);
-    if (err?.name === "AbortError") {
-      alert("Refresh is taking longer than expected. The model may still be running on Render. The app will reload the latest available data now.");
-      await refreshLatestAfterModel(btn);
-    } else {
-      alert("Refresh failed. Check Render logs for details. " + (err?.message || err));
-    }
+    alert("Refresh failed. Check Render logs for details. " + (err?.message || err));
   } finally {
     btn.textContent = old;
     btn.disabled = false;
