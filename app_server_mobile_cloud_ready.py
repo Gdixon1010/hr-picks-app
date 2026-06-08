@@ -566,6 +566,43 @@ def _grade_k_prop(row: dict, target_date: str, season: int) -> tuple[str, str]:
 
 
 
+
+def _grade_over_season_avg_k_prop(row: dict, target_date: str, season: int) -> tuple[str, str]:
+    """Grade the new K Edge prop by comparing actual Ks to the pitcher's own season average.
+
+    This replaces misleading 5+ K tracking. A win means the pitcher finished above
+    his season K/start average. The actual sportsbook line should still be checked
+    manually before betting.
+    """
+    player = str(row.get("pick") or row.get("pitcherName") or row.get("playerName") or "").strip()
+    team = str(row.get("team") or row.get("teamName") or "").strip()
+    if not player:
+        return "Unable to Grade", "Missing pitcher"
+    pending, reason = _pending_if_game_not_final(row, target_date)
+    if pending:
+        return "Pending", reason
+    stat = _boxscore_player_stat_by_name(target_date, player, "pitching", team_name=team)
+    if stat is None:
+        pid = row.get("playerId") or (_find_player_id_on_team(player, team, season) if team else None)
+        if pid:
+            stat = _player_game_log_for_date(int(pid), "pitching", season, target_date)
+    if not stat:
+        return "No Action", f"No pitching boxscore/game log found for {player} on {target_date}"
+    ks = _safe_int_stat(stat, "strikeOuts")
+    avg = None
+    for key in ["season_k_avg", "season_rate", "avg_k_per_start"]:
+        try:
+            val = row.get(key)
+            if val is not None and str(val).strip() not in {"", "—", "None", "nan"}:
+                avg = float(val)
+                break
+        except Exception:
+            pass
+    if avg is None:
+        return "Unable to Grade", "Missing season K average for K Edge grading"
+    result = "Win" if float(ks) > float(avg) else "Loss"
+    return result, f"{player}: {ks} Ks vs season avg {round(avg, 2)}"
+
 def _safe_int_stat(stat: dict, key: str, default: int = 0) -> int:
     try:
         return int(stat.get(key, default) or default)
@@ -737,6 +774,8 @@ def _grade_pick(row: dict, target_date: str, season: int = 2026, card_type: str 
         result, detail = _grade_hitter(row, target_date, season, "hit")
     elif lower == "hr" or "home run" in lower:
         result, detail = _grade_hitter(row, target_date, season, "hr")
+    elif "season avg" in lower and ("k" in lower or "strikeout" in lower):
+        result, detail = _grade_over_season_avg_k_prop(row, target_date, season)
     elif "strikeout" in lower or "k prop" in lower or lower in {"ks", "k"}:
         if "+" in lower:
             result, detail = _grade_alt_k_prop(row, target_date, season, _parse_plus_threshold(bet_type, 5))
@@ -1430,8 +1469,7 @@ function renderFinal() {
       <div class="line"><span class="label">Bet Type:</span> ${esc(fmt(p.bet_type))}</div>
       <div class="line"><span class="label">Team:</span> ${esc(fmt(p.team || p.teamName))}</div>
       <div class="line"><span class="label">Opponent:</span> ${esc(fmt(p.opponent || p.opponentTeam))}</div>
-      <div class="line"><span class="label">Card Rank:</span> ${esc(fmt(p.card_rank_label || p.final_card_tier || p.slot))}</div>
-      <div class="line"><span class="label">Profile Grade:</span> ${esc(fmt(p.model_profile_confidence || p.confidence))}</div>
+      <div class="line"><span class="label">Confidence:</span> ${esc(fmt(p.confidence))}</div>
       <div class="kicker">${esc(fmt(p.why_it_made_the_card || p.reason))}</div>
       <div class="line"><span class="label">Model Insight:</span> ${esc(fmt(insight))}</div>
       <div class="muted">Source: ${esc(fmt(p.source_tab))}</div>
@@ -1555,15 +1593,17 @@ function displayColumnsForResearch(key, rows) {
     plus_money_props: [
       "prop_type", "bet_type", "pick", "playerName", "team", "teamName", "opponent", "game",
       "confidence", "model_grade", "recent_cash_rate", "recent_cash_record",
-      "recent_cash_sample", "recent_cash_last_10", "season_rate",
+      "recent_cash_sample", "recent_cash_last_10", "season_rate", "season_k_avg",
+      "last10_k_avg", "projected_k_mid", "k_edge_vs_season", "k_target",
       "lineup_status", "batting_order_slot", "market_check", "reason"
     ],
     hr_value_watch: [
       "playerName", "teamName", "homeRuns", "league_avg_hr_excl_zero", "hr_vs_league_avg",
-      "hr_value_score", "hr_contact_proxy", "hr_value_profile", "avg_games_between_hrs",
-      "current_games_without_hr", "hr_drought_over_avg", "hr_status", "last_hr_date",
+      "hr_regression_score", "hr_regression_profile", "avg_games_between_hrs",
+      "current_games_without_hr", "longest_games_without_hr", "hr_drought_over_avg", "last_hr_date",
+      "hr_contact_proxy", "split_pitcher_hand", "split_avg", "split_ops", "split_advantage_label", "split_bonus",
       "park_favorability", "opponent_pitcher", "opponent_pitcher_pick_type",
-      "lineup_status", "batting_order_slot", "hr_value_reason"
+      "lineup_status", "batting_order_slot", "hr_regression_reason"
     ]
   };
   const preferred = curated[key] || allColumns;
