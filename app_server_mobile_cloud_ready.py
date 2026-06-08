@@ -17,7 +17,6 @@ app = FastAPI()
 # Server-side refresh lock: prevents multiple users from running the model at the same time.
 refresh_lock = Lock()
 is_refreshing = False
-refresh_started_at = None
 
 
 def resolve_storage_dir() -> Path:
@@ -243,6 +242,7 @@ def _get_card_history(card_type: str) -> dict:
         "final_card": "final_card_by_date.json",
         "refined_picks": "refined_picks_by_date.json",
         "plus_money_props": "plus_money_props_by_date.json",
+        "top_picks": "top_picks_by_date.json",
     }
     filename = filename_map.get(card_type, f"{card_type}_by_date.json")
     return read_json_file(_history_dir() / filename, {})
@@ -281,6 +281,23 @@ def _extract_rows_from_appdata(payload: dict, card_type: str) -> list:
             rows = (((payload.get("research") or {}).get("final_card")) or [])
     elif card_type == "plus_money_props":
         rows = (((payload.get("research") or {}).get("plus_money_props")) or payload.get("plus_money_props") or [])
+    elif card_type == "top_picks":
+        rows = (((payload.get("research") or {}).get("top_picks")) or payload.get("top_picks") or [])
+        # Results tracking only grades Top Pick HR rows for now.
+        normalized = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            row = dict(r)
+            typ = str(row.get("type") or row.get("category") or "").strip().upper()
+            if typ != "HR":
+                continue
+            row.setdefault("bet_type", "HR")
+            row.setdefault("pick", row.get("playerName"))
+            row.setdefault("team", row.get("teamName"))
+            row.setdefault("source_tab", "Top_Picks_HR")
+            normalized.append(row)
+        rows = normalized
     else:
         rows = (((payload.get("research") or {}).get("refined_picks")) or payload.get("refined_picks") or [])
     return [r for r in rows if isinstance(r, dict) and not _is_placeholder_pick(r)]
@@ -840,10 +857,12 @@ def grade_date_results(target_date: str, season: int = 2026, include_refined: bo
     final_rows = _card_rows_for_date(target_date, "final_card")
     refined_rows = _card_rows_for_date(target_date, "refined_picks") if include_refined else []
     plus_money_rows = _card_rows_for_date(target_date, "plus_money_props")
+    top_hr_rows = _card_rows_for_date(target_date, "top_picks")
     new_rows = []
     new_rows.extend(_grade_pick(play, target_date, season, "Final Card") for play in final_rows)
     new_rows.extend(_grade_pick(play, target_date, season, "Refined Picks") for play in refined_rows)
     new_rows.extend(_grade_pick(play, target_date, season, "Plus Money Props") for play in plus_money_rows)
+    new_rows.extend(_grade_pick(play, target_date, season, "Top HR Picks") for play in top_hr_rows)
     if not new_rows:
         return {"status": "no_plays", "date": target_date, "message": "No locked/appdata picks found to grade"}
     latest_path = hist / "results_history_latest.json"
@@ -859,7 +878,7 @@ def grade_date_results(target_date: str, season: int = 2026, include_refined: bo
     latest_path.write_text(json.dumps(latest_payload, indent=2, ensure_ascii=False), encoding="utf-8")
     (hist / "performance_summary_latest.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     (hist / "results_history.jsonl").write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in all_rows) + "\n", encoding="utf-8")
-    return {"status": "ok", "date": target_date, "final_card_rows": len(final_rows), "refined_rows": len(refined_rows), "plus_money_rows": len(plus_money_rows), "graded_new_rows": len(new_rows), "total_rows": len(all_rows), "summary": summary.get("overall")}
+    return {"status": "ok", "date": target_date, "final_card_rows": len(final_rows), "refined_rows": len(refined_rows), "plus_money_rows": len(plus_money_rows), "top_hr_rows": len(top_hr_rows), "graded_new_rows": len(new_rows), "total_rows": len(all_rows), "summary": summary.get("overall")}
 
 
 def grade_recent_slates_including_today(season: int = 2026, days_back: int = 4) -> dict:
@@ -948,75 +967,63 @@ def grade_results(date: str | None = None):
 
 @app.get("/refresh-data")
 def refresh_data():
-    global is_refreshing, refresh_started_at
-
-    now_ts = time.time()
-    stale_after_seconds = 20 * 60  # 20 minutes
-
-    # If a prior refresh got stuck, release the in-memory lock so the phone button works again.
-    if is_refreshing and refresh_started_at:
-        age = now_ts - refresh_started_at
-        if age > stale_after_seconds:
-            print(f"⚠️ Stale refresh lock cleared after {round(age, 1)} seconds")
-            is_refreshing = False
-            refresh_started_at = None
+    global is_refreshing
 
     if is_refreshing:
-        age = round(now_ts - refresh_started_at, 1) if refresh_started_at else None
         return JSONResponse({
             "status": "busy",
             "message": "Refresh already in progress. Please wait a few minutes, then click Reload App again.",
             "timezone": "America/New_York",
-            "refresh_age_seconds": age,
         })
 
     with refresh_lock:
-        now_ts = time.time()
-        if is_refreshing and refresh_started_at:
-            age = now_ts - refresh_started_at
-            if age > stale_after_seconds:
-                print(f"⚠️ Stale refresh lock cleared inside lock after {round(age, 1)} seconds")
-                is_refreshing = False
-                refresh_started_at = None
-
         if is_refreshing:
-            age = round(now_ts - refresh_started_at, 1) if refresh_started_at else None
             return JSONResponse({
                 "status": "busy",
                 "message": "Refresh already in progress. Please wait a few minutes, then click Reload App again.",
                 "timezone": "America/New_York",
-                "refresh_age_seconds": age,
             })
 
         is_refreshing = True
         start_time = time.time()
-        refresh_started_at = start_time
         today = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
-        started_at_et = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ")
 
         try:
-            print(f"🔄 App refresh started at {started_at_et}")
-            # Phone-safe refresh:
-            # Always run the model so later posted lineups can ADD new Elite plays.
-            # hr_v41_cloud_ready.py handles the Final Card as append-only:
-            # old Elite rows are preserved, new Elite rows are added if room remains,
-            # and an empty/new placeholder output can never wipe a locked card.
-            run_model_main(2026, today)
+            # Smart refresh behavior:
+            # - If no Elite Final Card is locked for today, run the model so the phone/app button can create picks.
+            # - If Elite Final Card rows already exist, DO NOT rebuild the model because a late rebuild can wipe the card.
+            # - Always run grading so Results can update safely.
+            history_dir = OUTPUT_DIR / "history"
+            lock_file = history_dir / "final_card_by_date_latest.json"
+            lock_data = read_json_file(lock_file, {})
+            locked_rows = lock_data.get("rows") or []
+            locked_date = str(lock_data.get("target_date") or "")
+
+            has_locked_final_card = (
+                locked_date == today
+                and any(
+                    isinstance(r, dict)
+                    and str(r.get("slot", "")).startswith("Elite")
+                    and str(r.get("confidence", "")) == "A+"
+                    for r in locked_rows
+                )
+            )
+
+            model_ran = False
+            if not has_locked_final_card:
+                run_model_main(2026, today)
+                model_ran = True
 
             auto_grade_result = grade_recent_slates_including_today(season=2026, days_back=4)
             duration = round(time.time() - start_time, 2)
-            finished_at_et = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ")
-            print(f"✅ App refresh finished at {finished_at_et} in {duration}s")
             return JSONResponse({
                 "status": "ok",
-                "message": "Data refreshed safely. Model ran and Final Card was protected by append-only v41 lock.",
+                "message": "Data refreshed safely. Model only ran if no locked Final Card existed.",
                 "date": today,
                 "timezone": "America/New_York",
-                "started_at_et": started_at_et,
-                "finished_at_et": finished_at_et,
                 "duration_seconds": duration,
-                "model_ran": True,
-                "final_card_protection": "append_only_until_4am",
+                "model_ran": model_ran,
+                "final_card_was_locked": has_locked_final_card,
                 "auto_grade": auto_grade_result,
             })
         except Exception as e:
@@ -1027,12 +1034,10 @@ def refresh_data():
                     "message": str(e),
                     "date": today,
                     "timezone": "America/New_York",
-                    "started_at_et": started_at_et,
                 },
             )
         finally:
             is_refreshing = False
-            refresh_started_at = None
 
 
 
@@ -1462,9 +1467,6 @@ function renderFinal() {
   }
   mount.innerHTML = '<div class="cards">' + plays.map(p => {
     const insight = buildModelInsight(p);
-    const slotText = String(p.slot || p.play_type || p.section || "");
-    const cardTier = p.final_card_tier || (slotText.startsWith("Elite") ? "Elite" : (p.confidence || "—"));
-    const profileGrade = p.model_profile_confidence || p.profile_confidence || p.confidence || "—";
     return `
     <div class="card">
       <div class="pill">${esc(fmt(p.slot || p.play_type || p.section || "Play"))}</div>
@@ -1472,7 +1474,7 @@ function renderFinal() {
       <div class="line"><span class="label">Bet Type:</span> ${esc(fmt(p.bet_type))}</div>
       <div class="line"><span class="label">Team:</span> ${esc(fmt(p.team || p.teamName))}</div>
       <div class="line"><span class="label">Opponent:</span> ${esc(fmt(p.opponent || p.opponentTeam))}</div>
-      <div class="line"><span class="label">Card Tier:</span> ${esc(fmt(cardTier))}</div>\n      <div class="line"><span class="label">Profile Grade:</span> ${esc(fmt(profileGrade))}</div>
+      <div class="line"><span class="label">Confidence:</span> ${esc(fmt(p.confidence))}</div>
       <div class="kicker">${esc(fmt(p.why_it_made_the_card || p.reason))}</div>
       <div class="line"><span class="label">Model Insight:</span> ${esc(fmt(insight))}</div>
       <div class="muted">Source: ${esc(fmt(p.source_tab))}</div>
@@ -1961,6 +1963,7 @@ function renderResults() {
       ${summaryCard('Final Card Results', 'Final Card', 'Official card picks only.')}
       ${summaryCard('Refined Picks Results', 'Refined Picks', 'Broader research/model picks only.')}
       ${summaryCard('Plus Money Props Results', 'Plus Money Props', 'Alt props/value props tracked separately.')}
+      ${summaryCard('Top HR Picks Results', 'Top HR Picks', 'Top Picks HR rows tracked separately for HR model improvement.')}
     </div>
 
     <div class="cards" style="margin-top:18px;">
@@ -1993,6 +1996,7 @@ function renderResults() {
     ${resultsTable('Final Card Graded Picks', tableRowsFor('Final Card'))}
     ${resultsTable('Refined Picks Graded Picks', tableRowsFor('Refined Picks'))}
     ${resultsTable('Plus Money Props Graded Picks', tableRowsFor('Plus Money Props'))}
+    ${resultsTable('Top HR Picks Graded Picks', tableRowsFor('Top HR Picks'))}
     ${resultsTable('All Recent Graded Picks', recent)}
   `;
 }
