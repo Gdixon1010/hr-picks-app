@@ -2226,7 +2226,7 @@ def build_hr_value_watch(player_rows: pd.DataFrame) -> pd.DataFrame:
 
     # HARD VALUE RULE: do not include already-priced-up HR totals.
     # User specifically wants players at/below league-average HRs only.
-    df["hr_regression_value_ok"] = (hr > 0) & (league_avg > 0) & (hr <= league_avg)
+    df["hr_regression_value_ok"] = (hr > 0) & (league_avg > 0) & (hr <= (league_avg + 1))
 
     drought_severity = (current_gap - avg_gap).clip(lower=0)
     longest_pressure = (current_gap / longest.replace(0, pd.NA)).fillna(0).clip(lower=0, upper=1.5)
@@ -2268,12 +2268,11 @@ def build_hr_value_watch(player_rows: pd.DataFrame) -> pd.DataFrame:
         axis=1,
     )
 
+    # Soft-gate version: the table should be useful early in the day before lineups post.
+    # Hard rule stays: player must not be above league-average HR pace (+1 cushion).
+    # Lineup slot, starter status, contact, split, and park are scored/displayed, not hard-blocked.
     pool = df[
         (df["hr_regression_value_ok"] == True)
-        & (df.get("starter_only_flag", False).astype(bool) == True)
-        & (slot <= 6)
-        & (contact >= 2.8)
-        & (split_bonus >= -0.05)
         & (df.get("opponent_pitcher_pick_type", "Neutral").astype(str) != "Strong SP")
     ].copy()
 
@@ -2465,14 +2464,21 @@ def build_plus_money_prop_sheet(player_rows: pd.DataFrame, pitcher_line_value: p
         return pd.DataFrame([{"prop_type":"Info", "bet_type":"Info", "pick":"No plus-money prop candidates", "reason":"No props met recent cash-rate and role filters"}], columns=cols)
 
     out = pd.DataFrame(rows)
+    # Safety: some rows are hitter props and some rows are K-edge props.
+    # Make every expected column exist before selecting cols, or pandas raises "not in index".
+    for c in cols:
+        if c not in out.columns:
+            out[c] = None
     if "bet_type" not in out.columns:
         out["bet_type"] = out.get("prop_type")
     else:
         out["bet_type"] = out["bet_type"].fillna(out.get("prop_type"))
         out.loc[out["bet_type"].astype(str).str.strip().isin(["", "—", "None", "nan"]), "bet_type"] = out.get("prop_type")
     out["sort_rank"] = out["confidence"].map({"A+": 1, "A": 2, "B": 3}).fillna(9)
-    out = out.sort_values(["sort_rank", "recent_cash_rate", "model_grade"], ascending=[True, False, False])
-    out = out.drop(columns=["sort_rank"])
+    out["_recent_cash_sort"] = pd.to_numeric(out.get("recent_cash_rate"), errors="coerce").fillna(-1)
+    out["_model_grade_sort"] = pd.to_numeric(out.get("model_grade"), errors="coerce").fillna(-999)
+    out = out.sort_values(["sort_rank", "_recent_cash_sort", "_model_grade_sort"], ascending=[True, False, False])
+    out = out.drop(columns=["sort_rank", "_recent_cash_sort", "_model_grade_sort"], errors="ignore")
     return out.head(30).reset_index(drop=True)[cols]
 
 def build_daily_card(game_rankings, refined_picks, pitcher_line_value, hr_drought):
