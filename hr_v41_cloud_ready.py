@@ -29,11 +29,6 @@ OUTPUT_DIR = resolve_storage_dir()
 HISTORY_DIR = OUTPUT_DIR / "history"
 HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
-FINAL_CARD_MAX_ROWS = 8
-BEST_BET_COUNT = 3
-STRONG_PLAY_COUNT = 3
-
-
 
 def active_slate_date(now_et=None) -> str:
     """Slate day runs 4:00 AM ET to 3:59 AM ET next calendar day."""
@@ -169,32 +164,6 @@ def _normalize_plus_money_rows(rows: list) -> list:
     return out
 
 
-def _normalize_top_picks_rows(rows: list) -> list:
-    """Make Top Picks gradeable, especially HR rows.
-
-    Top_Picks rows are research rows, so older builds did not always include
-    bet_type/pick/team. This normalizes them so Results can track Top HR Picks.
-    """
-    out = []
-    for r in _rows(rows):
-        if not isinstance(r, dict):
-            continue
-        row = dict(r)
-        typ = str(row.get("type") or row.get("category") or "").strip().upper()
-        if typ == "HR":
-            row.setdefault("bet_type", "HR")
-            row.setdefault("pick", row.get("playerName"))
-            row.setdefault("team", row.get("teamName"))
-            row.setdefault("source_tab", "Top_Picks_HR")
-        elif typ == "HIT":
-            row.setdefault("bet_type", "1+ Hit")
-            row.setdefault("pick", row.get("playerName"))
-            row.setdefault("team", row.get("teamName"))
-            row.setdefault("source_tab", "Top_Picks_HIT")
-        out.append(row)
-    return out
-
-
 
 def _elite_final_rows(rows: list) -> list:
     """Final Card reset filter for elite-only mode.
@@ -210,10 +179,60 @@ def _elite_final_rows(rows: list) -> list:
         bet = str(r.get("bet_type") or "").strip()
         slot = str(r.get("slot") or "").strip()
         conf = str(r.get("confidence") or "").strip()
-        # Official Final Card accepts elite/expanded rows created by v40/v41.
-        if (slot.startswith("Elite") or slot.startswith("Best Bet") or slot.startswith("Strong") or slot.startswith("Lean")) and bet in {"1+ Hit", "K Prop"}:
+        # Official Final Card now only accepts explicitly elite rows created by v40.
+        if slot.startswith("Elite") and conf == "A+" and bet in {"1+ Hit", "K Prop"}:
             out.append(dict(r))
     return out
+
+def _merge_final_card_append_only(old_rows: list, new_rows: list, max_rows: int = 8) -> list:
+    """Append-only Final Card merge with expanded slots.
+
+    Old same-slate rows stay locked. New rows can add until max_rows. This keeps
+    early confirmed plays while still allowing late-game lineups to add new plays.
+    """
+    merged = []
+    seen = set()
+
+    def key_for(row: dict):
+        return (
+            _norm(row.get("bet_type")),
+            _norm(row.get("pick")),
+            _norm(row.get("team")),
+            _norm(row.get("opponent")),
+        )
+
+    for source_rows in (_rows(old_rows), _rows(new_rows)):
+        for r in source_rows:
+            if not isinstance(r, dict) or _is_placeholder(r):
+                continue
+            row = dict(r)
+            key = key_for(row)
+            if not any(key) or key in seen:
+                continue
+            seen.add(key)
+            merged.append(row)
+            if len(merged) >= max_rows:
+                break
+        if len(merged) >= max_rows:
+            break
+
+    for i, r in enumerate(merged, 1):
+        r["slot"] = f"Elite {i}"
+        if i == 1:
+            r["card_rank_label"] = "Best Bet"
+            r["final_card_tier"] = "Best Bet"
+            r["card_priority"] = 1
+        elif i <= 3:
+            r["card_rank_label"] = "Strong Play"
+            r["final_card_tier"] = "Strong Play"
+            r["card_priority"] = 2
+        else:
+            r["card_rank_label"] = "Lean / Watch"
+            r["final_card_tier"] = "Lean / Watch"
+            r["card_priority"] = 3
+        r["confidence"] = r.get("confidence") or "A+"
+    return merged
+
 
 def _get_final_card_plays(data: dict) -> list:
     fc = data.get("final_card")
@@ -236,7 +255,16 @@ def _set_final_card_plays(data: dict, rows: list) -> None:
 
 
 def _refined_to_elite_final_rows(data: dict) -> list:
-    """Promote qualified Refined Picks into Elite Final Card when v40 final_card is empty/placeholder."""
+    """Promote qualified Refined Picks into Final Card expansion slots.
+
+    Results audit recalibration:
+    - Refined 1+ Hit A has performed best historically.
+    - B has also been strong.
+    - A+ is still allowed, but it is not automatically ranked above A/B.
+
+    This function can return up to 8 candidates so late-game lineups can be added
+    after early games have already produced Final Card rows.
+    """
     rows = _get_research_rows(data, "refined_picks")
     out = []
 
@@ -248,17 +276,26 @@ def _refined_to_elite_final_rows(data: dict) -> list:
         except Exception:
             return default
 
+    def confidence_rank(row: dict) -> int:
+        conf = str(row.get("confidence") or "").strip()
+        return {"A": 0, "B": 1, "A+": 2}.get(conf, 9)
+
     candidates = []
     for r in _rows(rows):
         if not isinstance(r, dict) or _is_placeholder(r):
             continue
         if str(r.get("bet_type") or "") != "1+ Hit":
             continue
+
+        conf = str(r.get("confidence") or "").strip()
+        if conf not in {"A", "B", "A+"}:
+            continue
+
         lineup = str(r.get("lineup_status") or "")
         slot = num(r.get("batting_order_slot"), 99)
         if lineup != "Confirmed Starter" or slot > 5:
             continue
-        if num(r.get("Hit_score")) < 5.00:
+        if num(r.get("Hit_score")) < 4.50:
             continue
         if num(r.get("contact_quality_score")) < 3.40:
             continue
@@ -273,48 +310,51 @@ def _refined_to_elite_final_rows(data: dict) -> list:
     candidates = sorted(
         candidates,
         key=lambda r: (
-            num(r.get("Hit_score")),
-            num(r.get("contact_quality_score")),
-            num(r.get("hit_pct_last_10")),
-            num(r.get("recent_cash_rate")),
-            -num(r.get("batting_order_slot"), 99),
+            confidence_rank(r),
+            -num(r.get("recent_cash_rate")),
+            -num(r.get("hit_pct_last_10")),
+            -num(r.get("contact_quality_score")),
+            -num(r.get("Hit_score")),
+            num(r.get("batting_order_slot"), 99),
         ),
-        reverse=True,
     )
 
     used_teams = set()
+    used_players = set()
     for r in candidates:
         team = r.get("teamName")
-        if team in used_teams:
+        player = r.get("playerName")
+        player_key = (_norm(team), _norm(player))
+        if team in used_teams or player_key in used_players:
             continue
         used_teams.add(team)
-        rank_score = round(
-            (num(r.get("recent_cash_rate")) * 3.0)
-            + (num(r.get("hit_pct_last_10")) / 100.0 * 2.0)
-            + (num(r.get("contact_quality_score")) * 0.7)
-            + (num(r.get("Hit_score")) * 0.6)
-            - (num(r.get("batting_order_slot"), 99) * 0.05),
-            3,
-        )
+        used_players.add(player_key)
+        original_conf = str(r.get("confidence") or "").strip() or "Unknown"
         out.append({
             "slot": f"Elite {len(out) + 1}",
             "bet_type": "1+ Hit",
-            "pick": r.get("playerName"),
+            "pick": player,
             "team": team,
             "opponent": r.get("opponentTeam") or r.get("opponent_pitcher_team"),
             "confidence": "A+",
+            "model_profile_confidence": original_conf,
             "why_it_made_the_card": (
-                f"Elite refined fallback; Hit_score {r.get('Hit_score')}; "
+                f"Recalibrated expanded Final Card; profile confidence {original_conf}; "
+                f"Hit_score {r.get('Hit_score')}; "
                 f"contact {r.get('contact_quality_score')}; "
                 f"L10 hit {r.get('hit_pct_last_10')}%; "
                 f"slot {r.get('batting_order_slot')}; "
                 f"recent cash {r.get('recent_cash_rate')}; "
+                f"split vs {r.get('split_pitcher_hand')}HP avg {r.get('split_avg')} "
+                f"({r.get('split_advantage_label')}, bonus {r.get('split_bonus')}); "
                 f"opp {r.get('opponent_pitcher_pick_type')}"
             ),
-            "source_tab": "Refined_Picks",
+            "source_tab": "Refined_Picks_Recalibrated",
             "final_card_tier": "Elite",
+            "card_rank_label": "Pending Rank",
+            "card_priority": 9,
         })
-        if len(out) >= 3:
+        if len(out) >= 8:
             break
     return out
 
@@ -380,7 +420,6 @@ def main(season: int, target_date: str):
         new_data = json.load(f)
 
     _set_research_rows(new_data, "plus_money_props", _normalize_plus_money_rows(_get_research_rows(new_data, "plus_money_props")))
-    _set_research_rows(new_data, "top_picks", _normalize_top_picks_rows(_get_research_rows(new_data, "top_picks")))
 
     prev_file = _latest_v41_json_for_date(target_date)
     old_data = {}
@@ -404,10 +443,15 @@ def main(season: int, target_date: str):
     old_plus_money_candidates.extend(_normalize_plus_money_rows(_get_research_rows(old_data, "plus_money_props")))
     old_plus_money_candidates.extend(_normalize_plus_money_rows(_history_rows("plus_money_props", target_date)))
 
-    # Elite Final Card mode: do NOT carry old same-day Core/Moneyline rows forward.
-    # The Final Card is the official card and should reflect only the latest elite-only gate.
-    # Refined Picks / Plus Money still preserve same-day rows; Final Card is re-filtered.
-    merged_final = _elite_final_rows(_get_final_card_plays(new_data))
+    # Expanded append-only Final Card:
+    # - Preserve existing same-slate Final Card rows until 4 AM ET.
+    # - Add new qualified plays as later lineups post.
+    # - Use BOTH v40 Elite rows and recalibrated Refined fallback rows.
+    old_elite_final = _elite_final_rows(old_final_candidates)
+    v40_elite_final = _elite_final_rows(_get_final_card_plays(new_data))
+    refined_elite_final = _refined_to_elite_final_rows(new_data)
+    new_elite_final = _merge_final_card_append_only(v40_elite_final, refined_elite_final, max_rows=8)
+    merged_final = _merge_final_card_append_only(old_elite_final, new_elite_final, max_rows=8)
     _set_final_card_plays(new_data, merged_final)
 
     merged_refined = _merge_rows(
@@ -426,8 +470,8 @@ def main(season: int, target_date: str):
         _set_research_rows(new_data, "plus_money_props", merged_plus_money)
 
     merged_top = _merge_rows(
-        _normalize_top_picks_rows(_get_research_rows(old_data, "top_picks")),
-        _normalize_top_picks_rows(_get_research_rows(new_data, "top_picks")),
+        _get_research_rows(old_data, "top_picks"),
+        _get_research_rows(new_data, "top_picks"),
         ["type", "category", "bet_type", "playerName", "teamName"],
     )
     if merged_top:
@@ -443,8 +487,6 @@ def main(season: int, target_date: str):
     _update_history("refined_picks", target_date, _get_research_rows(new_data, "refined_picks"))
     _set_research_rows(new_data, "plus_money_props", _normalize_plus_money_rows(_get_research_rows(new_data, "plus_money_props")))
     _update_history("plus_money_props", target_date, _get_research_rows(new_data, "plus_money_props"))
-    _set_research_rows(new_data, "top_picks", _normalize_top_picks_rows(_get_research_rows(new_data, "top_picks")))
-    _update_history("top_picks", target_date, _get_research_rows(new_data, "top_picks"))
 
     v41_path = _write_v41_json(new_data, season, target_date)
 
