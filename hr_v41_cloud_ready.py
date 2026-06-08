@@ -184,11 +184,55 @@ def _elite_final_rows(rows: list) -> list:
             out.append(dict(r))
     return out
 
-def _merge_final_card_append_only(old_rows: list, new_rows: list, max_rows: int = 8) -> list:
-    """Append-only Final Card merge with expanded slots.
+def _get_final_card_plays(data: dict) -> list:
+    fc = data.get("final_card")
+    if isinstance(fc, dict):
+        rows = _rows(fc.get("plays"))
+    elif isinstance(fc, list):
+        rows = _rows(fc)
+    else:
+        rows = []
+    if not rows and isinstance(data.get("research"), dict):
+        rows = _rows(data["research"].get("final_card"))
+    return rows
 
-    Old same-slate rows stay locked. New rows can add until max_rows. This keeps
-    early confirmed plays while still allowing late-game lineups to add new plays.
+
+def _set_final_card_plays(data: dict, rows: list) -> None:
+    data["final_card"] = {"generated_section": "final_card", "plays": rows}
+    data.setdefault("research", {})
+    if isinstance(data["research"], dict):
+        data["research"]["final_card"] = rows
+
+
+def _rank_final_card_rows(rows: list) -> list:
+    """Apply clear rank labels to expanded Final Card rows."""
+    ranked = []
+    for i, row in enumerate(_rows(rows), 1):
+        if not isinstance(row, dict):
+            continue
+        r = dict(row)
+        r["slot"] = f"Elite {i}"
+        if i == 1:
+            r["card_rank_label"] = "Best Bet"
+            r["final_card_tier"] = "Best Bet"
+            r["card_priority"] = 1
+        elif i <= 3:
+            r["card_rank_label"] = "Strong Play"
+            r["final_card_tier"] = "Strong Play"
+            r["card_priority"] = 2
+        else:
+            r["card_rank_label"] = "Lean / Watch"
+            r["final_card_tier"] = "Lean / Watch"
+            r["card_priority"] = 3
+        ranked.append(r)
+    return ranked
+
+
+def _merge_final_card_append_only(old_rows: list, new_rows: list, max_rows: int = 8) -> list:
+    """Append-only Final Card merge.
+
+    Keeps existing same-slate plays, then appends newly qualified plays until max_rows.
+    This prevents early picks from being wiped while still allowing late-game plays to enter.
     """
     merged = []
     seen = set()
@@ -216,54 +260,14 @@ def _merge_final_card_append_only(old_rows: list, new_rows: list, max_rows: int 
         if len(merged) >= max_rows:
             break
 
-    for i, r in enumerate(merged, 1):
-        r["slot"] = f"Elite {i}"
-        if i == 1:
-            r["card_rank_label"] = "Best Bet"
-            r["final_card_tier"] = "Best Bet"
-            r["card_priority"] = 1
-        elif i <= 3:
-            r["card_rank_label"] = "Strong Play"
-            r["final_card_tier"] = "Strong Play"
-            r["card_priority"] = 2
-        else:
-            r["card_rank_label"] = "Lean / Watch"
-            r["final_card_tier"] = "Lean / Watch"
-            r["card_priority"] = 3
-        r["confidence"] = r.get("confidence") or "A+"
-    return merged
-
-
-def _get_final_card_plays(data: dict) -> list:
-    fc = data.get("final_card")
-    if isinstance(fc, dict):
-        rows = _rows(fc.get("plays"))
-    elif isinstance(fc, list):
-        rows = _rows(fc)
-    else:
-        rows = []
-    if not rows and isinstance(data.get("research"), dict):
-        rows = _rows(data["research"].get("final_card"))
-    return rows
-
-
-def _set_final_card_plays(data: dict, rows: list) -> None:
-    data["final_card"] = {"generated_section": "final_card", "plays": rows}
-    data.setdefault("research", {})
-    if isinstance(data["research"], dict):
-        data["research"]["final_card"] = rows
+    return _rank_final_card_rows(merged)
 
 
 def _refined_to_elite_final_rows(data: dict) -> list:
-    """Promote qualified Refined Picks into Final Card expansion slots.
+    """Promote qualified Refined Picks into expanded Final Card rows.
 
-    Results audit recalibration:
-    - Refined 1+ Hit A has performed best historically.
-    - B has also been strong.
-    - A+ is still allowed, but it is not automatically ranked above A/B.
-
-    This function can return up to 8 candidates so late-game lineups can be added
-    after early games have already produced Final Card rows.
+    Tight gate creates Best/Strong plays. Lean gate allows high-quality B/A profiles
+    so later confirmed lineups can make the card instead of being blocked at 3 plays.
     """
     rows = _get_research_rows(data, "refined_picks")
     out = []
@@ -277,8 +281,9 @@ def _refined_to_elite_final_rows(data: dict) -> list:
             return default
 
     def confidence_rank(row: dict) -> int:
+        # Results audit showed A/B can be more reliable than the old A+ label.
         conf = str(row.get("confidence") or "").strip()
-        return {"A": 0, "B": 1, "A+": 2}.get(conf, 9)
+        return {"A": 0, "A+": 1, "B": 2}.get(conf, 9)
 
     candidates = []
     for r in _rows(rows):
@@ -295,21 +300,37 @@ def _refined_to_elite_final_rows(data: dict) -> list:
         slot = num(r.get("batting_order_slot"), 99)
         if lineup != "Confirmed Starter" or slot > 5:
             continue
-        if num(r.get("Hit_score")) < 4.50:
-            continue
-        if num(r.get("contact_quality_score")) < 3.40:
-            continue
-        if num(r.get("hit_pct_last_10")) < 80:
-            continue
-        if num(r.get("recent_cash_rate"), -1) < 0.70:
-            continue
         if str(r.get("opponent_pitcher_pick_type") or "Neutral") == "Strong SP":
             continue
-        candidates.append(r)
+
+        hit_score = num(r.get("Hit_score"))
+        contact = num(r.get("contact_quality_score"))
+        l10 = num(r.get("hit_pct_last_10"))
+        cash = num(r.get("recent_cash_rate"), -1)
+
+        tight_gate = (
+            hit_score >= 4.50
+            and contact >= 3.40
+            and l10 >= 80
+            and cash >= 0.70
+        )
+        lean_gate = (
+            hit_score >= 4.65
+            and contact >= 3.30
+            and l10 >= 80
+            and cash >= 0.60
+        )
+        if not (tight_gate or lean_gate):
+            continue
+
+        row = dict(r)
+        row["final_card_gate"] = "Strong Gate" if tight_gate else "Lean Gate"
+        candidates.append(row)
 
     candidates = sorted(
         candidates,
         key=lambda r: (
+            0 if r.get("final_card_gate") == "Strong Gate" else 1,
             confidence_rank(r),
             -num(r.get("recent_cash_rate")),
             -num(r.get("hit_pct_last_10")),
@@ -340,6 +361,7 @@ def _refined_to_elite_final_rows(data: dict) -> list:
             "model_profile_confidence": original_conf,
             "why_it_made_the_card": (
                 f"Recalibrated expanded Final Card; profile confidence {original_conf}; "
+                f"gate {r.get('final_card_gate')}; "
                 f"Hit_score {r.get('Hit_score')}; "
                 f"contact {r.get('contact_quality_score')}; "
                 f"L10 hit {r.get('hit_pct_last_10')}%; "
@@ -356,8 +378,7 @@ def _refined_to_elite_final_rows(data: dict) -> list:
         })
         if len(out) >= 8:
             break
-    return out
-
+    return _rank_final_card_rows(out)
 
 def _get_research_rows(data: dict, key: str) -> list:
     research = data.get("research") if isinstance(data.get("research"), dict) else {}
@@ -444,9 +465,9 @@ def main(season: int, target_date: str):
     old_plus_money_candidates.extend(_normalize_plus_money_rows(_history_rows("plus_money_props", target_date)))
 
     # Expanded append-only Final Card:
-    # - Preserve existing same-slate Final Card rows until 4 AM ET.
-    # - Add new qualified plays as later lineups post.
-    # - Use BOTH v40 Elite rows and recalibrated Refined fallback rows.
+    # - preserve same-slate rows until the 4AM slate reset
+    # - add newly qualified late-game plays until 8 total
+    # - use v40 elite rows plus recalibrated refined fallback rows
     old_elite_final = _elite_final_rows(old_final_candidates)
     v40_elite_final = _elite_final_rows(_get_final_card_plays(new_data))
     refined_elite_final = _refined_to_elite_final_rows(new_data)
