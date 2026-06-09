@@ -17,6 +17,7 @@ app = FastAPI()
 # Server-side refresh lock: prevents multiple users from running the model at the same time.
 refresh_lock = Lock()
 is_refreshing = False
+refresh_started_at = None
 
 
 def resolve_storage_dir() -> Path:
@@ -566,43 +567,6 @@ def _grade_k_prop(row: dict, target_date: str, season: int) -> tuple[str, str]:
 
 
 
-
-def _grade_over_season_avg_k_prop(row: dict, target_date: str, season: int) -> tuple[str, str]:
-    """Grade the new K Edge prop by comparing actual Ks to the pitcher's own season average.
-
-    This replaces misleading 5+ K tracking. A win means the pitcher finished above
-    his season K/start average. The actual sportsbook line should still be checked
-    manually before betting.
-    """
-    player = str(row.get("pick") or row.get("pitcherName") or row.get("playerName") or "").strip()
-    team = str(row.get("team") or row.get("teamName") or "").strip()
-    if not player:
-        return "Unable to Grade", "Missing pitcher"
-    pending, reason = _pending_if_game_not_final(row, target_date)
-    if pending:
-        return "Pending", reason
-    stat = _boxscore_player_stat_by_name(target_date, player, "pitching", team_name=team)
-    if stat is None:
-        pid = row.get("playerId") or (_find_player_id_on_team(player, team, season) if team else None)
-        if pid:
-            stat = _player_game_log_for_date(int(pid), "pitching", season, target_date)
-    if not stat:
-        return "No Action", f"No pitching boxscore/game log found for {player} on {target_date}"
-    ks = _safe_int_stat(stat, "strikeOuts")
-    avg = None
-    for key in ["season_k_avg", "season_rate", "avg_k_per_start"]:
-        try:
-            val = row.get(key)
-            if val is not None and str(val).strip() not in {"", "—", "None", "nan"}:
-                avg = float(val)
-                break
-        except Exception:
-            pass
-    if avg is None:
-        return "Unable to Grade", "Missing season K average for K Edge grading"
-    result = "Win" if float(ks) > float(avg) else "Loss"
-    return result, f"{player}: {ks} Ks vs season avg {round(avg, 2)}"
-
 def _safe_int_stat(stat: dict, key: str, default: int = 0) -> int:
     try:
         return int(stat.get(key, default) or default)
@@ -759,31 +723,6 @@ def _infer_result_confidence(row: dict, card_type: str) -> str:
             return "A"
     return "Unknown"
 
-def _copy_model_metrics(row: dict) -> dict:
-    """Carry model-attribution fields into result history for future analysis.
-
-    Older result rows only saved pick/result fields. New rows keep the scoring
-    inputs so we can compare winners vs losers by Hit_score, contact, split,
-    lineup slot, pitcher type, HR regression, and K edge.
-    """
-    metric_keys = [
-        "Hit_score", "contact_quality_score", "hit_quality_label",
-        "hit_pct_last_10", "hit_pct_last_5", "current_hit_streak",
-        "recent_cash_rate", "recent_cash_record", "recent_cash_sample", "recent_cash_last_10",
-        "split_pitcher_hand", "split_avg", "split_ops", "split_plate_appearances",
-        "split_advantage_label", "split_bonus",
-        "lineup_status", "batting_order_slot", "starter_only_flag",
-        "opponent_pitcher", "opponent_pitcher_pick_type", "opponent_pitcher_sample",
-        "park_favorability", "game", "source_tab",
-        "HR_score", "hr_regression_score", "hr_drought_over_avg",
-        "league_avg_hr_excl_zero", "hr_vs_league_avg", "homeRuns",
-        "avg_games_between_hrs", "current_games_without_hr", "longest_games_without_hr",
-        "hr_status", "hr_value_profile", "hr_regression_label",
-        "season_k_avg", "last10_k_avg", "projected_k_mid", "k_edge_vs_season", "k_target",
-        "card_rank_label", "card_priority", "model_profile_confidence", "final_card_gate",
-    ]
-    return {k: row.get(k) for k in metric_keys if k in row}
-
 def _grade_pick(row: dict, target_date: str, season: int = 2026, card_type: str = "Final Card") -> dict:
     bet_type = _infer_grade_bet_type(row)
     lower = bet_type.lower()
@@ -799,8 +738,6 @@ def _grade_pick(row: dict, target_date: str, season: int = 2026, card_type: str 
         result, detail = _grade_hitter(row, target_date, season, "hit")
     elif lower == "hr" or "home run" in lower:
         result, detail = _grade_hitter(row, target_date, season, "hr")
-    elif "season avg" in lower and ("k" in lower or "strikeout" in lower):
-        result, detail = _grade_over_season_avg_k_prop(row, target_date, season)
     elif "strikeout" in lower or "k prop" in lower or lower in {"ks", "k"}:
         if "+" in lower:
             result, detail = _grade_alt_k_prop(row, target_date, season, _parse_plus_threshold(bet_type, 5))
@@ -808,7 +745,7 @@ def _grade_pick(row: dict, target_date: str, season: int = 2026, card_type: str 
             result, detail = _grade_k_prop(row, target_date, season)
     else:
         result, detail = "Unable to Grade", f"Unsupported bet type: {bet_type}"
-    result_row = {
+    return {
         "target_date": target_date,
         "card_type": card_type,
         "bet_type": bet_type or row.get("prop_type") or row.get("play_type"),
@@ -822,8 +759,6 @@ def _grade_pick(row: dict, target_date: str, season: int = 2026, card_type: str 
         "source_tab": row.get("source_tab") or ("Plus_Money_Props" if card_type == "Plus Money Props" else ("Refined_Picks" if card_type == "Refined Picks" else "Final_Card")),
         "graded_at_et": dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " "),
     }
-    result_row.update(_copy_model_metrics(row))
-    return result_row
 
 
 def _dedupe_result_rows(rows: list) -> list:
@@ -1013,39 +948,75 @@ def grade_results(date: str | None = None):
 
 @app.get("/refresh-data")
 def refresh_data():
-    global is_refreshing
+    global is_refreshing, refresh_started_at
+
+    now_ts = time.time()
+    stale_after_seconds = 20 * 60  # 20 minutes
+
+    # If a prior refresh got stuck, release the in-memory lock so the phone button works again.
+    if is_refreshing and refresh_started_at:
+        age = now_ts - refresh_started_at
+        if age > stale_after_seconds:
+            print(f"⚠️ Stale refresh lock cleared after {round(age, 1)} seconds")
+            is_refreshing = False
+            refresh_started_at = None
 
     if is_refreshing:
+        age = round(now_ts - refresh_started_at, 1) if refresh_started_at else None
         return JSONResponse({
             "status": "busy",
             "message": "Refresh already in progress. Please wait a few minutes, then click Reload App again.",
             "timezone": "America/New_York",
+            "refresh_age_seconds": age,
         })
 
     with refresh_lock:
+        now_ts = time.time()
+        if is_refreshing and refresh_started_at:
+            age = now_ts - refresh_started_at
+            if age > stale_after_seconds:
+                print(f"⚠️ Stale refresh lock cleared inside lock after {round(age, 1)} seconds")
+                is_refreshing = False
+                refresh_started_at = None
+
         if is_refreshing:
+            age = round(now_ts - refresh_started_at, 1) if refresh_started_at else None
             return JSONResponse({
                 "status": "busy",
                 "message": "Refresh already in progress. Please wait a few minutes, then click Reload App again.",
                 "timezone": "America/New_York",
+                "refresh_age_seconds": age,
             })
 
         is_refreshing = True
         start_time = time.time()
+        refresh_started_at = start_time
         today = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+        started_at_et = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ")
 
         try:
-            # First build/lock today's latest cards.
-            # Then grade today + recent slates so completed games immediately appear in Results.
+            print(f"🔄 App refresh started at {started_at_et}")
+            # Phone-safe refresh:
+            # Always run the model so later posted lineups can ADD new Elite plays.
+            # hr_v41_cloud_ready.py handles the Final Card as append-only:
+            # old Elite rows are preserved, new Elite rows are added if room remains,
+            # and an empty/new placeholder output can never wipe a locked card.
             run_model_main(2026, today)
+
             auto_grade_result = grade_recent_slates_including_today(season=2026, days_back=4)
             duration = round(time.time() - start_time, 2)
+            finished_at_et = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ")
+            print(f"✅ App refresh finished at {finished_at_et} in {duration}s")
             return JSONResponse({
                 "status": "ok",
-                "message": "Data refreshed and results checked",
+                "message": "Data refreshed safely. Model ran and Final Card was protected by append-only v41 lock.",
                 "date": today,
                 "timezone": "America/New_York",
+                "started_at_et": started_at_et,
+                "finished_at_et": finished_at_et,
                 "duration_seconds": duration,
+                "model_ran": True,
+                "final_card_protection": "append_only_until_4am",
                 "auto_grade": auto_grade_result,
             })
         except Exception as e:
@@ -1056,10 +1027,12 @@ def refresh_data():
                     "message": str(e),
                     "date": today,
                     "timezone": "America/New_York",
+                    "started_at_et": started_at_et,
                 },
             )
         finally:
             is_refreshing = False
+            refresh_started_at = None
 
 
 
@@ -1620,17 +1593,15 @@ function displayColumnsForResearch(key, rows) {
     plus_money_props: [
       "prop_type", "bet_type", "pick", "playerName", "team", "teamName", "opponent", "game",
       "confidence", "model_grade", "recent_cash_rate", "recent_cash_record",
-      "recent_cash_sample", "recent_cash_last_10", "season_rate", "season_k_avg",
-      "last10_k_avg", "projected_k_mid", "k_edge_vs_season", "k_target",
+      "recent_cash_sample", "recent_cash_last_10", "season_rate",
       "lineup_status", "batting_order_slot", "market_check", "reason"
     ],
     hr_value_watch: [
       "playerName", "teamName", "homeRuns", "league_avg_hr_excl_zero", "hr_vs_league_avg",
-      "hr_regression_score", "hr_regression_profile", "avg_games_between_hrs",
-      "current_games_without_hr", "longest_games_without_hr", "hr_drought_over_avg", "last_hr_date",
-      "hr_contact_proxy", "split_pitcher_hand", "split_avg", "split_ops", "split_advantage_label", "split_bonus",
+      "hr_value_score", "hr_contact_proxy", "hr_value_profile", "avg_games_between_hrs",
+      "current_games_without_hr", "hr_drought_over_avg", "hr_status", "last_hr_date",
       "park_favorability", "opponent_pitcher", "opponent_pitcher_pick_type",
-      "lineup_status", "batting_order_slot", "hr_regression_reason"
+      "lineup_status", "batting_order_slot", "hr_value_reason"
     ]
   };
   const preferred = curated[key] || allColumns;
@@ -1923,14 +1894,32 @@ function renderResults() {
   const byCardType = Array.isArray(results.by_card_type) ? results.by_card_type : [];
   const bySlot = Array.isArray(results.by_slot) ? results.by_slot : [];
   const recent = Array.isArray(results.recent_results) ? results.recent_results : [];
+  const allRows = Array.isArray(APP_DATA?.results_latest?.rows) ? APP_DATA.results_latest.rows : recent;
 
   function pctText(v) {
     return v !== undefined && v !== null ? esc((Number(v) * 100).toFixed(1) + '%') : '—';
   }
 
+  function calcSummary(rows) {
+    const graded = (rows || []).filter(r => r && (r.result_status === 'Win' || r.result_status === 'Loss'));
+    const wins = graded.filter(r => r.result_status === 'Win').length;
+    const losses = graded.filter(r => r.result_status === 'Loss').length;
+    const total = wins + losses;
+    return { total, wins, losses, winRate: total ? wins / total : null };
+  }
+
+  function summaryHtml(title, summary, note) {
+    return `<div class="card">
+      <h2>${esc(title)}</h2>
+      <div class="line"><span class="label">Graded Picks:</span> ${esc(fmt(summary.total))}</div>
+      <div class="line"><span class="label">Wins:</span> ${esc(fmt(summary.wins))}</div>
+      <div class="line"><span class="label">Losses:</span> ${esc(fmt(summary.losses))}</div>
+      <div class="line"><span class="label">Win Rate:</span> ${summary.winRate !== null ? esc((summary.winRate * 100).toFixed(1) + '%') : '—'}</div>
+      <div class="muted">${esc(note)}</div>
+    </div>`;
+  }
+
   function cardSummary(cardType) {
-    // All-time summary from performance_summary_latest.json -> by_card_type.
-    // Do NOT use recent_results here because recent_results is capped/recent only.
     const target = String(cardType || '').trim().toLowerCase();
     const row = byCardType.find(r => String(r.card_type || r.cardType || r["Card Type"] || '').trim().toLowerCase() === target);
     if (!row) return { total: 0, wins: 0, losses: 0, winRate: null };
@@ -1943,14 +1932,29 @@ function renderResults() {
   }
 
   function summaryCard(title, cardType, note) {
-    const s = cardSummary(cardType);
-    return `<div class="card">
-      <h2>${esc(title)}</h2>
-      <div class="line"><span class="label">Graded Picks:</span> ${esc(fmt(s.total))}</div>
-      <div class="line"><span class="label">Wins:</span> ${esc(fmt(s.wins))}</div>
-      <div class="line"><span class="label">Losses:</span> ${esc(fmt(s.losses))}</div>
-      <div class="line"><span class="label">Win Rate:</span> ${s.winRate !== null ? esc((s.winRate * 100).toFixed(1) + '%') : '—'}</div>
-      <div class="muted">${esc(note)}</div>
+    return summaryHtml(title, cardSummary(cardType), note);
+  }
+
+  function groupSummary(rows, key) {
+    const groups = {};
+    (rows || []).forEach(r => {
+      if (!r || !(r.result_status === 'Win' || r.result_status === 'Loss')) return;
+      const k = fmt(r[key] || 'Unknown');
+      groups[k] = groups[k] || { label: k, total: 0, wins: 0, losses: 0 };
+      groups[k].total += 1;
+      if (r.result_status === 'Win') groups[k].wins += 1;
+      else groups[k].losses += 1;
+    });
+    return Object.values(groups).map(g => ({ ...g, winRate: g.total ? g.wins / g.total : null }))
+      .sort((a,b) => (b.winRate ?? 0) - (a.winRate ?? 0));
+  }
+
+  function smallSummaryTable(title, rows, labelName) {
+    return `<div class="table-shell">
+      <h2 style="margin-top:0;">${esc(title)}</h2>
+      <div class="table-wrap"><table><thead><tr><th>${esc(labelName)}</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
+      ${rows.map(r => `<tr><td>${esc(fmt(r.label))}</td><td>${esc(fmt(r.total))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${r.winRate !== null ? esc((r.winRate * 100).toFixed(1) + '%') : '—'}</td></tr>`).join('') || '<tr><td colspan="5">No graded results yet.</td></tr>'}
+      </tbody></table></div>
     </div>`;
   }
 
@@ -1970,32 +1974,49 @@ function renderResults() {
     </div>`;
   }
 
+  const officialHitRows = allRows.filter(r =>
+    r && r.bet_type === '1+ Hit' &&
+    (r.card_type === 'Final Card' || r.card_type === 'Refined Picks') &&
+    (r.result_status === 'Win' || r.result_status === 'Loss')
+  );
+  const finalHitRows = allRows.filter(r => r && r.bet_type === '1+ Hit' && r.card_type === 'Final Card');
+  const refinedHitRows = allRows.filter(r => r && r.bet_type === '1+ Hit' && r.card_type === 'Refined Picks');
+  const experimentalRows = allRows.filter(r => r && r.bet_type !== '1+ Hit');
+  const officialHitSummary = calcSummary(officialHitRows);
+  const finalHitSummary = calcSummary(finalHitRows);
+  const refinedHitSummary = calcSummary(refinedHitRows);
+  const experimentalSummary = calcSummary(experimentalRows);
+
+  const officialByConfidence = groupSummary(officialHitRows, 'confidence');
+  const officialByCard = groupSummary(officialHitRows, 'card_type');
+
   mount.innerHTML = `
     <div class="cards">
-      <div class="card"><h2>Overall Performance</h2>
+      ${summaryHtml('Official 1+ Hit Performance', officialHitSummary, 'Main performance number. This excludes HR, Runs, RBI, Total Bases, Moneyline, and K experiments.')}
+      ${summaryHtml('Final Card 1+ Hits', finalHitSummary, 'Official card hit picks only.')}
+      ${summaryHtml('Refined 1+ Hits', refinedHitSummary, 'Broader hit model/research picks only.')}
+      ${summaryHtml('Experimental / Research Props', experimentalSummary, 'HR, Runs, RBI, Total Bases, Moneyline, and K props. Track separately; do not judge the hit model by this number.')}
+    </div>
+
+    <div class="cards" style="margin-top:18px;">
+      <div class="card"><h2>All Tracked Picks</h2>
         <div class="line"><span class="label">Graded Picks:</span> ${esc(fmt(overall.graded_picks))}</div>
         <div class="line"><span class="label">Wins:</span> ${esc(fmt(overall.wins))}</div>
         <div class="line"><span class="label">Losses:</span> ${esc(fmt(overall.losses))}</div>
         <div class="line"><span class="label">Win Rate:</span> ${overall.win_rate !== undefined && overall.win_rate !== null ? esc((overall.win_rate * 100).toFixed(1) + '%') : '—'}</div>
+        <div class="muted">This is all categories mixed together, including high-variance research props.</div>
       </div>
-      <div class="card"><h2>What This Is For</h2>
-        <div class="line">Final Card = elite-only official plays. Refined Picks = broader model/research plays. They are tracked separately.</div>
+      <div class="card"><h2>How To Read This Page</h2>
+        <div class="line">Use <strong>Official 1+ Hit Performance</strong> as the main quality number. Everything else is research until it proves itself separately.</div>
       </div>
     </div>
 
     <div class="cards" style="margin-top:18px;">
-      ${summaryCard('Final Card Results', 'Final Card', 'Official card picks only.')}
-      ${summaryCard('Refined Picks Results', 'Refined Picks', 'Broader research/model picks only.')}
-      ${summaryCard('Plus Money Props Results', 'Plus Money Props', 'Alt props/value props tracked separately.')}
+      ${smallSummaryTable('Official 1+ Hits By Confidence', officialByConfidence, 'Confidence')}
+      ${smallSummaryTable('Official 1+ Hits By Source', officialByCard, 'Source')}
     </div>
 
     <div class="cards" style="margin-top:18px;">
-      <div class="table-shell">
-        <h2 style="margin-top:0;">By Card Type</h2>
-        <div class="table-wrap"><table><thead><tr><th>Card Type</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
-        ${byCardType.map(r => `<tr><td>${esc(fmt(r.card_type))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${pctText(r.win_rate)}</td></tr>`).join("") || '<tr><td colspan="5">No card-type results yet.</td></tr>'}
-        </tbody></table></div>
-      </div>
       <div class="table-shell">
         <h2 style="margin-top:0;">By Bet Type</h2>
         <div class="table-wrap"><table><thead><tr><th>Bet Type</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
@@ -2003,7 +2024,13 @@ function renderResults() {
         </tbody></table></div>
       </div>
       <div class="table-shell">
-        <h2 style="margin-top:0;">By Confidence</h2>
+        <h2 style="margin-top:0;">By Card Type</h2>
+        <div class="table-wrap"><table><thead><tr><th>Card Type</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
+        ${byCardType.map(r => `<tr><td>${esc(fmt(r.card_type))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${pctText(r.win_rate)}</td></tr>`).join("") || '<tr><td colspan="5">No card-type results yet.</td></tr>'}
+        </tbody></table></div>
+      </div>
+      <div class="table-shell">
+        <h2 style="margin-top:0;">By Confidence - All Categories</h2>
         <div class="table-wrap"><table><thead><tr><th>Confidence</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
         ${byConf.map(r => `<tr><td>${esc(fmt(r.confidence))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${pctText(r.win_rate)}</td></tr>`).join("") || '<tr><td colspan="5">No confidence-level results yet.</td></tr>'}
         </tbody></table></div>
@@ -2022,7 +2049,6 @@ function renderResults() {
     ${resultsTable('All Recent Graded Picks', recent)}
   `;
 }
-
 function renderAll() {
   setMeta();
   renderFinal();
