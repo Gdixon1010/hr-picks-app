@@ -759,6 +759,31 @@ def _infer_result_confidence(row: dict, card_type: str) -> str:
             return "A"
     return "Unknown"
 
+def _copy_model_metrics(row: dict) -> dict:
+    """Carry model-attribution fields into result history for future analysis.
+
+    Older result rows only saved pick/result fields. New rows keep the scoring
+    inputs so we can compare winners vs losers by Hit_score, contact, split,
+    lineup slot, pitcher type, HR regression, and K edge.
+    """
+    metric_keys = [
+        "Hit_score", "contact_quality_score", "hit_quality_label",
+        "hit_pct_last_10", "hit_pct_last_5", "current_hit_streak",
+        "recent_cash_rate", "recent_cash_record", "recent_cash_sample", "recent_cash_last_10",
+        "split_pitcher_hand", "split_avg", "split_ops", "split_plate_appearances",
+        "split_advantage_label", "split_bonus",
+        "lineup_status", "batting_order_slot", "starter_only_flag",
+        "opponent_pitcher", "opponent_pitcher_pick_type", "opponent_pitcher_sample",
+        "park_favorability", "game", "source_tab",
+        "HR_score", "hr_regression_score", "hr_drought_over_avg",
+        "league_avg_hr_excl_zero", "hr_vs_league_avg", "homeRuns",
+        "avg_games_between_hrs", "current_games_without_hr", "longest_games_without_hr",
+        "hr_status", "hr_value_profile", "hr_regression_label",
+        "season_k_avg", "last10_k_avg", "projected_k_mid", "k_edge_vs_season", "k_target",
+        "card_rank_label", "card_priority", "model_profile_confidence", "final_card_gate",
+    ]
+    return {k: row.get(k) for k in metric_keys if k in row}
+
 def _grade_pick(row: dict, target_date: str, season: int = 2026, card_type: str = "Final Card") -> dict:
     bet_type = _infer_grade_bet_type(row)
     lower = bet_type.lower()
@@ -783,7 +808,7 @@ def _grade_pick(row: dict, target_date: str, season: int = 2026, card_type: str 
             result, detail = _grade_k_prop(row, target_date, season)
     else:
         result, detail = "Unable to Grade", f"Unsupported bet type: {bet_type}"
-    return {
+    result_row = {
         "target_date": target_date,
         "card_type": card_type,
         "bet_type": bet_type or row.get("prop_type") or row.get("play_type"),
@@ -797,6 +822,8 @@ def _grade_pick(row: dict, target_date: str, season: int = 2026, card_type: str 
         "source_tab": row.get("source_tab") or ("Plus_Money_Props" if card_type == "Plus Money Props" else ("Refined_Picks" if card_type == "Refined Picks" else "Final_Card")),
         "graded_at_et": dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " "),
     }
+    result_row.update(_copy_model_metrics(row))
+    return result_row
 
 
 def _dedupe_result_rows(rows: list) -> list:
