@@ -281,9 +281,11 @@ def _refined_to_elite_final_rows(data: dict) -> list:
             return default
 
     def confidence_rank(row: dict) -> int:
-        # Results audit showed A/B can be more reliable than the old A+ label.
+        # Results audit through 2026-06-09 showed B profiles have been the
+        # most reliable 1+ Hit group, followed by A, then A+.
+        # Do not treat A+ as automatically strongest; it was over-promoted.
         conf = str(row.get("confidence") or "").strip()
-        return {"A": 0, "A+": 1, "B": 2}.get(conf, 9)
+        return {"B": 0, "A": 1, "A+": 2}.get(conf, 9)
 
     candidates = []
     for r in _rows(rows):
@@ -330,8 +332,8 @@ def _refined_to_elite_final_rows(data: dict) -> list:
     candidates = sorted(
         candidates,
         key=lambda r: (
+            confidence_rank(r),                 # B first, then A, then A+ based on results
             0 if r.get("final_card_gate") == "Strong Gate" else 1,
-            confidence_rank(r),
             -num(r.get("recent_cash_rate")),
             -num(r.get("hit_pct_last_10")),
             -num(r.get("contact_quality_score")),
@@ -360,8 +362,8 @@ def _refined_to_elite_final_rows(data: dict) -> list:
             "confidence": "A+",
             "model_profile_confidence": original_conf,
             "why_it_made_the_card": (
-                f"Recalibrated expanded Final Card; profile confidence {original_conf}; "
-                f"gate {r.get('final_card_gate')}; "
+                f"Results-ranked expanded Final Card; profile confidence {original_conf}; "
+                f"profile rank B>A>A+; gate {r.get('final_card_gate')}; "
                 f"Hit_score {r.get('Hit_score')}; "
                 f"contact {r.get('contact_quality_score')}; "
                 f"L10 hit {r.get('hit_pct_last_10')}%; "
