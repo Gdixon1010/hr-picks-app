@@ -1453,6 +1453,15 @@ function buildModelInsight(p) {
   return "Model found enough edge and supporting context for this pick to make the final card.";
 }
 
+function finalCardRankLabel(p) {
+  const slot = String(p?.slot || "");
+  const rank = p?.card_rank_label || p?.final_card_tier || "";
+  if (rank && rank !== "Elite") return rank;
+  if (slot.includes("1")) return "Best Bet";
+  if (slot.includes("2") || slot.includes("3")) return "Strong Play";
+  return "Lean / Watch";
+}
+
 function renderFinal() {
   const mount = document.getElementById("view-final");
   const plays = finalCardRows();
@@ -1462,14 +1471,18 @@ function renderFinal() {
   }
   mount.innerHTML = '<div class="cards">' + plays.map(p => {
     const insight = buildModelInsight(p);
+    const rankLabel = finalCardRankLabel(p);
+    const profileGrade = p.model_profile_confidence || p.profile_confidence || p.confidence || "—";
+    const slotLabel = p.slot || p.play_type || p.section || "Play";
     return `
     <div class="card">
-      <div class="pill">${esc(fmt(p.slot || p.play_type || p.section || "Play"))}</div>
+      <div class="pill">${esc(fmt(slotLabel))} • ${esc(fmt(rankLabel))}</div>
       <h2>${esc(fmt(p.pick || p.playerName || "Play"))}</h2>
       <div class="line"><span class="label">Bet Type:</span> ${esc(fmt(p.bet_type))}</div>
       <div class="line"><span class="label">Team:</span> ${esc(fmt(p.team || p.teamName))}</div>
       <div class="line"><span class="label">Opponent:</span> ${esc(fmt(p.opponent || p.opponentTeam))}</div>
-      <div class="line"><span class="label">Confidence:</span> ${esc(fmt(p.confidence))}</div>
+      <div class="line"><span class="label">Card Rank:</span> ${esc(fmt(rankLabel))}</div>
+      <div class="line"><span class="label">Profile Grade:</span> ${esc(fmt(profileGrade))}</div>
       <div class="kicker">${esc(fmt(p.why_it_made_the_card || p.reason))}</div>
       <div class="line"><span class="label">Model Insight:</span> ${esc(fmt(insight))}</div>
       <div class="muted">Source: ${esc(fmt(p.source_tab))}</div>
