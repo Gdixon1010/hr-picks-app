@@ -213,16 +213,23 @@ def _rank_final_card_rows(rows: list) -> list:
         r = dict(row)
         r["slot"] = f"Elite {i}"
         if i == 1:
-            r["card_rank_label"] = "Best Bet"
-            r["final_card_tier"] = "Best Bet"
+            # Display grade: best of the best gets A+.
+            # The original model profile is preserved separately in model_profile_confidence.
+            r["confidence"] = "A+"
+            r["card_rank_label"] = "A+ Best Bet"
+            r["final_card_tier"] = "A+ Best Bet"
             r["card_priority"] = 1
         elif i <= 3:
-            r["card_rank_label"] = "Strong Play"
-            r["final_card_tier"] = "Strong Play"
+            # Next-best card plays display as A.
+            r["confidence"] = "A"
+            r["card_rank_label"] = "A Strong Play"
+            r["final_card_tier"] = "A Strong Play"
             r["card_priority"] = 2
         else:
-            r["card_rank_label"] = "Lean / Watch"
-            r["final_card_tier"] = "Lean / Watch"
+            # Remaining qualified card plays display as B.
+            r["confidence"] = "B"
+            r["card_rank_label"] = "B Lean / Watch"
+            r["final_card_tier"] = "B Lean / Watch"
             r["card_priority"] = 3
         ranked.append(r)
     return ranked
@@ -362,8 +369,8 @@ def _refined_to_elite_final_rows(data: dict) -> list:
             "confidence": "A+",
             "model_profile_confidence": original_conf,
             "why_it_made_the_card": (
-                f"Results-ranked expanded Final Card; profile confidence {original_conf}; "
-                f"profile rank B>A>A+; gate {r.get('final_card_gate')}; "
+                f"Results-ranked expanded Final Card; source profile {original_conf}; "
+                f"display grade based on final card rank; gate {r.get('final_card_gate')}; "
                 f"Hit_score {r.get('Hit_score')}; "
                 f"contact {r.get('contact_quality_score')}; "
                 f"L10 hit {r.get('hit_pct_last_10')}%; "
