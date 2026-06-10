@@ -513,7 +513,11 @@ def main(season: int, target_date: str):
         new_data["_meta"]["active_slate_date"] = target_date
         new_data["_meta"]["locked_until_et"] = f"{(datetime.strptime(target_date, '%Y-%m-%d').date() + timedelta(days=1)).strftime('%Y-%m-%d')} 04:00 AM ET"
 
-    _update_history("final_card", target_date, _get_final_card_plays(new_data))
+    final_rows_for_history = _get_final_card_plays(new_data)
+    if final_rows_for_history:
+        _update_history("final_card", target_date, final_rows_for_history)
+    else:
+        print("🔒 Final Card empty; keeping existing final_card history lock unchanged.")
     _update_history("refined_picks", target_date, _get_research_rows(new_data, "refined_picks"))
     _set_research_rows(new_data, "plus_money_props", _normalize_plus_money_rows(_get_research_rows(new_data, "plus_money_props")))
     _update_history("plus_money_props", target_date, _get_research_rows(new_data, "plus_money_props"))
