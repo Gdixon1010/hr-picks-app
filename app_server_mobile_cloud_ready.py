@@ -996,12 +996,37 @@ def refresh_data():
 
         try:
             print(f"🔄 App refresh started at {started_at_et}")
-            # Phone-safe refresh:
-            # Always run the model so later posted lineups can ADD new Elite plays.
-            # hr_v41_cloud_ready.py handles the Final Card as append-only:
-            # old Elite rows are preserved, new Elite rows are added if room remains,
-            # and an empty/new placeholder output can never wipe a locked card.
-            run_model_main(2026, today)
+
+            # HARD FINAL CARD LOCK:
+            # If a real Final Card is already locked for today's slate, the app Reload button
+            # must NOT rerun the model. This prevents any refresh from overwriting or replacing
+            # the official card after it has started/locked. Reload will only update Results.
+            history_dir = OUTPUT_DIR / "history"
+            lock_file = history_dir / "final_card_by_date_latest.json"
+            lock_data = read_json_file(lock_file, {})
+            locked_date = str(lock_data.get("target_date") or "")
+            locked_rows = lock_data.get("rows") or []
+
+            def _real_locked_row(row):
+                if not isinstance(row, dict):
+                    return False
+                blob = " ".join(str(v).lower() for v in row.values())
+                if "no plays" in blob or "no qualified" in blob or "no final card" in blob:
+                    return False
+                return str(row.get("slot", "")).startswith("Elite") and bool(row.get("pick"))
+
+            has_locked_final_card = (
+                locked_date == today
+                and any(_real_locked_row(r) for r in locked_rows)
+            )
+
+            model_ran = False
+            if has_locked_final_card:
+                print(f"🔒 Final Card is locked with {len(locked_rows)} row(s); skipping model run.")
+            else:
+                print("🔓 No locked Final Card found; running model.")
+                run_model_main(2026, today)
+                model_ran = True
 
             auto_grade_result = grade_recent_slates_including_today(season=2026, days_back=4)
             duration = round(time.time() - start_time, 2)
@@ -1009,14 +1034,16 @@ def refresh_data():
             print(f"✅ App refresh finished at {finished_at_et} in {duration}s")
             return JSONResponse({
                 "status": "ok",
-                "message": "Data refreshed safely. Model ran and Final Card was protected by append-only v41 lock.",
+                "message": "Reload completed. Model is skipped when Final Card is locked; Results are updated safely.",
                 "date": today,
                 "timezone": "America/New_York",
                 "started_at_et": started_at_et,
                 "finished_at_et": finished_at_et,
                 "duration_seconds": duration,
-                "model_ran": True,
-                "final_card_protection": "append_only_until_4am",
+                "model_ran": model_ran,
+                "final_card_was_locked": has_locked_final_card,
+                "locked_final_card_rows": len(locked_rows) if has_locked_final_card else 0,
+                "final_card_protection": "hard_skip_model_when_locked",
                 "auto_grade": auto_grade_result,
             })
         except Exception as e:
