@@ -1020,13 +1020,16 @@ def refresh_data():
                 and any(_real_locked_row(r) for r in locked_rows)
             )
 
-            model_ran = False
+            # APPEND-ONLY FINAL CARD REFRESH:
+            # Still run the model after the first Final Card row is locked so late-game
+            # lineups/candidates can be discovered and appended by hr_v41_cloud_ready.
+            # The v41 history writer protects the lock from empty/fewer-row overwrites.
+            model_ran = True
             if has_locked_final_card:
-                print(f"🔒 Final Card is locked with {len(locked_rows)} row(s); skipping model run.")
+                print(f"🔒 Final Card has {len(locked_rows)} locked row(s); running append-only refresh for late additions.")
             else:
                 print("🔓 No locked Final Card found; running model.")
-                run_model_main(2026, today)
-                model_ran = True
+            run_model_main(2026, today)
 
             auto_grade_result = grade_recent_slates_including_today(season=2026, days_back=4)
             duration = round(time.time() - start_time, 2)
@@ -1034,7 +1037,7 @@ def refresh_data():
             print(f"✅ App refresh finished at {finished_at_et} in {duration}s")
             return JSONResponse({
                 "status": "ok",
-                "message": "Reload completed. Model is skipped when Final Card is locked; Results are updated safely.",
+                "message": "Reload completed. Model ran in append-only mode; existing Final Card picks are protected and late qualifiers can be added.",
                 "date": today,
                 "timezone": "America/New_York",
                 "started_at_et": started_at_et,
@@ -1043,7 +1046,7 @@ def refresh_data():
                 "model_ran": model_ran,
                 "final_card_was_locked": has_locked_final_card,
                 "locked_final_card_rows": len(locked_rows) if has_locked_final_card else 0,
-                "final_card_protection": "hard_skip_model_when_locked",
+                "final_card_protection": "append_only_never_remove_existing_picks",
                 "auto_grade": auto_grade_result,
             })
         except Exception as e:
