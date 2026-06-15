@@ -965,7 +965,6 @@ def grade_results(date: str | None = None):
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
 
-@app.get("/refresh-data")
 def _get_final_rows_from_payload(payload: dict) -> list:
     if not isinstance(payload, dict):
         return []
