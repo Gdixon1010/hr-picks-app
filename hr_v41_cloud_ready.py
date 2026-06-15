@@ -235,7 +235,7 @@ def _rank_final_card_rows(rows: list) -> list:
     return ranked
 
 
-def _merge_final_card_append_only(old_rows: list, new_rows: list, max_rows: int = 8) -> list:
+def _merge_final_card_append_only(old_rows: list, new_rows: list, max_rows: int = 5) -> list:
     """Append-only Final Card merge.
 
     Keeps existing same-slate plays, then appends newly qualified plays until max_rows.
@@ -288,11 +288,10 @@ def _refined_to_elite_final_rows(data: dict) -> list:
             return default
 
     def confidence_rank(row: dict) -> int:
-        # Results audit through 2026-06-09 showed B profiles have been the
-        # most reliable 1+ Hit group, followed by A, then A+.
-        # Do not treat A+ as automatically strongest; it was over-promoted.
+        # Final Card quality gate: only A+ and A profiles qualify for official plays.
+        # A+ is ranked first for display clarity, then A. B stays in Refined Picks only.
         conf = str(row.get("confidence") or "").strip()
-        return {"B": 0, "A": 1, "A+": 2}.get(conf, 9)
+        return {"A+": 0, "A": 1}.get(conf, 9)
 
     candidates = []
     for r in _rows(rows):
@@ -302,7 +301,9 @@ def _refined_to_elite_final_rows(data: dict) -> list:
             continue
 
         conf = str(r.get("confidence") or "").strip()
-        if conf not in {"A", "B", "A+"}:
+        # Final Card is now official-only: no B profiles are promoted.
+        # B remains useful in Refined Picks, but does not enter the official card.
+        if conf not in {"A+", "A"}:
             continue
 
         lineup = str(r.get("lineup_status") or "")
@@ -339,7 +340,7 @@ def _refined_to_elite_final_rows(data: dict) -> list:
     candidates = sorted(
         candidates,
         key=lambda r: (
-            confidence_rank(r),                 # B first, then A, then A+ based on results
+            confidence_rank(r),                 # A+ first, then A; B excluded from official card
             0 if r.get("final_card_gate") == "Strong Gate" else 1,
             -num(r.get("recent_cash_rate")),
             -num(r.get("hit_pct_last_10")),
@@ -369,7 +370,7 @@ def _refined_to_elite_final_rows(data: dict) -> list:
             "confidence": "A+",
             "model_profile_confidence": original_conf,
             "why_it_made_the_card": (
-                f"Results-ranked expanded Final Card; source profile {original_conf}; "
+                f"A-only quality Final Card; source profile {original_conf}; "
                 f"display grade based on final card rank; gate {r.get('final_card_gate')}; "
                 f"Hit_score {r.get('Hit_score')}; "
                 f"contact {r.get('contact_quality_score')}; "
@@ -385,7 +386,7 @@ def _refined_to_elite_final_rows(data: dict) -> list:
             "card_rank_label": "Pending Rank",
             "card_priority": 9,
         })
-        if len(out) >= 8:
+        if len(out) >= 5:
             break
     return _rank_final_card_rows(out)
 
@@ -480,8 +481,8 @@ def main(season: int, target_date: str):
     old_elite_final = _elite_final_rows(old_final_candidates)
     v40_elite_final = _elite_final_rows(_get_final_card_plays(new_data))
     refined_elite_final = _refined_to_elite_final_rows(new_data)
-    new_elite_final = _merge_final_card_append_only(v40_elite_final, refined_elite_final, max_rows=8)
-    merged_final = _merge_final_card_append_only(old_elite_final, new_elite_final, max_rows=8)
+    new_elite_final = _merge_final_card_append_only(v40_elite_final, refined_elite_final, max_rows=5)
+    merged_final = _merge_final_card_append_only(old_elite_final, new_elite_final, max_rows=5)
     _set_final_card_plays(new_data, merged_final)
 
     merged_refined = _merge_rows(
