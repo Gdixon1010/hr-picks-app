@@ -17,6 +17,7 @@ app = FastAPI()
 # Server-side refresh lock: prevents multiple users from running the model at the same time.
 refresh_lock = Lock()
 is_refreshing = False
+refresh_started_at = None
 
 
 def resolve_storage_dir() -> Path:
@@ -242,7 +243,6 @@ def _get_card_history(card_type: str) -> dict:
         "final_card": "final_card_by_date.json",
         "refined_picks": "refined_picks_by_date.json",
         "plus_money_props": "plus_money_props_by_date.json",
-        "top_picks": "top_picks_by_date.json",
     }
     filename = filename_map.get(card_type, f"{card_type}_by_date.json")
     return read_json_file(_history_dir() / filename, {})
@@ -281,23 +281,6 @@ def _extract_rows_from_appdata(payload: dict, card_type: str) -> list:
             rows = (((payload.get("research") or {}).get("final_card")) or [])
     elif card_type == "plus_money_props":
         rows = (((payload.get("research") or {}).get("plus_money_props")) or payload.get("plus_money_props") or [])
-    elif card_type == "top_picks":
-        rows = (((payload.get("research") or {}).get("top_picks")) or payload.get("top_picks") or [])
-        # Results tracking only grades Top Pick HR rows for now.
-        normalized = []
-        for r in rows:
-            if not isinstance(r, dict):
-                continue
-            row = dict(r)
-            typ = str(row.get("type") or row.get("category") or "").strip().upper()
-            if typ != "HR":
-                continue
-            row.setdefault("bet_type", "HR")
-            row.setdefault("pick", row.get("playerName"))
-            row.setdefault("team", row.get("teamName"))
-            row.setdefault("source_tab", "Top_Picks_HR")
-            normalized.append(row)
-        rows = normalized
     else:
         rows = (((payload.get("research") or {}).get("refined_picks")) or payload.get("refined_picks") or [])
     return [r for r in rows if isinstance(r, dict) and not _is_placeholder_pick(r)]
@@ -740,10 +723,61 @@ def _infer_result_confidence(row: dict, card_type: str) -> str:
             return "A"
     return "Unknown"
 
+
+def _parse_over_season_k_target(row: dict) -> float | None:
+    """Find the season-average strikeout target saved with Over Season Avg Ks rows."""
+    for key in ["k_target", "season_k_avg", "projected_k_mid", "last10_k_avg"]:
+        try:
+            val = row.get(key)
+            if val is not None and str(val).strip() not in {"", "—", "None", "nan", "NaN"}:
+                return float(val)
+        except Exception:
+            pass
+    text = " ".join(str(row.get(k) or "") for k in ["result_detail", "why_it_made_the_card", "reason", "market_check", "bet_type", "prop_type"])
+    patterns = [
+        r"season\s+avg\s+target\s+(\d+(?:\.\d+)?)",
+        r"target\s+(\d+(?:\.\d+)?)",
+        r"season[_\s-]*k[_\s-]*avg[^0-9]*(\d+(?:\.\d+)?)",
+        r"avg\s+(\d+(?:\.\d+)?)\s*K",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.I)
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                pass
+    return None
+
+
+def _grade_over_season_avg_k(row: dict, target_date: str, season: int) -> tuple[str, str]:
+    player = str(row.get("pick") or row.get("pitcherName") or row.get("playerName") or "").strip()
+    team = str(row.get("team") or row.get("teamName") or "").strip()
+    if not player:
+        return "Unable to Grade", "Missing pitcher"
+    target = _parse_over_season_k_target(row)
+    if target is None:
+        return "Unable to Grade", "Could not determine season average K target"
+    pending, reason = _pending_if_game_not_final(row, target_date)
+    if pending:
+        return "Pending", reason
+    stat = _boxscore_player_stat_by_name(target_date, player, "pitching", team_name=team)
+    if stat is None:
+        pid = row.get("playerId") or (_find_player_id_on_team(player, team, season) if team else None)
+        if pid:
+            stat = _player_game_log_for_date(int(pid), "pitching", season, target_date)
+    if not stat:
+        return "No Action", f"No pitching boxscore/game log found for {player} on {target_date}"
+    ks = _safe_int_stat(stat, "strikeOuts")
+    return ("Win" if ks > target else "Loss"), f"{player}: {ks} Ks vs season avg target {target:.1f}"
+
+
 def _grade_pick(row: dict, target_date: str, season: int = 2026, card_type: str = "Final Card") -> dict:
     bet_type = _infer_grade_bet_type(row)
     lower = bet_type.lower()
-    if "moneyline" in lower or lower == "ml":
+    if "over season avg" in lower or ("season avg" in lower and ("k" in lower or "strikeout" in lower)):
+        result, detail = _grade_over_season_avg_k(row, target_date, season)
+    elif "moneyline" in lower or lower == "ml":
         result, detail = _grade_moneyline(row, target_date)
     elif "total bases" in lower or "total base" in lower:
         result, detail = _grade_batting_prop(row, target_date, season, "total_bases", _parse_plus_threshold(bet_type, 2))
@@ -857,12 +891,10 @@ def grade_date_results(target_date: str, season: int = 2026, include_refined: bo
     final_rows = _card_rows_for_date(target_date, "final_card")
     refined_rows = _card_rows_for_date(target_date, "refined_picks") if include_refined else []
     plus_money_rows = _card_rows_for_date(target_date, "plus_money_props")
-    top_hr_rows = _card_rows_for_date(target_date, "top_picks")
     new_rows = []
     new_rows.extend(_grade_pick(play, target_date, season, "Final Card") for play in final_rows)
     new_rows.extend(_grade_pick(play, target_date, season, "Refined Picks") for play in refined_rows)
     new_rows.extend(_grade_pick(play, target_date, season, "Plus Money Props") for play in plus_money_rows)
-    new_rows.extend(_grade_pick(play, target_date, season, "Top HR Picks") for play in top_hr_rows)
     if not new_rows:
         return {"status": "no_plays", "date": target_date, "message": "No locked/appdata picks found to grade"}
     latest_path = hist / "results_history_latest.json"
@@ -878,7 +910,7 @@ def grade_date_results(target_date: str, season: int = 2026, include_refined: bo
     latest_path.write_text(json.dumps(latest_payload, indent=2, ensure_ascii=False), encoding="utf-8")
     (hist / "performance_summary_latest.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     (hist / "results_history.jsonl").write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in all_rows) + "\n", encoding="utf-8")
-    return {"status": "ok", "date": target_date, "final_card_rows": len(final_rows), "refined_rows": len(refined_rows), "plus_money_rows": len(plus_money_rows), "top_hr_rows": len(top_hr_rows), "graded_new_rows": len(new_rows), "total_rows": len(all_rows), "summary": summary.get("overall")}
+    return {"status": "ok", "date": target_date, "final_card_rows": len(final_rows), "refined_rows": len(refined_rows), "plus_money_rows": len(plus_money_rows), "graded_new_rows": len(new_rows), "total_rows": len(all_rows), "summary": summary.get("overall")}
 
 
 def grade_recent_slates_including_today(season: int = 2026, days_back: int = 4) -> dict:
@@ -965,6 +997,8 @@ def grade_results(date: str | None = None):
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
 
+
+
 def _get_final_rows_from_payload(payload: dict) -> list:
     if not isinstance(payload, dict):
         return []
@@ -983,13 +1017,12 @@ def _get_final_rows_from_payload(payload: dict) -> list:
 def _real_final_card_rows(rows: list) -> list:
     out = []
     for r in rows or []:
-        if not isinstance(r, dict):
-            continue
-        if _is_placeholder_pick(r):
+        if not isinstance(r, dict) or _is_placeholder_pick(r):
             continue
         pick = str(r.get("pick") or r.get("playerName") or "").strip()
         slot = str(r.get("slot") or "")
-        if pick and (slot.startswith("Elite") or str(r.get("bet_type") or "") == "1+ Hit"):
+        bet = str(r.get("bet_type") or "").strip()
+        if pick and (slot.startswith("Elite") or bet == "1+ Hit"):
             out.append(r)
     return out
 
@@ -1021,7 +1054,7 @@ def _merge_final_card_append_only(old_rows: list, new_rows: list, max_rows: int 
         if len(merged) >= max_rows:
             break
 
-    # Re-slot without changing pick order. Display labels are rank labels only.
+    # Re-slot without changing pick order. confidence is display rank; model_profile_confidence remains the quality grade.
     for i, r in enumerate(merged, 1):
         r["slot"] = f"Elite {i}"
         if i == 1:
@@ -1039,12 +1072,10 @@ def _merge_final_card_append_only(old_rows: list, new_rows: list, max_rows: int 
 
 def _write_final_card_lock(target_date: str, rows: list) -> None:
     hist = _history_dir()
-    hist.mkdir(parents=True, exist_ok=True)
     rows = _real_final_card_rows(rows)
     if not rows:
         print("🔒 Append-only Final Card: no real rows to write; keeping existing lock unchanged.")
         return
-
     payload = {
         "target_date": target_date,
         "rows": rows,
@@ -1052,7 +1083,6 @@ def _write_final_card_lock(target_date: str, rows: list) -> None:
         "lock_mode": "append_only_never_remove_existing_picks",
     }
     (hist / "final_card_by_date_latest.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-
     by_date_path = hist / "final_card_by_date.json"
     by_date = read_json_file(by_date_path, {})
     if not isinstance(by_date, dict):
@@ -1078,26 +1108,50 @@ def _patch_latest_appdata_final_card(target_date: str, rows: list) -> None:
 
 @app.get("/refresh-data")
 def refresh_data():
-    global is_refreshing
+    global is_refreshing, refresh_started_at
+
+    now_ts = time.time()
+    stale_after_seconds = 20 * 60
+
+    if is_refreshing and refresh_started_at:
+        age = now_ts - refresh_started_at
+        if age > stale_after_seconds:
+            print(f"⚠️ Stale refresh lock cleared after {round(age, 1)} seconds")
+            is_refreshing = False
+            refresh_started_at = None
 
     if is_refreshing:
+        age = round(now_ts - refresh_started_at, 1) if refresh_started_at else None
         return JSONResponse({
             "status": "busy",
             "message": "Refresh already in progress. Please wait a few minutes, then click Reload App again.",
             "timezone": "America/New_York",
+            "refresh_age_seconds": age,
         })
 
     with refresh_lock:
+        now_ts = time.time()
+        if is_refreshing and refresh_started_at:
+            age = now_ts - refresh_started_at
+            if age > stale_after_seconds:
+                print(f"⚠️ Stale refresh lock cleared inside lock after {round(age, 1)} seconds")
+                is_refreshing = False
+                refresh_started_at = None
+
         if is_refreshing:
+            age = round(now_ts - refresh_started_at, 1) if refresh_started_at else None
             return JSONResponse({
                 "status": "busy",
                 "message": "Refresh already in progress. Please wait a few minutes, then click Reload App again.",
                 "timezone": "America/New_York",
+                "refresh_age_seconds": age,
             })
 
         is_refreshing = True
         start_time = time.time()
+        refresh_started_at = start_time
         today = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+        started_at_et = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ")
 
         try:
             history_dir = OUTPUT_DIR / "history"
@@ -1132,15 +1186,21 @@ def refresh_data():
             if merged_rows:
                 _write_final_card_lock(today, merged_rows)
                 _patch_latest_appdata_final_card(today, merged_rows)
+            else:
+                print("🔒 No Final Card rows after model; existing lock/history left unchanged.")
 
             added_count = max(0, len(merged_rows) - len(before_rows))
             auto_grade_result = grade_recent_slates_including_today(season=2026, days_back=4)
             duration = round(time.time() - start_time, 2)
+            finished_at_et = dt.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %I:%M %p ET").replace(" 0", " ")
+            print(f"✅ Append-only refresh finished at {finished_at_et} in {duration}s")
             return JSONResponse({
                 "status": "ok",
                 "message": "Append-only refresh completed. Existing Final Card picks were kept; new qualifiers were added only if available.",
                 "date": today,
                 "timezone": "America/New_York",
+                "started_at_et": started_at_et,
+                "finished_at_et": finished_at_et,
                 "duration_seconds": duration,
                 "model_ran": model_ran,
                 "final_card_was_locked": bool(before_rows),
@@ -1159,11 +1219,12 @@ def refresh_data():
                     "message": str(e),
                     "date": today,
                     "timezone": "America/New_York",
+                    "started_at_et": started_at_et,
                 },
             )
         finally:
             is_refreshing = False
-
+            refresh_started_at = None
 
 
 @app.get("/")
@@ -1583,14 +1644,13 @@ function buildModelInsight(p) {
   return "Model found enough edge and supporting context for this pick to make the final card.";
 }
 
-
 function finalCardRankLabel(p) {
   const slot = String(p?.slot || "");
   const rank = p?.card_rank_label || p?.final_card_tier || "";
   if (rank && rank !== "Elite") return rank;
-  if (slot.includes("1")) return "A+ Best Bet";
-  if (slot.includes("2") || slot.includes("3")) return "A Strong Play";
-  return "B Lean / Watch";
+  if (slot.includes("1")) return "Best Bet";
+  if (slot.includes("2") || slot.includes("3")) return "Strong Play";
+  return "Lean / Watch";
 }
 
 function renderFinal() {
@@ -1603,7 +1663,7 @@ function renderFinal() {
   mount.innerHTML = '<div class="cards">' + plays.map(p => {
     const insight = buildModelInsight(p);
     const rankLabel = finalCardRankLabel(p);
-    const profileGrade = p.model_profile_confidence || p.profile_confidence || "—";
+    const profileGrade = p.model_profile_confidence || p.profile_confidence || p.confidence || "—";
     const slotLabel = p.slot || p.play_type || p.section || "Play";
     return `
     <div class="card">
@@ -2038,14 +2098,32 @@ function renderResults() {
   const byCardType = Array.isArray(results.by_card_type) ? results.by_card_type : [];
   const bySlot = Array.isArray(results.by_slot) ? results.by_slot : [];
   const recent = Array.isArray(results.recent_results) ? results.recent_results : [];
+  const allRows = Array.isArray(APP_DATA?.results_latest?.rows) ? APP_DATA.results_latest.rows : recent;
 
   function pctText(v) {
     return v !== undefined && v !== null ? esc((Number(v) * 100).toFixed(1) + '%') : '—';
   }
 
+  function calcSummary(rows) {
+    const graded = (rows || []).filter(r => r && (r.result_status === 'Win' || r.result_status === 'Loss'));
+    const wins = graded.filter(r => r.result_status === 'Win').length;
+    const losses = graded.filter(r => r.result_status === 'Loss').length;
+    const total = wins + losses;
+    return { total, wins, losses, winRate: total ? wins / total : null };
+  }
+
+  function summaryHtml(title, summary, note) {
+    return `<div class="card">
+      <h2>${esc(title)}</h2>
+      <div class="line"><span class="label">Graded Picks:</span> ${esc(fmt(summary.total))}</div>
+      <div class="line"><span class="label">Wins:</span> ${esc(fmt(summary.wins))}</div>
+      <div class="line"><span class="label">Losses:</span> ${esc(fmt(summary.losses))}</div>
+      <div class="line"><span class="label">Win Rate:</span> ${summary.winRate !== null ? esc((summary.winRate * 100).toFixed(1) + '%') : '—'}</div>
+      <div class="muted">${esc(note)}</div>
+    </div>`;
+  }
+
   function cardSummary(cardType) {
-    // All-time summary from performance_summary_latest.json -> by_card_type.
-    // Do NOT use recent_results here because recent_results is capped/recent only.
     const target = String(cardType || '').trim().toLowerCase();
     const row = byCardType.find(r => String(r.card_type || r.cardType || r["Card Type"] || '').trim().toLowerCase() === target);
     if (!row) return { total: 0, wins: 0, losses: 0, winRate: null };
@@ -2058,14 +2136,29 @@ function renderResults() {
   }
 
   function summaryCard(title, cardType, note) {
-    const s = cardSummary(cardType);
-    return `<div class="card">
-      <h2>${esc(title)}</h2>
-      <div class="line"><span class="label">Graded Picks:</span> ${esc(fmt(s.total))}</div>
-      <div class="line"><span class="label">Wins:</span> ${esc(fmt(s.wins))}</div>
-      <div class="line"><span class="label">Losses:</span> ${esc(fmt(s.losses))}</div>
-      <div class="line"><span class="label">Win Rate:</span> ${s.winRate !== null ? esc((s.winRate * 100).toFixed(1) + '%') : '—'}</div>
-      <div class="muted">${esc(note)}</div>
+    return summaryHtml(title, cardSummary(cardType), note);
+  }
+
+  function groupSummary(rows, key) {
+    const groups = {};
+    (rows || []).forEach(r => {
+      if (!r || !(r.result_status === 'Win' || r.result_status === 'Loss')) return;
+      const k = fmt(r[key] || 'Unknown');
+      groups[k] = groups[k] || { label: k, total: 0, wins: 0, losses: 0 };
+      groups[k].total += 1;
+      if (r.result_status === 'Win') groups[k].wins += 1;
+      else groups[k].losses += 1;
+    });
+    return Object.values(groups).map(g => ({ ...g, winRate: g.total ? g.wins / g.total : null }))
+      .sort((a,b) => (b.winRate ?? 0) - (a.winRate ?? 0));
+  }
+
+  function smallSummaryTable(title, rows, labelName) {
+    return `<div class="table-shell">
+      <h2 style="margin-top:0;">${esc(title)}</h2>
+      <div class="table-wrap"><table><thead><tr><th>${esc(labelName)}</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
+      ${rows.map(r => `<tr><td>${esc(fmt(r.label))}</td><td>${esc(fmt(r.total))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${r.winRate !== null ? esc((r.winRate * 100).toFixed(1) + '%') : '—'}</td></tr>`).join('') || '<tr><td colspan="5">No graded results yet.</td></tr>'}
+      </tbody></table></div>
     </div>`;
   }
 
@@ -2085,33 +2178,49 @@ function renderResults() {
     </div>`;
   }
 
+  const officialHitRows = allRows.filter(r =>
+    r && r.bet_type === '1+ Hit' &&
+    (r.card_type === 'Final Card' || r.card_type === 'Refined Picks') &&
+    (r.result_status === 'Win' || r.result_status === 'Loss')
+  );
+  const finalHitRows = allRows.filter(r => r && r.bet_type === '1+ Hit' && r.card_type === 'Final Card');
+  const refinedHitRows = allRows.filter(r => r && r.bet_type === '1+ Hit' && r.card_type === 'Refined Picks');
+  const experimentalRows = allRows.filter(r => r && r.bet_type !== '1+ Hit');
+  const officialHitSummary = calcSummary(officialHitRows);
+  const finalHitSummary = calcSummary(finalHitRows);
+  const refinedHitSummary = calcSummary(refinedHitRows);
+  const experimentalSummary = calcSummary(experimentalRows);
+
+  const officialByConfidence = groupSummary(officialHitRows, 'confidence');
+  const officialByCard = groupSummary(officialHitRows, 'card_type');
+
   mount.innerHTML = `
     <div class="cards">
-      <div class="card"><h2>Overall Performance</h2>
+      ${summaryHtml('Official 1+ Hit Performance', officialHitSummary, 'Main performance number. This excludes HR, Runs, RBI, Total Bases, Moneyline, and K experiments.')}
+      ${summaryHtml('Final Card 1+ Hits', finalHitSummary, 'Official card hit picks only.')}
+      ${summaryHtml('Refined 1+ Hits', refinedHitSummary, 'Broader hit model/research picks only.')}
+      ${summaryHtml('Experimental / Research Props', experimentalSummary, 'HR, Runs, RBI, Total Bases, Moneyline, and K props. Track separately; do not judge the hit model by this number.')}
+    </div>
+
+    <div class="cards" style="margin-top:18px;">
+      <div class="card"><h2>All Tracked Picks</h2>
         <div class="line"><span class="label">Graded Picks:</span> ${esc(fmt(overall.graded_picks))}</div>
         <div class="line"><span class="label">Wins:</span> ${esc(fmt(overall.wins))}</div>
         <div class="line"><span class="label">Losses:</span> ${esc(fmt(overall.losses))}</div>
         <div class="line"><span class="label">Win Rate:</span> ${overall.win_rate !== undefined && overall.win_rate !== null ? esc((overall.win_rate * 100).toFixed(1) + '%') : '—'}</div>
+        <div class="muted">This is all categories mixed together, including high-variance research props.</div>
       </div>
-      <div class="card"><h2>What This Is For</h2>
-        <div class="line">Final Card = elite-only official plays. Refined Picks = broader model/research plays. They are tracked separately.</div>
+      <div class="card"><h2>How To Read This Page</h2>
+        <div class="line">Use <strong>Official 1+ Hit Performance</strong> as the main quality number. Everything else is research until it proves itself separately.</div>
       </div>
     </div>
 
     <div class="cards" style="margin-top:18px;">
-      ${summaryCard('Final Card Results', 'Final Card', 'Official card picks only.')}
-      ${summaryCard('Refined Picks Results', 'Refined Picks', 'Broader research/model picks only.')}
-      ${summaryCard('Plus Money Props Results', 'Plus Money Props', 'Alt props/value props tracked separately.')}
-      ${summaryCard('Top HR Picks Results', 'Top HR Picks', 'Top Picks HR rows tracked separately for HR model improvement.')}
+      ${smallSummaryTable('Official 1+ Hits By Confidence', officialByConfidence, 'Confidence')}
+      ${smallSummaryTable('Official 1+ Hits By Source', officialByCard, 'Source')}
     </div>
 
     <div class="cards" style="margin-top:18px;">
-      <div class="table-shell">
-        <h2 style="margin-top:0;">By Card Type</h2>
-        <div class="table-wrap"><table><thead><tr><th>Card Type</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
-        ${byCardType.map(r => `<tr><td>${esc(fmt(r.card_type))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${pctText(r.win_rate)}</td></tr>`).join("") || '<tr><td colspan="5">No card-type results yet.</td></tr>'}
-        </tbody></table></div>
-      </div>
       <div class="table-shell">
         <h2 style="margin-top:0;">By Bet Type</h2>
         <div class="table-wrap"><table><thead><tr><th>Bet Type</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
@@ -2119,7 +2228,13 @@ function renderResults() {
         </tbody></table></div>
       </div>
       <div class="table-shell">
-        <h2 style="margin-top:0;">By Confidence</h2>
+        <h2 style="margin-top:0;">By Card Type</h2>
+        <div class="table-wrap"><table><thead><tr><th>Card Type</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
+        ${byCardType.map(r => `<tr><td>${esc(fmt(r.card_type))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${pctText(r.win_rate)}</td></tr>`).join("") || '<tr><td colspan="5">No card-type results yet.</td></tr>'}
+        </tbody></table></div>
+      </div>
+      <div class="table-shell">
+        <h2 style="margin-top:0;">By Confidence - All Categories</h2>
         <div class="table-wrap"><table><thead><tr><th>Confidence</th><th>Graded</th><th>Wins</th><th>Losses</th><th>Win Rate</th></tr></thead><tbody>
         ${byConf.map(r => `<tr><td>${esc(fmt(r.confidence))}</td><td>${esc(fmt(r.graded_picks))}</td><td>${esc(fmt(r.wins))}</td><td>${esc(fmt(r.losses))}</td><td>${pctText(r.win_rate)}</td></tr>`).join("") || '<tr><td colspan="5">No confidence-level results yet.</td></tr>'}
         </tbody></table></div>
@@ -2135,11 +2250,9 @@ function renderResults() {
     ${resultsTable('Final Card Graded Picks', tableRowsFor('Final Card'))}
     ${resultsTable('Refined Picks Graded Picks', tableRowsFor('Refined Picks'))}
     ${resultsTable('Plus Money Props Graded Picks', tableRowsFor('Plus Money Props'))}
-    ${resultsTable('Top HR Picks Graded Picks', tableRowsFor('Top HR Picks'))}
     ${resultsTable('All Recent Graded Picks', recent)}
   `;
 }
-
 function renderAll() {
   setMeta();
   renderFinal();
